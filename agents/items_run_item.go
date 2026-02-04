@@ -150,6 +150,14 @@ func TResponseInputItemFromToolCallItemType(input ToolCallItemType) TResponseInp
 		return TResponseInputItemFromResponseComputerToolCall(v)
 	case ResponseOutputItemLocalShellCall:
 		return TResponseInputItemFromResponseOutputItemLocalShellCall(v)
+	case ResponseFileSearchToolCall:
+		return openaitypes.ResponseInputItemUnionParamFromResponseFileSearchToolCall(
+			responses.ResponseFileSearchToolCall(v),
+		)
+	case ResponseFunctionWebSearch:
+		return openaitypes.ResponseInputItemUnionParamFromResponseFunctionWebSearch(
+			responses.ResponseFunctionWebSearch(v),
+		)
 	default:
 		// This would be an unrecoverable implementation bug, so a panic is appropriate.
 		panic(fmt.Errorf("unexpected ToolCallItemType type %T", v))
