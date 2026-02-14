@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/nlpodyssey/openai-agents-go/modelsettings"
@@ -35,14 +36,24 @@ import (
 )
 
 type OpenAIChatCompletionsModel struct {
-	Model  openai.ChatModel
-	client OpenaiClient
+	Model     openai.ChatModel
+	client    OpenaiClient
+	modelImpl string
 }
 
 func NewOpenAIChatCompletionsModel(model openai.ChatModel, client OpenaiClient) OpenAIChatCompletionsModel {
+	return NewOpenAIChatCompletionsModelWithImpl(model, client, "")
+}
+
+func NewOpenAIChatCompletionsModelWithImpl(
+	model openai.ChatModel,
+	client OpenaiClient,
+	modelImpl string,
+) OpenAIChatCompletionsModel {
 	return OpenAIChatCompletionsModel{
-		Model:  model,
-		client: client,
+		Model:     model,
+		client:    client,
+		modelImpl: strings.TrimSpace(modelImpl),
 	}
 }
 
@@ -136,7 +147,16 @@ func (m OpenAIChatCompletionsModel) GetResponse(
 
 			var items []TResponseOutputItem
 			if message != nil {
-				items, err = ChatCmplConverter().MessageToOutputItems(*message)
+				var providerData map[string]any
+				if m.modelImpl == "litellm" {
+					providerData = map[string]any{
+						"model": string(m.Model),
+					}
+					if response.ID != "" {
+						providerData["response_id"] = response.ID
+					}
+				}
+				items, err = ChatCmplConverter().MessageToOutputItems(*message, providerData)
 				if err != nil {
 					return err
 				}
@@ -246,6 +266,9 @@ func (m OpenAIChatCompletionsModel) generationSpanParams(params ModelResponsePar
 	}
 	if m.client.BaseURL.Valid() {
 		modelConfig["base_url"] = m.client.BaseURL.Value
+	}
+	if m.modelImpl != "" {
+		modelConfig["model_impl"] = m.modelImpl
 	}
 	return &tracing.GenerationSpanParams{
 		Model:       m.Model,
@@ -364,6 +387,9 @@ func (m OpenAIChatCompletionsModel) prepareRequest(
 	}
 	for k, v := range modelSettings.ExtraQuery {
 		opts = append(opts, option.WithQuery(k, v))
+	}
+	for k, v := range mergedModelExtraJSON(modelSettings) {
+		opts = append(opts, option.WithJSONSet(k, v))
 	}
 
 	if modelSettings.CustomizeChatCompletionsRequest != nil {

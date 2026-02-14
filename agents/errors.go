@@ -22,13 +22,16 @@ import (
 
 // RunErrorDetails provides data collected from an agent run when an error occurs.
 type RunErrorDetails struct {
-	Context                context.Context
-	Input                  Input
-	NewItems               []RunItem
-	RawResponses           []ModelResponse
-	LastAgent              *Agent
-	InputGuardrailResults  []InputGuardrailResult
-	OutputGuardrailResults []OutputGuardrailResult
+	Context                    context.Context
+	Input                      Input
+	NewItems                   []RunItem
+	RawResponses               []ModelResponse
+	LastAgent                  *Agent
+	InputGuardrailResults      []InputGuardrailResult
+	OutputGuardrailResults     []OutputGuardrailResult
+	ToolInputGuardrailResults  []ToolInputGuardrailResult
+	ToolOutputGuardrailResults []ToolOutputGuardrailResult
+	Interruptions              []ToolApprovalItem
 }
 
 func (d RunErrorDetails) String() string {
@@ -180,5 +183,67 @@ func NewOutputGuardrailTripwireTriggeredError(guardrailResult OutputGuardrailRes
 	return OutputGuardrailTripwireTriggeredError{
 		AgentsError:     AgentsErrorf("output guardrail %s triggered tripwire", guardrailResult.Guardrail.Name),
 		GuardrailResult: guardrailResult,
+	}
+}
+
+// ToolInputGuardrailTripwireTriggeredError is returned when a tool input guardrail tripwire is triggered.
+type ToolInputGuardrailTripwireTriggeredError struct {
+	*AgentsError
+	// The guardrail that was triggered.
+	Guardrail ToolInputGuardrail
+	// The output returned by the guardrail.
+	Output ToolGuardrailFunctionOutput
+}
+
+func (err ToolInputGuardrailTripwireTriggeredError) Error() string {
+	if err.AgentsError == nil {
+		return "ToolInputGuardrailTripwireTriggeredError"
+	}
+	return err.AgentsError.Error()
+}
+
+func (err ToolInputGuardrailTripwireTriggeredError) Unwrap() error {
+	return err.AgentsError
+}
+
+func NewToolInputGuardrailTripwireTriggeredError(
+	guardrail ToolInputGuardrail,
+	output ToolGuardrailFunctionOutput,
+) ToolInputGuardrailTripwireTriggeredError {
+	return ToolInputGuardrailTripwireTriggeredError{
+		AgentsError: AgentsErrorf("tool input guardrail %s triggered tripwire", guardrail.GetName()),
+		Guardrail:   guardrail,
+		Output:      output,
+	}
+}
+
+// ToolOutputGuardrailTripwireTriggeredError is returned when a tool output guardrail tripwire is triggered.
+type ToolOutputGuardrailTripwireTriggeredError struct {
+	*AgentsError
+	// The guardrail that was triggered.
+	Guardrail ToolOutputGuardrail
+	// The output returned by the guardrail.
+	Output ToolGuardrailFunctionOutput
+}
+
+func (err ToolOutputGuardrailTripwireTriggeredError) Error() string {
+	if err.AgentsError == nil {
+		return "ToolOutputGuardrailTripwireTriggeredError"
+	}
+	return err.AgentsError.Error()
+}
+
+func (err ToolOutputGuardrailTripwireTriggeredError) Unwrap() error {
+	return err.AgentsError
+}
+
+func NewToolOutputGuardrailTripwireTriggeredError(
+	guardrail ToolOutputGuardrail,
+	output ToolGuardrailFunctionOutput,
+) ToolOutputGuardrailTripwireTriggeredError {
+	return ToolOutputGuardrailTripwireTriggeredError{
+		AgentsError: AgentsErrorf("tool output guardrail %s triggered tripwire", guardrail.GetName()),
+		Guardrail:   guardrail,
+		Output:      output,
 	}
 }

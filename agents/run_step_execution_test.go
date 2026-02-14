@@ -346,6 +346,83 @@ func TestMultipleFinalOutputLeadsToFinalOutputNextStep(t *testing.T) {
 	assert.Equal(t, Foo{Bar: "456"}, result.NextStep.(NextStepFinalOutput).Output)
 }
 
+func TestMCPApprovalWithoutCallbackLeadsToInterruptionNextStep(t *testing.T) {
+	agent := &Agent{
+		Name: "test",
+		Tools: []Tool{
+			HostedMCPTool{
+				ToolConfig: responses.ToolMcpParam{
+					ServerLabel: "mcp_server",
+					Type:        constant.ValueOf[constant.Mcp](),
+				},
+			},
+		},
+	}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			getMCPApprovalRequest("approval_1", "mcp_server", "add", `{"a":1}`),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	result := getExecuteResult(t, getExecuteResultParams{
+		agent:    agent,
+		response: response,
+	})
+
+	require.IsType(t, NextStepInterruption{}, result.NextStep)
+	interruptions := result.NextStep.(NextStepInterruption).Interruptions
+	require.Len(t, interruptions, 1)
+	assert.Equal(t, "add", interruptions[0].ToolName)
+
+	items := result.GeneratedItems()
+	require.Len(t, items, 1)
+	requestItem, ok := items[0].(MCPApprovalRequestItem)
+	require.True(t, ok)
+	assert.Equal(t, "approval_1", requestItem.RawItem.ID)
+	assert.Equal(t, "add", requestItem.RawItem.Name)
+}
+
+func TestMCPApprovalWithCallbackRunsAgainWithApprovalResponse(t *testing.T) {
+	agent := &Agent{
+		Name: "test",
+		Tools: []Tool{
+			HostedMCPTool{
+				ToolConfig: responses.ToolMcpParam{
+					ServerLabel: "mcp_server",
+					Type:        constant.ValueOf[constant.Mcp](),
+				},
+				OnApprovalRequest: func(context.Context, responses.ResponseOutputItemMcpApprovalRequest) (MCPToolApprovalFunctionResult, error) {
+					return MCPToolApprovalFunctionResult{Approve: true}, nil
+				},
+			},
+		},
+	}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			getMCPApprovalRequest("approval_1", "mcp_server", "add", `{"a":1}`),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	result := getExecuteResult(t, getExecuteResultParams{
+		agent:    agent,
+		response: response,
+	})
+
+	assert.IsType(t, NextStepRunAgain{}, result.NextStep)
+	items := result.GeneratedItems()
+	require.Len(t, items, 2)
+	_, ok := items[0].(MCPApprovalRequestItem)
+	require.True(t, ok)
+	responseItem, ok := items[1].(MCPApprovalResponseItem)
+	require.True(t, ok)
+	assert.Equal(t, "approval_1", responseItem.RawItem.ApprovalRequestID)
+	assert.True(t, responseItem.RawItem.Approve)
+}
+
 func assertItemIsMessage(t *testing.T, item RunItem, agent *Agent, text string) {
 	t.Helper()
 	assert.Equal(t, MessageOutputItem{
@@ -455,6 +532,16 @@ func getFinalOutputMessage(args string) responses.ResponseOutputItemUnion {
 			Annotations: nil,
 		}},
 		Status: string(responses.ResponseOutputMessageStatusCompleted),
+	}
+}
+
+func getMCPApprovalRequest(id, serverLabel, name, arguments string) responses.ResponseOutputItemUnion {
+	return responses.ResponseOutputItemUnion{
+		ID:          id,
+		Type:        "mcp_approval_request",
+		ServerLabel: serverLabel,
+		Name:        name,
+		Arguments:   arguments,
 	}
 }
 

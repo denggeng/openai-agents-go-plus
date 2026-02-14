@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/nlpodyssey/openai-agents-go/modelsettings"
+	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
@@ -105,6 +106,72 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 		require.NoError(t, err)
 		assert.Same(t, customParams, params)
 		assert.Equal(t, customOpts, opts)
+	})
+
+	t.Run("with extra body and args", func(t *testing.T) {
+		m := NewOpenAIResponsesModel("model-name", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))
+		_, _, err := m.prepareRequest(
+			t.Context(),
+			param.Opt[string]{},
+			InputString("input"),
+			modelsettings.ModelSettings{
+				ExtraHeaders: map[string]string{"x-header": "v"},
+				ExtraQuery:   map[string]string{"q": "1"},
+				ExtraBody: map[string]any{
+					"cached_content":   "cache",
+					"reasoning_effort": "none",
+				},
+				ExtraArgs: map[string]any{
+					"custom_param":     "custom",
+					"reasoning_effort": "low",
+				},
+				CustomizeResponsesRequest: func(ctx context.Context, params *responses.ResponseNewParams, opts []option.RequestOption) (*responses.ResponseNewParams, []option.RequestOption, error) {
+					// header + query + cached_content + custom_param + reasoning_effort
+					assert.Len(t, opts, 5)
+					return params, opts, nil
+				},
+			},
+			nil,
+			nil,
+			nil,
+			"",
+			false,
+			responses.ResponsePromptParam{},
+		)
+		require.NoError(t, err)
+	})
+
+	t.Run("explicit reasoning effort wins over extra reasoning_effort", func(t *testing.T) {
+		m := NewOpenAIResponsesModel("model-name", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))
+		_, _, err := m.prepareRequest(
+			t.Context(),
+			param.Opt[string]{},
+			InputString("input"),
+			modelsettings.ModelSettings{
+				Reasoning: openai.ReasoningParam{Effort: openai.ReasoningEffortLow},
+				ExtraBody: map[string]any{
+					"reasoning_effort": "none",
+					"cached_content":   "cache",
+				},
+				ExtraArgs: map[string]any{
+					"reasoning_effort": "high",
+					"custom_param":     "custom",
+				},
+				CustomizeResponsesRequest: func(ctx context.Context, params *responses.ResponseNewParams, opts []option.RequestOption) (*responses.ResponseNewParams, []option.RequestOption, error) {
+					assert.Equal(t, openai.ReasoningEffortLow, params.Reasoning.Effort)
+					// cached_content + custom_param (reasoning_effort removed from extras)
+					assert.Len(t, opts, 2)
+					return params, opts, nil
+				},
+			},
+			nil,
+			nil,
+			nil,
+			"",
+			false,
+			responses.ResponsePromptParam{},
+		)
+		require.NoError(t, err)
 	})
 
 	t.Run("with ModelSettings.CustomizeResponsesRequest returning error", func(t *testing.T) {

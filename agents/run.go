@@ -202,6 +202,17 @@ func RunInputsStreamed(ctx context.Context, startingAgent *Agent, input []TRespo
 	return DefaultRunner.RunInputsStreamed(ctx, startingAgent, input)
 }
 
+// RunFromState resumes a workflow from a serialized RunState using the DefaultRunner.
+func RunFromState(ctx context.Context, startingAgent *Agent, state RunState) (*RunResult, error) {
+	return DefaultRunner.RunFromState(ctx, startingAgent, state)
+}
+
+// RunFromStateStreamed resumes a workflow from a serialized RunState in streaming mode
+// using the DefaultRunner.
+func RunFromStateStreamed(ctx context.Context, startingAgent *Agent, state RunState) (*RunResultStreaming, error) {
+	return DefaultRunner.RunFromStateStreamed(ctx, startingAgent, state)
+}
+
 // Run a workflow starting at the given agent. The agent will run in a loop until a final
 // output is generated.
 //
@@ -252,6 +263,24 @@ func (r Runner) RunInputs(ctx context.Context, startingAgent *Agent, input []TRe
 // RunInputsStreamed executes startingAgent with the provided list of input items using the Runner configuration and returns a streaming result.
 func (r Runner) RunInputsStreamed(ctx context.Context, startingAgent *Agent, input []TResponseInputItem) (*RunResultStreaming, error) {
 	return r.runStreamed(ctx, startingAgent, InputItems(input))
+}
+
+// RunFromState resumes a workflow from a serialized RunState.
+func (r Runner) RunFromState(ctx context.Context, startingAgent *Agent, state RunState) (*RunResult, error) {
+	resumeRunner, resumeInput, startingTurn, resumeState, err := r.prepareResumeFromState(startingAgent, state)
+	if err != nil {
+		return nil, err
+	}
+	return resumeRunner.runWithStartingTurnAndState(ctx, startingAgent, resumeInput, startingTurn, resumeState)
+}
+
+// RunFromStateStreamed resumes a workflow from a serialized RunState in streaming mode.
+func (r Runner) RunFromStateStreamed(ctx context.Context, startingAgent *Agent, state RunState) (*RunResultStreaming, error) {
+	resumeRunner, resumeInput, startingTurn, resumeState, err := r.prepareResumeFromState(startingAgent, state)
+	if err != nil {
+		return nil, err
+	}
+	return resumeRunner.runStreamedWithStartingTurnAndState(ctx, startingAgent, resumeInput, startingTurn, resumeState)
 }
 
 // RunStreamedChan runs a workflow starting at the given agent in streaming
@@ -324,7 +353,52 @@ func (r Runner) runStreamedSeq(ctx context.Context, startingAgent *Agent, input 
 	return res, nil
 }
 
+func (r Runner) prepareResumeFromState(
+	startingAgent *Agent,
+	state RunState,
+) (Runner, Input, uint64, *RunState, error) {
+	if startingAgent == nil {
+		return Runner{}, nil, 0, nil, fmt.Errorf("startingAgent must not be nil")
+	}
+	if err := state.Validate(); err != nil {
+		return Runner{}, nil, 0, nil, err
+	}
+	if state.CurrentAgentName != "" && state.CurrentAgentName != startingAgent.Name {
+		return Runner{}, nil, 0, nil, UserErrorf(
+			"run state current agent %q does not match provided starting agent %q",
+			state.CurrentAgentName,
+			startingAgent.Name,
+		)
+	}
+	if err := state.ApplyStoredToolApprovals(); err != nil {
+		return Runner{}, nil, 0, nil, err
+	}
+
+	resumeRunner := r
+	resumeRunner.Config = state.ResumeRunConfig(r.Config)
+	return resumeRunner, state.ResumeInput(), state.CurrentTurn, &state, nil
+}
+
 func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*RunResult, error) {
+	return r.runWithStartingTurnAndState(ctx, startingAgent, input, 0, nil)
+}
+
+func (r Runner) runWithStartingTurn(
+	ctx context.Context,
+	startingAgent *Agent,
+	input Input,
+	startingTurn uint64,
+) (*RunResult, error) {
+	return r.runWithStartingTurnAndState(ctx, startingAgent, input, startingTurn, nil)
+}
+
+func (r Runner) runWithStartingTurnAndState(
+	ctx context.Context,
+	startingAgent *Agent,
+	input Input,
+	startingTurn uint64,
+	resumeState *RunState,
+) (*RunResult, error) {
 	if startingAgent == nil {
 		return nil, fmt.Errorf("startingAgent must not be nil")
 	}
@@ -352,7 +426,7 @@ func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*Ru
 		Disabled:     r.Config.TracingDisabled,
 	}
 	err = ManageTraceCtx(ctx, traceParams, func(ctx context.Context) (err error) {
-		currentTurn := uint64(0)
+		currentTurn := startingTurn
 		originalInput := CopyInput(preparedInput)
 
 		maxTurns := r.Config.MaxTurns
@@ -361,12 +435,21 @@ func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*Ru
 		}
 
 		var (
-			generatedItems         []RunItem
-			modelResponses         []ModelResponse
-			inputGuardrailResults  []InputGuardrailResult
-			outputGuardrailResults []OutputGuardrailResult
-			currentSpan            tracing.Span
+			generatedItems             []RunItem
+			modelResponses             []ModelResponse
+			inputGuardrailResults      []InputGuardrailResult
+			outputGuardrailResults     []OutputGuardrailResult
+			toolInputGuardrailResults  []ToolInputGuardrailResult
+			toolOutputGuardrailResults []ToolOutputGuardrailResult
+			interruptions              []ToolApprovalItem
+			currentSpan                tracing.Span
 		)
+		if resumeState != nil {
+			inputGuardrailResults = resumeState.ResumeInputGuardrailResults()
+			outputGuardrailResults = resumeState.ResumeOutputGuardrailResults()
+			toolInputGuardrailResults = resumeState.ResumeToolInputGuardrailResults()
+			toolOutputGuardrailResults = resumeState.ResumeToolOutputGuardrailResults()
+		}
 
 		if u, ok := usage.FromContext(ctx); !ok || u == nil {
 			ctx = usage.NewContext(ctx, usage.NewUsage())
@@ -380,13 +463,16 @@ func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*Ru
 				var agentsErr *AgentsError
 				if errors.As(err, &agentsErr) {
 					agentsErr.RunData = &RunErrorDetails{
-						Context:                ctx,
-						Input:                  originalInput,
-						NewItems:               generatedItems,
-						RawResponses:           modelResponses,
-						LastAgent:              currentAgent,
-						InputGuardrailResults:  inputGuardrailResults,
-						OutputGuardrailResults: outputGuardrailResults,
+						Context:                    ctx,
+						Input:                      originalInput,
+						NewItems:                   generatedItems,
+						RawResponses:               modelResponses,
+						LastAgent:                  currentAgent,
+						InputGuardrailResults:      inputGuardrailResults,
+						OutputGuardrailResults:     outputGuardrailResults,
+						ToolInputGuardrailResults:  toolInputGuardrailResults,
+						ToolOutputGuardrailResults: toolOutputGuardrailResults,
+						Interruptions:              interruptions,
 					}
 				}
 			}
@@ -455,7 +541,7 @@ func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*Ru
 
 			var turnResult *SingleStepResult
 
-			if currentTurn == 1 {
+			if currentTurn == 1 && resumeState == nil {
 				var wg sync.WaitGroup
 				wg.Add(2)
 
@@ -520,6 +606,8 @@ func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*Ru
 			modelResponses = append(modelResponses, turnResult.ModelResponse)
 			originalInput = turnResult.OriginalInput
 			generatedItems = turnResult.GeneratedItems()
+			toolInputGuardrailResults = append(toolInputGuardrailResults, turnResult.ToolInputGuardrailResults...)
+			toolOutputGuardrailResults = append(toolOutputGuardrailResults, turnResult.ToolOutputGuardrailResults...)
 
 			switch nextStep := turnResult.NextStep.(type) {
 			case NextStepFinalOutput:
@@ -533,13 +621,16 @@ func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*Ru
 					return err
 				}
 				runResult = &RunResult{
-					Input:                  originalInput,
-					NewItems:               generatedItems,
-					RawResponses:           modelResponses,
-					FinalOutput:            nextStep.Output,
-					InputGuardrailResults:  inputGuardrailResults,
-					OutputGuardrailResults: outputGuardrailResults,
-					LastAgent:              currentAgent,
+					Input:                      originalInput,
+					NewItems:                   generatedItems,
+					RawResponses:               modelResponses,
+					FinalOutput:                nextStep.Output,
+					InputGuardrailResults:      inputGuardrailResults,
+					OutputGuardrailResults:     outputGuardrailResults,
+					ToolInputGuardrailResults:  toolInputGuardrailResults,
+					ToolOutputGuardrailResults: toolOutputGuardrailResults,
+					Interruptions:              interruptions,
+					LastAgent:                  currentAgent,
 				}
 
 				// Save the conversation to session if enabled
@@ -559,6 +650,26 @@ func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*Ru
 				shouldRunAgentStartHooks = true
 			case NextStepRunAgain:
 				// Nothing to do
+			case NextStepInterruption:
+				interruptions = slices.Clone(nextStep.Interruptions)
+				runResult = &RunResult{
+					Input:                      originalInput,
+					NewItems:                   generatedItems,
+					RawResponses:               modelResponses,
+					InputGuardrailResults:      inputGuardrailResults,
+					OutputGuardrailResults:     outputGuardrailResults,
+					ToolInputGuardrailResults:  toolInputGuardrailResults,
+					ToolOutputGuardrailResults: toolOutputGuardrailResults,
+					Interruptions:              interruptions,
+					LastAgent:                  currentAgent,
+				}
+
+				err = r.saveResultToSession(ctx, input, runResult)
+				if err != nil {
+					return err
+				}
+
+				return nil
 			default:
 				// This would be an unrecoverable implementation bug, so a panic is appropriate.
 				panic(fmt.Errorf("unexpected NextStep type %T", nextStep))
@@ -569,6 +680,25 @@ func (r Runner) run(ctx context.Context, startingAgent *Agent, input Input) (*Ru
 }
 
 func (r Runner) runStreamed(ctx context.Context, startingAgent *Agent, input Input) (*RunResultStreaming, error) {
+	return r.runStreamedWithStartingTurnAndState(ctx, startingAgent, input, 0, nil)
+}
+
+func (r Runner) runStreamedWithStartingTurn(
+	ctx context.Context,
+	startingAgent *Agent,
+	input Input,
+	startingTurn uint64,
+) (*RunResultStreaming, error) {
+	return r.runStreamedWithStartingTurnAndState(ctx, startingAgent, input, startingTurn, nil)
+}
+
+func (r Runner) runStreamedWithStartingTurnAndState(
+	ctx context.Context,
+	startingAgent *Agent,
+	input Input,
+	startingTurn uint64,
+	resumeState *RunState,
+) (*RunResultStreaming, error) {
 	if startingAgent == nil {
 		return nil, fmt.Errorf("startingAgent must not be nil")
 	}
@@ -604,9 +734,16 @@ func (r Runner) runStreamed(ctx context.Context, startingAgent *Agent, input Inp
 	streamedResult := newRunResultStreaming(ctx)
 	streamedResult.setInput(CopyInput(input))
 	streamedResult.setCurrentAgent(startingAgent)
+	streamedResult.setCurrentTurn(startingTurn)
 	streamedResult.setMaxTurns(maxTurns)
 	streamedResult.setCurrentAgentOutputType(startingAgent.OutputType)
 	streamedResult.setTrace(newTrace)
+	if resumeState != nil {
+		streamedResult.setInputGuardrailResults(resumeState.ResumeInputGuardrailResults())
+		streamedResult.setOutputGuardrailResults(resumeState.ResumeOutputGuardrailResults())
+		streamedResult.setToolInputGuardrailResults(resumeState.ResumeToolInputGuardrailResults())
+		streamedResult.setToolOutputGuardrailResults(resumeState.ResumeToolOutputGuardrailResults())
+	}
 
 	// Kick off the actual agent loop in the background and return the streamed result object.
 	streamedResult.createRunImplTask(ctx, func(ctx context.Context) error {
@@ -615,10 +752,12 @@ func (r Runner) runStreamed(ctx context.Context, startingAgent *Agent, input Inp
 			input,
 			streamedResult,
 			startingAgent,
+			startingTurn,
 			maxTurns,
 			hooks,
 			r.Config,
 			r.Config.PreviousResponseID,
+			resumeState != nil,
 		)
 	})
 
@@ -738,10 +877,12 @@ func (r Runner) startStreaming(
 	startingInput Input,
 	streamedResult *RunResultStreaming,
 	startingAgent *Agent,
+	startingTurn uint64,
 	maxTurns uint64,
 	hooks RunHooks,
 	runConfig RunConfig,
 	previousResponseID string,
+	isResumedState bool,
 ) (err error) {
 	currentAgent := startingAgent
 	var currentSpan tracing.Span
@@ -756,13 +897,16 @@ func (r Runner) startStreaming(
 			var agentsErr *AgentsError
 			if errors.As(err, &agentsErr) {
 				agentsErr.RunData = &RunErrorDetails{
-					Context:                ctx,
-					Input:                  streamedResult.Input(),
-					NewItems:               streamedResult.NewItems(),
-					RawResponses:           streamedResult.RawResponses(),
-					LastAgent:              currentAgent,
-					InputGuardrailResults:  streamedResult.InputGuardrailResults(),
-					OutputGuardrailResults: streamedResult.OutputGuardrailResults(),
+					Context:                    ctx,
+					Input:                      streamedResult.Input(),
+					NewItems:                   streamedResult.NewItems(),
+					RawResponses:               streamedResult.RawResponses(),
+					LastAgent:                  currentAgent,
+					InputGuardrailResults:      streamedResult.InputGuardrailResults(),
+					OutputGuardrailResults:     streamedResult.OutputGuardrailResults(),
+					ToolInputGuardrailResults:  streamedResult.ToolInputGuardrailResults(),
+					ToolOutputGuardrailResults: streamedResult.ToolOutputGuardrailResults(),
+					Interruptions:              streamedResult.Interruptions(),
 				}
 			} else if currentSpan != nil {
 				AttachErrorToSpan(currentSpan, tracing.SpanError{
@@ -795,7 +939,7 @@ func (r Runner) startStreaming(
 		}
 	}
 
-	currentTurn := uint64(0)
+	currentTurn := startingTurn
 	shouldRunAgentStartHooks := true
 	toolUseTracker := NewAgentToolUseTracker()
 
@@ -863,7 +1007,7 @@ func (r Runner) startStreaming(
 			break
 		}
 
-		if currentTurn == 1 {
+		if currentTurn == 1 && !isResumedState {
 			// Run the input guardrails in the background and put the results on the queue
 			streamedResult.createInputGuardrailsTask(ctx, func(ctx context.Context) error {
 				return r.runInputGuardrailsWithQueue(
@@ -896,6 +1040,8 @@ func (r Runner) startStreaming(
 		streamedResult.appendRawResponses(turnResult.ModelResponse)
 		streamedResult.setInput(turnResult.OriginalInput)
 		streamedResult.setNewItems(turnResult.GeneratedItems())
+		streamedResult.appendToolInputGuardrailResults(turnResult.ToolInputGuardrailResults...)
+		streamedResult.appendToolOutputGuardrailResults(turnResult.ToolOutputGuardrailResults...)
 
 		switch nextStep := turnResult.NextStep.(type) {
 		case NextStepFinalOutput:
@@ -923,13 +1069,16 @@ func (r Runner) startStreaming(
 			// Save the conversation to session if enabled
 			// Create a temporary RunResult for session saving
 			tempResult := &RunResult{
-				Input:                  streamedResult.Input(),
-				NewItems:               streamedResult.NewItems(),
-				RawResponses:           streamedResult.RawResponses(),
-				FinalOutput:            streamedResult.FinalOutput(),
-				InputGuardrailResults:  streamedResult.InputGuardrailResults(),
-				OutputGuardrailResults: streamedResult.OutputGuardrailResults(),
-				LastAgent:              currentAgent,
+				Input:                      streamedResult.Input(),
+				NewItems:                   streamedResult.NewItems(),
+				RawResponses:               streamedResult.RawResponses(),
+				FinalOutput:                streamedResult.FinalOutput(),
+				InputGuardrailResults:      streamedResult.InputGuardrailResults(),
+				OutputGuardrailResults:     streamedResult.OutputGuardrailResults(),
+				ToolInputGuardrailResults:  streamedResult.ToolInputGuardrailResults(),
+				ToolOutputGuardrailResults: streamedResult.ToolOutputGuardrailResults(),
+				Interruptions:              streamedResult.Interruptions(),
+				LastAgent:                  currentAgent,
 			}
 			err = r.saveResultToSession(ctx, startingInput, tempResult)
 			if err != nil {
@@ -951,6 +1100,27 @@ func (r Runner) startStreaming(
 			})
 		case NextStepRunAgain:
 			// Nothing to do
+		case NextStepInterruption:
+			streamedResult.setInterruptions(slices.Clone(nextStep.Interruptions))
+			streamedResult.markAsComplete()
+
+			tempResult := &RunResult{
+				Input:                      streamedResult.Input(),
+				NewItems:                   streamedResult.NewItems(),
+				RawResponses:               streamedResult.RawResponses(),
+				InputGuardrailResults:      streamedResult.InputGuardrailResults(),
+				OutputGuardrailResults:     streamedResult.OutputGuardrailResults(),
+				ToolInputGuardrailResults:  streamedResult.ToolInputGuardrailResults(),
+				ToolOutputGuardrailResults: streamedResult.ToolOutputGuardrailResults(),
+				Interruptions:              streamedResult.Interruptions(),
+				LastAgent:                  currentAgent,
+			}
+			err = r.saveResultToSession(ctx, startingInput, tempResult)
+			if err != nil {
+				return err
+			}
+
+			streamedResult.eventQueue.Put(queueCompleteSentinel{})
 		default:
 			// This would be an unrecoverable implementation bug, so a panic is appropriate.
 			panic(fmt.Errorf("unexpected NextStep type %T", nextStep))
@@ -1654,6 +1824,39 @@ func (r Runner) saveResultToSession(ctx context.Context, originalInput Input, re
 	err := session.AddItems(ctx, itemsToSave)
 	if err != nil {
 		return fmt.Errorf("failed to add session items: %w", err)
+	}
+
+	if usageTrackingSession, ok := session.(memory.RunUsageTrackingAwareSession); ok {
+		var runUsage *usage.Usage
+		if result != nil {
+			acc := usage.NewUsage()
+			hasUsage := false
+			for _, modelResponse := range result.RawResponses {
+				if modelResponse.Usage == nil {
+					continue
+				}
+				acc.Add(modelResponse.Usage)
+				hasUsage = true
+			}
+			if hasUsage {
+				runUsage = acc
+			}
+		}
+		if err := usageTrackingSession.StoreRunUsage(ctx, runUsage); err != nil {
+			return fmt.Errorf("failed to store run usage: %w", err)
+		}
+	}
+
+	responseID := result.LastResponseID()
+	if responseID != "" {
+		if compactionSession, ok := session.(memory.OpenAIResponsesCompactionAwareSession); ok {
+			err := compactionSession.RunCompaction(ctx, &memory.OpenAIResponsesCompactionArgs{
+				ResponseID: responseID,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to run session compaction: %w", err)
+			}
+		}
 	}
 
 	return err

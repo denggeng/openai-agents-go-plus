@@ -27,6 +27,9 @@ type ToolContextData struct {
 
 	// The ID of the tool call.
 	ToolCallID string
+
+	// The raw JSON arguments passed by the model for this tool call.
+	ToolArguments string
 }
 
 type toolContextDataKey struct{}
@@ -37,8 +40,9 @@ func ContextWithToolData(
 	toolCall responses.ResponseFunctionToolCall,
 ) context.Context {
 	return context.WithValue(ctx, toolContextDataKey{}, &ToolContextData{
-		ToolName:   toolCall.Name,
-		ToolCallID: toolCallID,
+		ToolName:      toolCall.Name,
+		ToolCallID:    toolCallID,
+		ToolArguments: toolCall.Arguments,
 	})
 }
 

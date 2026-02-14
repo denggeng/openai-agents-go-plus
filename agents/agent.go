@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/nlpodyssey/openai-agents-go/modelsettings"
@@ -256,6 +257,50 @@ func (a *Agent) GetAllTools(ctx context.Context) ([]Tool, error) {
 			enabledTools = append(enabledTools, tool)
 		}
 	}
+	allTools := slices.Concat(mcpTools, enabledTools)
+	if err := validateCodexToolNameCollisions(allTools); err != nil {
+		return nil, err
+	}
+	return allTools, nil
+}
 
-	return slices.Concat(mcpTools, enabledTools), nil
+func validateCodexToolNameCollisions(tools []Tool) error {
+	codexToolNames := make(map[string]struct{})
+	for _, tool := range tools {
+		functionTool, ok := tool.(FunctionTool)
+		if !ok || !functionTool.IsCodexTool {
+			continue
+		}
+		name := strings.TrimSpace(functionTool.Name)
+		if name != "" {
+			codexToolNames[name] = struct{}{}
+		}
+	}
+	if len(codexToolNames) == 0 {
+		return nil
+	}
+
+	nameCounts := make(map[string]int)
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool.ToolName())
+		if name != "" {
+			nameCounts[name]++
+		}
+	}
+
+	duplicateCodexNames := make([]string, 0, len(codexToolNames))
+	for name := range codexToolNames {
+		if nameCounts[name] > 1 {
+			duplicateCodexNames = append(duplicateCodexNames, name)
+		}
+	}
+	if len(duplicateCodexNames) == 0 {
+		return nil
+	}
+	slices.Sort(duplicateCodexNames)
+
+	return UserErrorf(
+		"Duplicate Codex tool names found: %s. Provide a unique codex_tool(name=...) per tool instance.",
+		strings.Join(duplicateCodexNames, ", "),
+	)
 }

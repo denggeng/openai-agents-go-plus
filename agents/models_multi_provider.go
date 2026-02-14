@@ -88,8 +88,13 @@ func (mp *MultiProvider) getPrefixAndModelName(modelName string) (_, _ string) {
 }
 
 func (mp *MultiProvider) createFallbackProvider(prefix string) (ModelProvider, error) {
-	// We didn't implement any fallback provider, so here we always return an error
-	return nil, UserErrorf("unknown prefix %q", prefix)
+	switch prefix {
+	case "litellm":
+		return NewLiteLLMProvider(LiteLLMProviderParams{}), nil
+	default:
+		// We didn't implement any fallback provider, so here we always return an error.
+		return nil, UserErrorf("unknown prefix %q", prefix)
+	}
 }
 
 func (mp *MultiProvider) getFallbackProvider(prefix string) (ModelProvider, error) {

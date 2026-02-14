@@ -87,8 +87,13 @@ func (chatCmplConverter) ConvertResponseFormat(
 	}, true, nil
 }
 
-func (chatCmplConverter) MessageToOutputItems(message openai.ChatCompletionMessage) ([]TResponseOutputItem, error) {
+func (chatCmplConverter) MessageToOutputItems(
+	message openai.ChatCompletionMessage,
+	providerData ...map[string]any,
+) ([]TResponseOutputItem, error) {
 	items := make([]TResponseOutputItem, 0)
+	baseProviderData := firstNonEmptyMap(providerData...)
+	modelName := providerDataModelName(baseProviderData)
 
 	// Build content array
 	var content []responses.ResponseOutputMessageContentUnion
@@ -118,23 +123,177 @@ func (chatCmplConverter) MessageToOutputItems(message openai.ChatCompletionMessa
 			Status:  string(responses.ResponseOutputMessageStatusCompleted),
 			Type:    "message",
 		}
+		if len(baseProviderData) > 0 {
+			withProviderData, err := responseOutputItemWithProviderData(messageItem, baseProviderData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode message provider_data: %w", err)
+			}
+			messageItem = withProviderData
+		}
 		items = append(items, messageItem)
 	}
 
 	// Add function calls
 	for _, toolCall := range message.ToolCalls {
+		callID := ChatCmplHelpers().CleanGeminiToolCallID(toolCall.ID, modelName)
 		funcCall := responses.ResponseOutputItemUnion{
 			ID:        FakeResponsesID,
-			CallID:    toolCall.ID,
+			CallID:    callID,
 			Arguments: toolCall.Function.Arguments,
 			Name:      toolCall.Function.Name,
 			Type:      "function_call",
 			Status:    string(responses.ResponseFunctionToolCallStatusCompleted),
 		}
+		funcProviderData := copyMap(baseProviderData)
+		if thoughtSignature := thoughtSignatureFromChatCompletionToolCall(toolCall, modelName); thoughtSignature != "" {
+			if funcProviderData == nil {
+				funcProviderData = map[string]any{}
+			}
+			funcProviderData["thought_signature"] = thoughtSignature
+		}
+		if len(funcProviderData) > 0 {
+			withProviderData, err := responseOutputItemWithProviderData(funcCall, funcProviderData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode function_call provider_data: %w", err)
+			}
+			funcCall = withProviderData
+		}
 		items = append(items, funcCall)
 	}
 
 	return items, nil
+}
+
+func responseOutputItemWithProviderData(
+	item responses.ResponseOutputItemUnion,
+	providerData map[string]any,
+) (responses.ResponseOutputItemUnion, error) {
+	payload := map[string]any{
+		"id":     item.ID,
+		"type":   item.Type,
+		"status": item.Status,
+	}
+	switch item.Type {
+	case "message":
+		payload["content"] = item.Content
+		payload["role"] = item.Role
+	case "function_call":
+		payload["call_id"] = item.CallID
+		payload["arguments"] = item.Arguments
+		payload["name"] = item.Name
+	default:
+		return item, nil
+	}
+	payload["provider_data"] = providerData
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return responses.ResponseOutputItemUnion{}, err
+	}
+
+	var out responses.ResponseOutputItemUnion
+	if err := json.Unmarshal(jsonPayload, &out); err != nil {
+		return responses.ResponseOutputItemUnion{}, err
+	}
+	return out, nil
+}
+
+func thoughtSignatureFromChatCompletionToolCall(
+	toolCall openai.ChatCompletionMessageToolCallUnion,
+	modelName string,
+) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(toolCall.RawJSON()), &payload); err != nil {
+		return ""
+	}
+	if sig := thoughtSignatureFromProviderSpecificFields(payload["provider_specific_fields"], modelName); sig != "" {
+		return sig
+	}
+	if sig := thoughtSignatureFromGoogleExtraContent(payload["extra_content"]); sig != "" {
+		return sig
+	}
+	return ""
+}
+
+func thoughtSignatureFromProviderSpecificFields(value any, modelName string) string {
+	if !isGeminiModelName(modelName) {
+		return ""
+	}
+	fields, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	thoughtSignature, _ := fields["thought_signature"].(string)
+	return thoughtSignature
+}
+
+func thoughtSignatureFromGoogleExtraContent(value any) string {
+	extraContent, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	googleFields, ok := extraContent["google"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	thoughtSignature, _ := googleFields["thought_signature"].(string)
+	return thoughtSignature
+}
+
+func providerDataModelName(providerData map[string]any) string {
+	if len(providerData) == 0 {
+		return ""
+	}
+	modelName, _ := providerData["model"].(string)
+	return modelName
+}
+
+func firstNonEmptyMap(maps ...map[string]any) map[string]any {
+	for _, input := range maps {
+		if len(input) > 0 {
+			return copyMap(input)
+		}
+	}
+	return nil
+}
+
+func copyMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func isGeminiModelName(modelName string) bool {
+	return strings.Contains(strings.ToLower(modelName), "gemini")
+}
+
+func thoughtSignatureFromFunctionCallProviderData(funcCall responses.ResponseFunctionToolCallParam) (string, bool) {
+	extraFields := funcCall.ExtraFields()
+	if len(extraFields) == 0 {
+		return "", false
+	}
+	providerDataAny, ok := extraFields["provider_data"]
+	if !ok {
+		return "", false
+	}
+	providerData, ok := providerDataAny.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	modelName, _ := providerData["model"].(string)
+	if !isGeminiModelName(modelName) {
+		return "", false
+	}
+	thoughtSignature, ok := providerData["thought_signature"].(string)
+	if !ok || thoughtSignature == "" {
+		return "", false
+	}
+	return thoughtSignature, true
 }
 
 func (conv chatCmplConverter) ExtractTextContentFromEasyInputMessageContentUnionParam(
@@ -505,6 +664,15 @@ func (conv chatCmplConverter) itemsToMessages(items []TResponseInputItem) ([]ope
 					},
 					Type: constant.ValueOf[constant.Function](),
 				},
+			}
+			if thoughtSignature, ok := thoughtSignatureFromFunctionCallProviderData(*funcCall); ok {
+				newToolCall.OfFunction.SetExtraFields(map[string]any{
+					"extra_content": map[string]any{
+						"google": map[string]any{
+							"thought_signature": thoughtSignature,
+						},
+					},
+				})
 			}
 			toolCalls = append(toolCalls, newToolCall)
 			asst.ToolCalls = toolCalls

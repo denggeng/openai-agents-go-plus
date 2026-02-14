@@ -295,6 +295,9 @@ func (m OpenAIResponsesModel) prepareRequest(
 	for k, v := range modelSettings.ExtraQuery {
 		opts = append(opts, option.WithQuery(k, v))
 	}
+	for k, v := range mergedModelExtraJSON(modelSettings) {
+		opts = append(opts, option.WithJSONSet(k, v))
+	}
 
 	if modelSettings.CustomizeResponsesRequest != nil {
 		return modelSettings.CustomizeResponsesRequest(ctx, params, opts)

@@ -60,6 +60,8 @@ func TestModelSettings_BasicSerialization(t *testing.T) {
 		"top_logprobs":        nil,
 		"extra_query":         nil,
 		"extra_headers":       nil,
+		"extra_body":          nil,
+		"extra_args":          nil,
 	}
 	assert.Equal(t, want, got)
 }
@@ -84,6 +86,8 @@ func TestModelSettings_AllFieldsSerialization(t *testing.T) {
 		TopLogprobs:       param.NewOpt(int64(1)),
 		ExtraQuery:        map[string]string{"foo": "bar"},
 		ExtraHeaders:      map[string]string{"foo": "bar"},
+		ExtraBody:         map[string]any{"body_key": "body_value"},
+		ExtraArgs:         map[string]any{"arg_key": "arg_value"},
 	}
 	res, err := json.Marshal(modelSettings)
 	require.NoError(t, err)
@@ -110,6 +114,8 @@ func TestModelSettings_AllFieldsSerialization(t *testing.T) {
 		"top_logprobs":        json.Number("1"),
 		"extra_query":         map[string]any{"foo": "bar"},
 		"extra_headers":       map[string]any{"foo": "bar"},
+		"extra_body":          map[string]any{"body_key": "body_value"},
+		"extra_args":          map[string]any{"arg_key": "arg_value"},
 	}
 	assert.Equal(t, want, got)
 }
@@ -150,6 +156,8 @@ func TestModelSettings_ToolChoiceMCPSerialization(t *testing.T) {
 		"top_logprobs":        nil,
 		"extra_query":         nil,
 		"extra_headers":       nil,
+		"extra_body":          nil,
+		"extra_args":          nil,
 	}
 	assert.Equal(t, want, got)
 }
@@ -183,6 +191,8 @@ func TestModelSettings_Resolve(t *testing.T) {
 		TopLogprobs:                     param.NewOpt(int64(1)),
 		ExtraQuery:                      map[string]string{"foo": "bar"},
 		ExtraHeaders:                    map[string]string{"foo": "bar"},
+		ExtraBody:                       map[string]any{"body": "base"},
+		ExtraArgs:                       map[string]any{"arg": "base"},
 		CustomizeResponsesRequest:       nil,
 		CustomizeChatCompletionsRequest: nil,
 	}
@@ -200,6 +210,7 @@ func TestModelSettings_Resolve(t *testing.T) {
 			Verbosity:  param.NewOpt(VerbosityHigh),
 			Store:      param.NewOpt(true),
 			ExtraQuery: map[string]string{"a": "b"},
+			ExtraBody:  map[string]any{"body": "override"},
 			CustomizeResponsesRequest: func(context.Context, *responses.ResponseNewParams, []option.RequestOption) (*responses.ResponseNewParams, []option.RequestOption, error) {
 				return nil, nil, nil
 			},
@@ -227,6 +238,8 @@ func TestModelSettings_Resolve(t *testing.T) {
 		assert.Equal(t, param.NewOpt(int64(1)), resolved.TopLogprobs)
 		assert.Equal(t, map[string]string{"a": "b"}, resolved.ExtraQuery)
 		assert.Equal(t, map[string]string{"foo": "bar"}, resolved.ExtraHeaders)
+		assert.Equal(t, map[string]any{"body": "override"}, resolved.ExtraBody)
+		assert.Equal(t, map[string]any{"arg": "base"}, resolved.ExtraArgs)
 		assert.NotNil(t, resolved.CustomizeResponsesRequest)
 		assert.Nil(t, resolved.CustomizeChatCompletionsRequest)
 	})
@@ -242,6 +255,7 @@ func TestModelSettings_Resolve(t *testing.T) {
 			ResponseInclude:   []responses.ResponseIncludable{responses.ResponseIncludableMessageInputImageImageURL},
 			TopLogprobs:       param.NewOpt(int64(2)),
 			ExtraHeaders:      map[string]string{"c": "d"},
+			ExtraArgs:         map[string]any{"arg": "override"},
 			CustomizeChatCompletionsRequest: func(context.Context, *openai.ChatCompletionNewParams, []option.RequestOption) (*openai.ChatCompletionNewParams, []option.RequestOption, error) {
 				return nil, nil, nil
 			},
@@ -269,6 +283,8 @@ func TestModelSettings_Resolve(t *testing.T) {
 		assert.Equal(t, param.NewOpt(int64(2)), resolved.TopLogprobs)
 		assert.Equal(t, map[string]string{"foo": "bar"}, resolved.ExtraQuery)
 		assert.Equal(t, map[string]string{"c": "d"}, resolved.ExtraHeaders)
+		assert.Equal(t, map[string]any{"body": "base"}, resolved.ExtraBody)
+		assert.Equal(t, map[string]any{"arg": "override"}, resolved.ExtraArgs)
 		assert.Nil(t, resolved.CustomizeResponsesRequest)
 		assert.NotNil(t, resolved.CustomizeChatCompletionsRequest)
 	})

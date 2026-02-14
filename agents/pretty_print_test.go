@@ -47,6 +47,8 @@ func TestPrettyResult(t *testing.T) {
 - 1 raw response(s)
 - 0 input guardrail result(s)
 - 0 output guardrail result(s)
+- 0 tool input guardrail result(s)
+- 0 tool output guardrail result(s)
 (See `+"`RunResult`"+` for more details)`, v)
 }
 
@@ -78,6 +80,8 @@ func TestPrettyRunResultStreaming(t *testing.T) {
 - 1 raw response(s)
 - 0 input guardrail result(s)
 - 0 output guardrail result(s)
+- 0 tool input guardrail result(s)
+- 0 tool output guardrail result(s)
 (See `+"`RunResultStreaming`"+` for more details)`, v)
 }
 
@@ -112,6 +116,8 @@ func TestPrettyRunResultStructuredOutput(t *testing.T) {
 - 1 raw response(s)
 - 0 input guardrail result(s)
 - 0 output guardrail result(s)
+- 0 tool input guardrail result(s)
+- 0 tool output guardrail result(s)
 (See `+"`RunResult`"+` for more details)`, v)
 }
 
@@ -151,6 +157,8 @@ func TestPrettyRunResultStreamingStructuredOutput(t *testing.T) {
 - 1 raw response(s)
 - 0 input guardrail result(s)
 - 0 output guardrail result(s)
+- 0 tool input guardrail result(s)
+- 0 tool output guardrail result(s)
 (See `+"`RunResultStreaming`"+` for more details)`, v)
 }
 
@@ -195,6 +203,8 @@ func TestPrettyRunResultSliceStructuredOutput(t *testing.T) {
 - 1 raw response(s)
 - 0 input guardrail result(s)
 - 0 output guardrail result(s)
+- 0 tool input guardrail result(s)
+- 0 tool output guardrail result(s)
 (See `+"`RunResult`"+` for more details)`, v)
 }
 
@@ -244,5 +254,7 @@ func TestPrettyRunResultStreamingListStructuredOutput(t *testing.T) {
 - 1 raw response(s)
 - 0 input guardrail result(s)
 - 0 output guardrail result(s)
+- 0 tool input guardrail result(s)
+- 0 tool output guardrail result(s)
 (See `+"`RunResultStreaming`"+` for more details)`, v)
 }

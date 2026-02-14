@@ -63,3 +63,14 @@ func (h chatCmplHelpers) GetStreamOptionsParam(
 	}
 	return options
 }
+
+// CleanGeminiToolCallID removes LiteLLM's "__thought__" suffix from Gemini tool call IDs.
+func (chatCmplHelpers) CleanGeminiToolCallID(toolCallID string, model string) string {
+	if strings.Contains(strings.ToLower(model), "gemini") && strings.Contains(toolCallID, "__thought__") {
+		parts := strings.Split(toolCallID, "__thought__")
+		if len(parts) > 0 {
+			return parts[0]
+		}
+	}
+	return toolCallID
+}

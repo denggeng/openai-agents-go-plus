@@ -17,6 +17,7 @@ package memory
 import (
 	"context"
 
+	"github.com/nlpodyssey/openai-agents-go/usage"
 	"github.com/openai/openai-go/v3/responses"
 )
 
@@ -43,4 +44,11 @@ type Session interface {
 
 	// ClearSession clears all items for this session.
 	ClearSession(context.Context) error
+}
+
+// RunUsageTrackingAwareSession extends Session with usage tracking support.
+// Sessions implementing this interface can persist token and request usage per turn.
+type RunUsageTrackingAwareSession interface {
+	Session
+	StoreRunUsage(ctx context.Context, runUsage *usage.Usage) error
 }

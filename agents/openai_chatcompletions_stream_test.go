@@ -318,3 +318,250 @@ func TestStreamResponseYieldsEventsForToolCall(t *testing.T) {
 	assert.Equal(t, "response.output_item.done", outputEvents[3].Type)
 	assert.Equal(t, "response.completed", outputEvents[4].Type)
 }
+
+func TestStreamResponsePreservesUsageFromEarlierChunk(t *testing.T) {
+	// Some providers can emit usage before the final chunk.
+	// Ensure we keep the last non-empty usage seen during stream consumption.
+	type m = map[string]any
+	chunk1 := m{
+		"id":      "chunk-id",
+		"created": 1,
+		"model":   "fake",
+		"object":  "chat.completion.chunk",
+		"choices": []m{{"index": 0, "delta": m{"content": "Hel"}}},
+		"usage": m{
+			"completion_tokens":         5,
+			"prompt_tokens":             7,
+			"total_tokens":              12,
+			"prompt_tokens_details":     m{"cached_tokens": 2},
+			"completion_tokens_details": m{"reasoning_tokens": 3},
+		},
+	}
+	chunk2 := m{
+		"id":      "chunk-id",
+		"created": 1,
+		"model":   "fake",
+		"object":  "chat.completion.chunk",
+		"choices": []m{{"index": 0, "delta": m{"content": "lo"}}},
+	}
+
+	dummyClient := makeOpenaiClientWithStreamResponse(t, chunk1, chunk2)
+	provider := agents.NewOpenAIProvider(agents.OpenAIProviderParams{
+		OpenaiClient: &dummyClient,
+		UseResponses: param.NewOpt(false),
+	})
+	model, err := provider.GetModel("gpt-4")
+	require.NoError(t, err)
+
+	var outputEvents []agents.TResponseStreamEvent
+	err = model.StreamResponse(
+		t.Context(),
+		agents.ModelResponseParams{
+			SystemInstructions: param.Opt[string]{},
+			Input:              agents.InputString(""),
+			ModelSettings:      modelsettings.ModelSettings{},
+			Tools:              nil,
+			OutputType:         nil,
+			Handoffs:           nil,
+			Tracing:            agents.ModelTracingDisabled,
+			PreviousResponseID: "",
+			Prompt:             responses.ResponsePromptParam{},
+		},
+		func(ctx context.Context, event agents.TResponseStreamEvent) error {
+			outputEvents = append(outputEvents, event)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, outputEvents)
+
+	completed := outputEvents[len(outputEvents)-1]
+	require.Equal(t, "response.completed", completed.Type)
+	assert.Equal(t, int64(7), completed.Response.Usage.InputTokens)
+	assert.Equal(t, int64(5), completed.Response.Usage.OutputTokens)
+	assert.Equal(t, int64(12), completed.Response.Usage.TotalTokens)
+	assert.Equal(t, int64(2), completed.Response.Usage.InputTokensDetails.CachedTokens)
+	assert.Equal(t, int64(3), completed.Response.Usage.OutputTokensDetails.ReasoningTokens)
+}
+
+func TestStreamResponseCleansGeminiThoughtSuffixInToolCallID(t *testing.T) {
+	type m = map[string]any
+	toolCallDelta := m{
+		"index":    0,
+		"id":       "call_stream_1__thought__litellm_sig_123",
+		"function": m{"name": "my_tool", "arguments": "{\"q\":1}"},
+		"type":     "function",
+	}
+	chunk := m{
+		"id":      "chunk-id",
+		"created": 1,
+		"model":   "gemini-2.0-pro",
+		"object":  "chat.completion.chunk",
+		"choices": []m{{"index": 0, "delta": m{"tool_calls": []m{toolCallDelta}}}},
+		"usage":   m{"completion_tokens": 1, "prompt_tokens": 1, "total_tokens": 2},
+	}
+
+	dummyClient := makeOpenaiClientWithStreamResponse(t, chunk)
+	provider := agents.NewOpenAIProvider(agents.OpenAIProviderParams{
+		OpenaiClient: &dummyClient,
+		UseResponses: param.NewOpt(false),
+	})
+	model, err := provider.GetModel("gemini-2.0-pro")
+	require.NoError(t, err)
+
+	var outputEvents []agents.TResponseStreamEvent
+	err = model.StreamResponse(
+		t.Context(),
+		agents.ModelResponseParams{
+			SystemInstructions: param.Opt[string]{},
+			Input:              agents.InputString(""),
+			ModelSettings:      modelsettings.ModelSettings{},
+			Tools:              nil,
+			Handoffs:           nil,
+			Tracing:            agents.ModelTracingDisabled,
+			PreviousResponseID: "",
+			Prompt:             responses.ResponsePromptParam{},
+		},
+		func(ctx context.Context, event agents.TResponseStreamEvent) error {
+			outputEvents = append(outputEvents, event)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, outputEvents, 5)
+
+	assert.Equal(t, "response.output_item.added", outputEvents[1].Type)
+	assert.Equal(t, "call_stream_1", outputEvents[1].Item.CallID)
+	assert.Equal(t, "response.output_item.done", outputEvents[3].Type)
+	assert.Equal(t, "call_stream_1", outputEvents[3].Item.CallID)
+}
+
+func TestStreamResponseCapturesLiteLLMProviderSpecificThoughtSignature(t *testing.T) {
+	type m = map[string]any
+	chunk := m{
+		"id":      "chunk-id-123",
+		"created": 1,
+		"model":   "gemini/gemini-3-pro",
+		"object":  "chat.completion.chunk",
+		"choices": []m{{"index": 0, "delta": m{"tool_calls": []m{
+			{
+				"index": 0,
+				"id":    "call_stream_1",
+				"function": m{
+					"name":      "get_weather",
+					"arguments": `{"city":"Tokyo"}`,
+				},
+				"type": "function",
+				"provider_specific_fields": m{
+					"thought_signature": "litellm_sig_123",
+				},
+			},
+		}}}},
+		"usage": m{"completion_tokens": 1, "prompt_tokens": 1, "total_tokens": 2},
+	}
+
+	dummyClient := makeOpenaiClientWithStreamResponse(t, chunk)
+	provider := agents.NewOpenAIProvider(agents.OpenAIProviderParams{
+		OpenaiClient: &dummyClient,
+		UseResponses: param.NewOpt(false),
+	})
+	model, err := provider.GetModel("gemini/gemini-3-pro")
+	require.NoError(t, err)
+
+	var outputEvents []agents.TResponseStreamEvent
+	err = model.StreamResponse(
+		t.Context(),
+		agents.ModelResponseParams{
+			SystemInstructions: param.Opt[string]{},
+			Input:              agents.InputString(""),
+			ModelSettings:      modelsettings.ModelSettings{},
+			Tools:              nil,
+			Handoffs:           nil,
+			Tracing:            agents.ModelTracingDisabled,
+			PreviousResponseID: "",
+			Prompt:             responses.ResponsePromptParam{},
+		},
+		func(ctx context.Context, event agents.TResponseStreamEvent) error {
+			outputEvents = append(outputEvents, event)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, outputEvents, 5)
+	require.Equal(t, "response.output_item.done", outputEvents[3].Type)
+	require.NotEmpty(t, outputEvents[3].Item.RawJSON())
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(outputEvents[3].Item.RawJSON()), &payload))
+	providerData, ok := payload["provider_data"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "litellm_sig_123", providerData["thought_signature"])
+	assert.Equal(t, "gemini/gemini-3-pro", providerData["model"])
+	assert.Equal(t, "chunk-id-123", providerData["response_id"])
+}
+
+func TestStreamResponseCapturesGoogleExtraContentThoughtSignature(t *testing.T) {
+	type m = map[string]any
+	chunk := m{
+		"id":      "chunk-id-456",
+		"created": 1,
+		"model":   "gemini/gemini-3-pro",
+		"object":  "chat.completion.chunk",
+		"choices": []m{{"index": 0, "delta": m{"tool_calls": []m{
+			{
+				"index": 0,
+				"id":    "call_stream_2",
+				"function": m{
+					"name":      "search",
+					"arguments": `{"query":"test"}`,
+				},
+				"type": "function",
+				"extra_content": m{
+					"google": m{
+						"thought_signature": "google_sig_456",
+					},
+				},
+			},
+		}}}},
+		"usage": m{"completion_tokens": 1, "prompt_tokens": 1, "total_tokens": 2},
+	}
+
+	dummyClient := makeOpenaiClientWithStreamResponse(t, chunk)
+	provider := agents.NewOpenAIProvider(agents.OpenAIProviderParams{
+		OpenaiClient: &dummyClient,
+		UseResponses: param.NewOpt(false),
+	})
+	model, err := provider.GetModel("gemini/gemini-3-pro")
+	require.NoError(t, err)
+
+	var outputEvents []agents.TResponseStreamEvent
+	err = model.StreamResponse(
+		t.Context(),
+		agents.ModelResponseParams{
+			SystemInstructions: param.Opt[string]{},
+			Input:              agents.InputString(""),
+			ModelSettings:      modelsettings.ModelSettings{},
+			Tools:              nil,
+			Handoffs:           nil,
+			Tracing:            agents.ModelTracingDisabled,
+			PreviousResponseID: "",
+			Prompt:             responses.ResponsePromptParam{},
+		},
+		func(ctx context.Context, event agents.TResponseStreamEvent) error {
+			outputEvents = append(outputEvents, event)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, outputEvents, 5)
+	require.Equal(t, "response.output_item.done", outputEvents[3].Type)
+	require.NotEmpty(t, outputEvents[3].Item.RawJSON())
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(outputEvents[3].Item.RawJSON()), &payload))
+	providerData, ok := payload["provider_data"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "google_sig_456", providerData["thought_signature"])
+	assert.Equal(t, "gemini/gemini-3-pro", providerData["model"])
+	assert.Equal(t, "chunk-id-456", providerData["response_id"])
+}

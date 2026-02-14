@@ -48,6 +48,15 @@ type RunResult struct {
 	// Guardrail results for the final output of the agent.
 	OutputGuardrailResults []OutputGuardrailResult
 
+	// Guardrail results for tool inputs run during the agent loop.
+	ToolInputGuardrailResults []ToolInputGuardrailResult
+
+	// Guardrail results for tool outputs run during the agent loop.
+	ToolOutputGuardrailResults []ToolOutputGuardrailResult
+
+	// Pending tool approvals that interrupted the run.
+	Interruptions []ToolApprovalItem
+
 	// The LastAgent that was run.
 	LastAgent *Agent
 }
@@ -73,48 +82,54 @@ func (r RunResult) LastResponseID() string {
 // - A MaxTurnsExceededError if the agent exceeds the max_turns limit.
 // - A *GuardrailTripwireTriggeredError error if a guardrail is tripped.
 type RunResultStreaming struct {
-	context                context.Context
-	input                  *atomic.Pointer[Input]
-	newItems               *atomic.Pointer[[]RunItem]
-	rawResponses           *atomic.Pointer[[]ModelResponse]
-	finalOutput            *atomic.Value
-	inputGuardrailResults  *atomic.Pointer[[]InputGuardrailResult]
-	outputGuardrailResults *atomic.Pointer[[]OutputGuardrailResult]
-	currentAgent           *atomic.Pointer[Agent]
-	currentTurn            *atomic.Uint64
-	maxTurns               *atomic.Uint64
-	currentAgentOutputType *atomic.Pointer[OutputTypeInterface]
-	trace                  *atomic.Pointer[tracing.Trace]
-	isComplete             *atomic.Bool
-	eventQueue             *asyncqueue.Queue[StreamEvent]
-	inputGuardrailQueue    *asyncqueue.Queue[InputGuardrailResult]
-	runImplTask            *atomic.Pointer[asynctask.TaskNoValue]
-	inputGuardrailsTask    *atomic.Pointer[asynctask.TaskNoValue]
-	outputGuardrailsTask   *atomic.Pointer[asynctask.Task[[]OutputGuardrailResult]]
-	storedError            *atomic.Pointer[error]
+	context                    context.Context
+	input                      *atomic.Pointer[Input]
+	newItems                   *atomic.Pointer[[]RunItem]
+	rawResponses               *atomic.Pointer[[]ModelResponse]
+	finalOutput                *atomic.Value
+	inputGuardrailResults      *atomic.Pointer[[]InputGuardrailResult]
+	outputGuardrailResults     *atomic.Pointer[[]OutputGuardrailResult]
+	toolInputGuardrailResults  *atomic.Pointer[[]ToolInputGuardrailResult]
+	toolOutputGuardrailResults *atomic.Pointer[[]ToolOutputGuardrailResult]
+	interruptions              *atomic.Pointer[[]ToolApprovalItem]
+	currentAgent               *atomic.Pointer[Agent]
+	currentTurn                *atomic.Uint64
+	maxTurns                   *atomic.Uint64
+	currentAgentOutputType     *atomic.Pointer[OutputTypeInterface]
+	trace                      *atomic.Pointer[tracing.Trace]
+	isComplete                 *atomic.Bool
+	eventQueue                 *asyncqueue.Queue[StreamEvent]
+	inputGuardrailQueue        *asyncqueue.Queue[InputGuardrailResult]
+	runImplTask                *atomic.Pointer[asynctask.TaskNoValue]
+	inputGuardrailsTask        *atomic.Pointer[asynctask.TaskNoValue]
+	outputGuardrailsTask       *atomic.Pointer[asynctask.Task[[]OutputGuardrailResult]]
+	storedError                *atomic.Pointer[error]
 }
 
 func newRunResultStreaming(ctx context.Context) *RunResultStreaming {
 	return &RunResultStreaming{
-		context:                ctx,
-		input:                  newZeroValAtomicPointer[Input](),
-		newItems:               newZeroValAtomicPointer[[]RunItem](),
-		rawResponses:           newZeroValAtomicPointer[[]ModelResponse](),
-		finalOutput:            new(atomic.Value),
-		inputGuardrailResults:  newZeroValAtomicPointer[[]InputGuardrailResult](),
-		outputGuardrailResults: newZeroValAtomicPointer[[]OutputGuardrailResult](),
-		currentAgent:           new(atomic.Pointer[Agent]),
-		currentTurn:            new(atomic.Uint64),
-		maxTurns:               new(atomic.Uint64),
-		currentAgentOutputType: newZeroValAtomicPointer[OutputTypeInterface](),
-		trace:                  newZeroValAtomicPointer[tracing.Trace](),
-		isComplete:             new(atomic.Bool),
-		eventQueue:             asyncqueue.New[StreamEvent](),
-		inputGuardrailQueue:    asyncqueue.New[InputGuardrailResult](),
-		runImplTask:            new(atomic.Pointer[asynctask.TaskNoValue]),
-		inputGuardrailsTask:    new(atomic.Pointer[asynctask.TaskNoValue]),
-		outputGuardrailsTask:   new(atomic.Pointer[asynctask.Task[[]OutputGuardrailResult]]),
-		storedError:            newZeroValAtomicPointer[error](),
+		context:                    ctx,
+		input:                      newZeroValAtomicPointer[Input](),
+		newItems:                   newZeroValAtomicPointer[[]RunItem](),
+		rawResponses:               newZeroValAtomicPointer[[]ModelResponse](),
+		finalOutput:                new(atomic.Value),
+		inputGuardrailResults:      newZeroValAtomicPointer[[]InputGuardrailResult](),
+		outputGuardrailResults:     newZeroValAtomicPointer[[]OutputGuardrailResult](),
+		toolInputGuardrailResults:  newZeroValAtomicPointer[[]ToolInputGuardrailResult](),
+		toolOutputGuardrailResults: newZeroValAtomicPointer[[]ToolOutputGuardrailResult](),
+		interruptions:              newZeroValAtomicPointer[[]ToolApprovalItem](),
+		currentAgent:               new(atomic.Pointer[Agent]),
+		currentTurn:                new(atomic.Uint64),
+		maxTurns:                   new(atomic.Uint64),
+		currentAgentOutputType:     newZeroValAtomicPointer[OutputTypeInterface](),
+		trace:                      newZeroValAtomicPointer[tracing.Trace](),
+		isComplete:                 new(atomic.Bool),
+		eventQueue:                 asyncqueue.New[StreamEvent](),
+		inputGuardrailQueue:        asyncqueue.New[InputGuardrailResult](),
+		runImplTask:                new(atomic.Pointer[asynctask.TaskNoValue]),
+		inputGuardrailsTask:        new(atomic.Pointer[asynctask.TaskNoValue]),
+		outputGuardrailsTask:       new(atomic.Pointer[asynctask.Task[[]OutputGuardrailResult]]),
+		storedError:                newZeroValAtomicPointer[error](),
 	}
 }
 
@@ -161,6 +176,42 @@ func (r *RunResultStreaming) OutputGuardrailResults() []OutputGuardrailResult {
 }
 func (r *RunResultStreaming) setOutputGuardrailResults(v []OutputGuardrailResult) {
 	r.outputGuardrailResults.Store(&v)
+}
+
+// ToolInputGuardrailResults returns tool-input guardrail results collected during tool execution.
+func (r *RunResultStreaming) ToolInputGuardrailResults() []ToolInputGuardrailResult {
+	return *r.toolInputGuardrailResults.Load()
+}
+func (r *RunResultStreaming) setToolInputGuardrailResults(v []ToolInputGuardrailResult) {
+	r.toolInputGuardrailResults.Store(&v)
+}
+func (r *RunResultStreaming) appendToolInputGuardrailResults(v ...ToolInputGuardrailResult) {
+	if len(v) == 0 {
+		return
+	}
+	r.setToolInputGuardrailResults(append(r.ToolInputGuardrailResults(), v...))
+}
+
+// ToolOutputGuardrailResults returns tool-output guardrail results collected during tool execution.
+func (r *RunResultStreaming) ToolOutputGuardrailResults() []ToolOutputGuardrailResult {
+	return *r.toolOutputGuardrailResults.Load()
+}
+func (r *RunResultStreaming) setToolOutputGuardrailResults(v []ToolOutputGuardrailResult) {
+	r.toolOutputGuardrailResults.Store(&v)
+}
+func (r *RunResultStreaming) appendToolOutputGuardrailResults(v ...ToolOutputGuardrailResult) {
+	if len(v) == 0 {
+		return
+	}
+	r.setToolOutputGuardrailResults(append(r.ToolOutputGuardrailResults(), v...))
+}
+
+// Interruptions returns pending tool approvals collected during the run.
+func (r *RunResultStreaming) Interruptions() []ToolApprovalItem {
+	return *r.interruptions.Load()
+}
+func (r *RunResultStreaming) setInterruptions(v []ToolApprovalItem) {
+	r.interruptions.Store(&v)
 }
 
 // CurrentAgent returns the current agent that is running.
@@ -307,13 +358,16 @@ func (r *RunResultStreaming) StreamEvents(fn func(StreamEvent) error) error {
 // createErrorDetails returns a RunErrorDetails object considering the current attributes of the object.
 func (r *RunResultStreaming) createErrorDetails() *RunErrorDetails {
 	return &RunErrorDetails{
-		Context:                r.context,
-		Input:                  r.Input(),
-		NewItems:               r.NewItems(),
-		RawResponses:           r.RawResponses(),
-		LastAgent:              r.CurrentAgent(),
-		InputGuardrailResults:  r.InputGuardrailResults(),
-		OutputGuardrailResults: r.OutputGuardrailResults(),
+		Context:                    r.context,
+		Input:                      r.Input(),
+		NewItems:                   r.NewItems(),
+		RawResponses:               r.RawResponses(),
+		LastAgent:                  r.CurrentAgent(),
+		InputGuardrailResults:      r.InputGuardrailResults(),
+		OutputGuardrailResults:     r.OutputGuardrailResults(),
+		ToolInputGuardrailResults:  r.ToolInputGuardrailResults(),
+		ToolOutputGuardrailResults: r.ToolOutputGuardrailResults(),
+		Interruptions:              r.Interruptions(),
 	}
 }
 

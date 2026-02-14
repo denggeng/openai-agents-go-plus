@@ -64,6 +64,20 @@ type FunctionTool struct {
 	// enable/disable a tool based on your context/state.
 	// Default value, if omitted: true.
 	IsEnabled FunctionToolEnabler
+
+	// Optional list of input guardrails to run before invoking this tool.
+	ToolInputGuardrails []ToolInputGuardrail
+
+	// Optional list of output guardrails to run after invoking this tool.
+	ToolOutputGuardrails []ToolOutputGuardrail
+
+	// Optional approval policy for this tool in realtime sessions.
+	// If set and returns true, the tool call will pause until explicitly approved.
+	NeedsApproval FunctionToolNeedsApproval
+
+	// Internal marker used for codex-tool specific runtime validation.
+	// Regular tools should leave this as false.
+	IsCodexTool bool
 }
 
 func (t FunctionTool) ToolName() string {
@@ -84,6 +98,66 @@ func DefaultToolErrorFunction(_ context.Context, err error) (any, error) {
 
 type FunctionToolEnabler interface {
 	IsEnabled(ctx context.Context, agent *Agent) (bool, error)
+}
+
+// FunctionToolNeedsApproval determines whether a specific tool call requires human approval.
+type FunctionToolNeedsApproval interface {
+	NeedsApproval(
+		ctx context.Context,
+		runContext *RunContextWrapper[any],
+		tool FunctionTool,
+		arguments map[string]any,
+		callID string,
+	) (bool, error)
+}
+
+// FunctionToolNeedsApprovalFlag is a static approval policy.
+type FunctionToolNeedsApprovalFlag struct {
+	needsApproval bool
+}
+
+func (f FunctionToolNeedsApprovalFlag) NeedsApproval(
+	context.Context,
+	*RunContextWrapper[any],
+	FunctionTool,
+	map[string]any,
+	string,
+) (bool, error) {
+	return f.needsApproval, nil
+}
+
+// NewFunctionToolNeedsApprovalFlag creates a static tool-approval policy.
+func NewFunctionToolNeedsApprovalFlag(needsApproval bool) FunctionToolNeedsApprovalFlag {
+	return FunctionToolNeedsApprovalFlag{needsApproval: needsApproval}
+}
+
+// FunctionToolNeedsApprovalEnabled always requires approval.
+func FunctionToolNeedsApprovalEnabled() FunctionToolNeedsApproval {
+	return NewFunctionToolNeedsApprovalFlag(true)
+}
+
+// FunctionToolNeedsApprovalDisabled never requires approval.
+func FunctionToolNeedsApprovalDisabled() FunctionToolNeedsApproval {
+	return NewFunctionToolNeedsApprovalFlag(false)
+}
+
+// FunctionToolNeedsApprovalFunc wraps a callback as a FunctionToolNeedsApproval policy.
+type FunctionToolNeedsApprovalFunc func(
+	ctx context.Context,
+	runContext *RunContextWrapper[any],
+	tool FunctionTool,
+	arguments map[string]any,
+	callID string,
+) (bool, error)
+
+func (f FunctionToolNeedsApprovalFunc) NeedsApproval(
+	ctx context.Context,
+	runContext *RunContextWrapper[any],
+	tool FunctionTool,
+	arguments map[string]any,
+	callID string,
+) (bool, error) {
+	return f(ctx, runContext, tool, arguments, callID)
 }
 
 // FunctionToolEnabledFlag is a static FunctionToolEnabler which always returns the configured flag value.

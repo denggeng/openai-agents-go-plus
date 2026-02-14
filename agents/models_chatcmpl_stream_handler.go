@@ -15,12 +15,14 @@
 package agents
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 
 	"github.com/nlpodyssey/openai-agents-go/openaitypes"
 	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/packages/respjson"
 	"github.com/openai/openai-go/v3/packages/ssestream"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
@@ -31,6 +33,8 @@ type StreamingState struct {
 	TextContentIndexAndOutput    *textContentIndexAndOutput
 	RefusalContentIndexAndOutput *refusalContentIndexAndOutput
 	FunctionCalls                map[int64]*responses.ResponseOutputItemUnion // responses.ResponseFunctionToolCall
+	BaseProviderData             map[string]any
+	FunctionCallProviderData     map[int64]map[string]any
 }
 
 func NewStreamingState() StreamingState {
@@ -39,6 +43,8 @@ func NewStreamingState() StreamingState {
 		TextContentIndexAndOutput:    nil,
 		RefusalContentIndexAndOutput: nil,
 		FunctionCalls:                make(map[int64]*responses.ResponseOutputItemUnion), // responses.ResponseFunctionToolCall
+		BaseProviderData:             make(map[string]any),
+		FunctionCallProviderData:     make(map[int64]map[string]any),
 	}
 }
 
@@ -102,6 +108,13 @@ func (chatCmplStreamHandler) HandleStream(
 
 		if len(chunk.Choices) == 0 || reflect.ValueOf(chunk.Choices[0].Delta).IsZero() {
 			continue
+		}
+
+		if modelName := string(response.Model); modelName != "" {
+			state.BaseProviderData["model"] = modelName
+		}
+		if chunk.ID != "" {
+			state.BaseProviderData["response_id"] = chunk.ID
 		}
 
 		delta := chunk.Choices[0].Delta
@@ -250,7 +263,15 @@ func (chatCmplStreamHandler) HandleStream(
 			tc.Arguments += tcFunction.Arguments
 			tc.Name += tcFunction.Name
 			if len(tcDelta.ID) > 0 {
-				tc.CallID = tcDelta.ID
+				tc.CallID = ChatCmplHelpers().CleanGeminiToolCallID(tcDelta.ID, string(response.Model))
+			}
+			if thoughtSignature := thoughtSignatureFromToolCallDelta(tcDelta, string(response.Model)); thoughtSignature != "" {
+				providerData := copyMap(state.BaseProviderData)
+				if providerData == nil {
+					providerData = map[string]any{}
+				}
+				providerData["thought_signature"] = thoughtSignature
+				state.FunctionCallProviderData[tcDelta.Index] = providerData
 			}
 		}
 	}
@@ -291,16 +312,24 @@ func (chatCmplStreamHandler) HandleStream(
 	}
 
 	// Actually send events for the function calls
-	for _, functionCall := range state.FunctionCalls {
+	for idx, functionCall := range state.FunctionCalls {
+		functionCallItem := responses.ResponseOutputItemUnion{ // responses.ResponseFunctionToolCall
+			ID:        FakeResponsesID,
+			CallID:    functionCall.CallID,
+			Arguments: functionCall.Arguments,
+			Name:      functionCall.Name,
+			Type:      "function_call",
+		}
+		if providerData := state.FunctionCallProviderData[idx]; len(providerData) > 0 {
+			withProviderData, providerDataErr := responseOutputItemWithProviderData(functionCallItem, providerData)
+			if providerDataErr != nil {
+				return fmt.Errorf("failed to encode function call provider_data: %w", providerDataErr)
+			}
+			functionCallItem = withProviderData
+		}
 		// First, a ResponseOutputItemAdded for the function call
 		if err = yield(TResponseStreamEvent{ // responses.ResponseOutputItemAddedEvent
-			Item: responses.ResponseOutputItemUnion{ // responses.ResponseFunctionToolCall
-				ID:        FakeResponsesID,
-				CallID:    functionCall.CallID,
-				Arguments: functionCall.Arguments,
-				Name:      functionCall.Name,
-				Type:      "function_call",
-			},
+			Item:           functionCallItem,
 			OutputIndex:    functionCallStartingIndex,
 			Type:           "response.output_item.added",
 			SequenceNumber: sequenceNumber.GetAndIncrement(),
@@ -319,13 +348,7 @@ func (chatCmplStreamHandler) HandleStream(
 		}
 		// Finally, the ResponseOutputItemDone
 		if err = yield(TResponseStreamEvent{ // responses.ResponseOutputItemDoneEvent
-			Item: responses.ResponseOutputItemUnion{ // responses.ResponseFunctionToolCall
-				ID:        FakeResponsesID,
-				CallID:    functionCall.CallID,
-				Arguments: functionCall.Arguments,
-				Name:      functionCall.Name,
-				Type:      "function_call",
-			},
+			Item:           functionCallItem,
 			OutputIndex:    functionCallStartingIndex,
 			Type:           "response.output_item.done",
 			SequenceNumber: sequenceNumber.GetAndIncrement(),
@@ -373,8 +396,22 @@ func (chatCmplStreamHandler) HandleStream(
 		}
 	}
 
-	for _, functionCall := range state.FunctionCalls {
-		outputs = append(outputs, *functionCall)
+	for idx, functionCall := range state.FunctionCalls {
+		outputItem := responses.ResponseOutputItemUnion{
+			ID:        FakeResponsesID,
+			CallID:    functionCall.CallID,
+			Arguments: functionCall.Arguments,
+			Name:      functionCall.Name,
+			Type:      "function_call",
+		}
+		if providerData := state.FunctionCallProviderData[idx]; len(providerData) > 0 {
+			withProviderData, providerDataErr := responseOutputItemWithProviderData(outputItem, providerData)
+			if providerDataErr != nil {
+				return fmt.Errorf("failed to encode final function call provider_data: %w", providerDataErr)
+			}
+			outputItem = withProviderData
+		}
+		outputs = append(outputs, outputItem)
 	}
 
 	finalResponse := response // copy
@@ -400,4 +437,41 @@ func (chatCmplStreamHandler) HandleStream(
 		Type:           "response.completed",
 		SequenceNumber: sequenceNumber.GetAndIncrement(),
 	})
+}
+
+func thoughtSignatureFromToolCallDelta(
+	tcDelta openai.ChatCompletionChunkChoiceDeltaToolCall,
+	modelName string,
+) string {
+	if thoughtSignature := thoughtSignatureFromProviderSpecificFields(
+		decodeRespJSONExtraField(tcDelta.JSON.ExtraFields, "provider_specific_fields"),
+		modelName,
+	); thoughtSignature != "" {
+		return thoughtSignature
+	}
+	if thoughtSignature := thoughtSignatureFromGoogleExtraContent(
+		decodeRespJSONExtraField(tcDelta.JSON.ExtraFields, "extra_content"),
+	); thoughtSignature != "" {
+		return thoughtSignature
+	}
+	return ""
+}
+
+func decodeRespJSONExtraField(extraFields map[string]respjson.Field, key string) any {
+	if len(extraFields) == 0 {
+		return nil
+	}
+	field, ok := extraFields[key]
+	if !ok {
+		return nil
+	}
+	raw := field.Raw()
+	if raw == "" {
+		return nil
+	}
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return nil
+	}
+	return value
 }

@@ -97,6 +97,16 @@ type ModelSettings struct {
 	// Optional additional headers to provide with the request.
 	ExtraHeaders map[string]string `json:"extra_headers"`
 
+	// Optional additional JSON body fields to provide with the request.
+	// These are applied after typed request params and can be useful for
+	// provider-specific extensions.
+	ExtraBody map[string]any `json:"extra_body"`
+
+	// Optional additional request args for provider-specific integrations.
+	// These are merged with ExtraBody; for duplicate keys, ExtraArgs wins,
+	// except `reasoning_effort` where ExtraBody wins for compatibility.
+	ExtraArgs map[string]any `json:"extra_args"`
+
 	// Optional function which allows you to fully customize parameters and options
 	// for a call to the responses API. Pre-built parameters and options are given.
 	// You should return the final parameters and options that will be passed
@@ -170,6 +180,8 @@ func (ms ModelSettings) Resolve(override ModelSettings) ModelSettings {
 	resolveOpt(&newSettings.TopLogprobs, override.TopLogprobs)
 	resolveMap(&newSettings.ExtraQuery, override.ExtraQuery)
 	resolveMap(&newSettings.ExtraHeaders, override.ExtraHeaders)
+	resolveMap(&newSettings.ExtraBody, override.ExtraBody)
+	resolveMap(&newSettings.ExtraArgs, override.ExtraArgs)
 	resolveAny(&newSettings.CustomizeResponsesRequest, override.CustomizeResponsesRequest)
 	resolveAny(&newSettings.CustomizeChatCompletionsRequest, override.CustomizeChatCompletionsRequest)
 	return newSettings

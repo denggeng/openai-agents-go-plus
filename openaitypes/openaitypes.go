@@ -15,10 +15,12 @@
 package openaitypes
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/packages/respjson"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 )
@@ -35,13 +37,17 @@ func ResponseInputItemUnionParamFromResponseOutputMessage(
 func ResponseOutputMessageToParam(
 	input responses.ResponseOutputMessage,
 ) responses.ResponseOutputMessageParam {
-	return responses.ResponseOutputMessageParam{
+	out := responses.ResponseOutputMessageParam{
 		ID:      input.ID,
 		Content: ResponseOutputMessageContentUnionSliceToParams(input.Content),
 		Status:  input.Status,
 		Role:    input.Role,
 		Type:    constant.ValueOf[constant.Message](),
 	}
+	if extraFields := decodedExtraFields(input.JSON.ExtraFields); len(extraFields) > 0 {
+		out.SetExtraFields(extraFields)
+	}
+	return out
 }
 
 func ResponseOutputMessageContentUnionSliceToParams(
@@ -176,7 +182,7 @@ func ResponseInputItemUnionParamFromResponseFunctionToolCall(
 func ResponseFunctionToolCallToParam(
 	input responses.ResponseFunctionToolCall,
 ) responses.ResponseFunctionToolCallParam {
-	return responses.ResponseFunctionToolCallParam{
+	out := responses.ResponseFunctionToolCallParam{
 		Arguments: input.Arguments,
 		CallID:    input.CallID,
 		Name:      input.Name,
@@ -184,6 +190,10 @@ func ResponseFunctionToolCallToParam(
 		Status:    input.Status,
 		Type:      constant.ValueOf[constant.FunctionCall](),
 	}
+	if extraFields := decodedExtraFields(input.JSON.ExtraFields); len(extraFields) > 0 {
+		out.SetExtraFields(extraFields)
+	}
+	return out
 }
 
 func ResponseInputItemUnionParamFromResponseInputItemFunctionCallOutputParam(
@@ -226,13 +236,17 @@ func ResponseReasoningItemToParam(
 	if input.EncryptedContent != "" {
 		encryptedContent = param.NewOpt(input.EncryptedContent)
 	}
-	return responses.ResponseReasoningItemParam{
+	out := responses.ResponseReasoningItemParam{
 		ID:               input.ID,
 		Summary:          ResponseReasoningItemSummarySliceToParams(input.Summary),
 		Status:           input.Status,
 		EncryptedContent: encryptedContent,
 		Type:             constant.ValueOf[constant.Reasoning](),
 	}
+	if extraFields := decodedExtraFields(input.JSON.ExtraFields); len(extraFields) > 0 {
+		out.SetExtraFields(extraFields)
+	}
+	return out
 }
 
 func ResponseReasoningItemSummarySliceToParams(
@@ -429,7 +443,7 @@ func ResponseFunctionWebSearchActionUnionToParam(
 	case "open_page":
 		return responses.ResponseFunctionWebSearchActionUnionParam{
 			OfOpenPage: &responses.ResponseFunctionWebSearchActionOpenPageParam{
-				URL:  input.URL,
+				URL:  makeOpt(input.URL),
 				Type: constant.ValueOf[constant.OpenPage](),
 			},
 		}
@@ -438,7 +452,7 @@ func ResponseFunctionWebSearchActionUnionToParam(
 			OfFind: &responses.ResponseFunctionWebSearchActionFindParam{
 				Pattern: input.Pattern,
 				URL:     input.URL,
-				Type:    constant.ValueOf[constant.Find](),
+				Type:    constant.ValueOf[constant.FindInPage](),
 			},
 		}
 	default:
@@ -846,6 +860,30 @@ func ResponseInputItemUnionParamFromResponseInputItemMcpApprovalResponseParam(
 	return responses.ResponseInputItemUnionParam{
 		OfMcpApprovalResponse: &input,
 	}
+}
+
+func decodedExtraFields(extraFields map[string]respjson.Field) map[string]any {
+	if len(extraFields) == 0 {
+		return nil
+	}
+
+	decoded := make(map[string]any, len(extraFields))
+	for k, field := range extraFields {
+		raw := field.Raw()
+		if raw == "" {
+			continue
+		}
+		var value any
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			continue
+		}
+		decoded[k] = value
+	}
+
+	if len(decoded) == 0 {
+		return nil
+	}
+	return decoded
 }
 
 func makeOpt[T comparable](v T) param.Opt[T] {

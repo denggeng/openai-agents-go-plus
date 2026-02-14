@@ -15,6 +15,7 @@
 package agents_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/nlpodyssey/openai-agents-go/agents"
@@ -127,6 +128,140 @@ func TestMessageToOutputItemsWithToolCall(t *testing.T) {
 			Type:      "function_call",
 		},
 	}, items)
+}
+
+func TestMessageToOutputItemsPropagatesGeminiThoughtSignatureToProviderData(t *testing.T) {
+	type m = map[string]any
+	rawMessage := m{
+		"role":    "assistant",
+		"content": "I'll check the weather.",
+		"tool_calls": []m{
+			{
+				"id":   "call_123__thought__litellm_sig_abc",
+				"type": "function",
+				"function": m{
+					"name":      "get_weather",
+					"arguments": `{"city":"Paris"}`,
+				},
+				"extra_content": m{
+					"google": m{
+						"thought_signature": "test_signature_abc",
+					},
+				},
+			},
+		},
+	}
+	rawBytes, err := json.Marshal(rawMessage)
+	require.NoError(t, err)
+
+	var message openai.ChatCompletionMessage
+	require.NoError(t, json.Unmarshal(rawBytes, &message))
+
+	items, err := agents.ChatCmplConverter().MessageToOutputItems(message, map[string]any{
+		"model":       "gemini/gemini-3-pro",
+		"response_id": "resp_123",
+	})
+	require.NoError(t, err)
+	require.Len(t, items, 2)
+
+	functionCall := items[1].AsFunctionCall()
+	assert.Equal(t, "call_123", functionCall.CallID)
+
+	var functionCallPayload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(functionCall.RawJSON()), &functionCallPayload))
+
+	providerData, ok := functionCallPayload["provider_data"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "gemini/gemini-3-pro", providerData["model"])
+	assert.Equal(t, "resp_123", providerData["response_id"])
+	assert.Equal(t, "test_signature_abc", providerData["thought_signature"])
+}
+
+func TestItemsToMessagesRestoresGeminiThoughtSignatureExtraContent(t *testing.T) {
+	functionCall := responses.ResponseFunctionToolCallParam{
+		ID:        param.NewOpt("tool1"),
+		CallID:    "call_restore",
+		Name:      "restore_func",
+		Arguments: `{"test":true}`,
+		Type:      constant.ValueOf[constant.FunctionCall](),
+	}
+	functionCall.SetExtraFields(map[string]any{
+		"provider_data": map[string]any{
+			"model":             "gemini/gemini-3-pro",
+			"response_id":       "gemini-response-id-123",
+			"thought_signature": "restored_sig_xyz",
+		},
+	})
+
+	result, err := agents.ChatCmplConverter().ItemsToMessages(agents.InputItems{
+		{OfFunctionCall: &functionCall},
+	})
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	resultJSON, err := json.Marshal(result[0])
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(resultJSON, &payload))
+
+	toolCalls, ok := payload["tool_calls"].([]any)
+	require.True(t, ok)
+	require.Len(t, toolCalls, 1)
+	toolCall, ok := toolCalls[0].(map[string]any)
+	require.True(t, ok)
+
+	extraContent, ok := toolCall["extra_content"].(map[string]any)
+	require.True(t, ok)
+	googleData, ok := extraContent["google"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "restored_sig_xyz", googleData["thought_signature"])
+}
+
+func TestItemsToMessagesRestoresThoughtSignatureAfterFunctionCallRoundTrip(t *testing.T) {
+	raw := map[string]any{
+		"id":        "fake-id",
+		"call_id":   "call_restore_roundtrip",
+		"name":      "restore_func",
+		"arguments": `{"test":true}`,
+		"type":      "function_call",
+		"provider_data": map[string]any{
+			"model":             "gemini/gemini-3-pro",
+			"response_id":       "gemini-response-id-456",
+			"thought_signature": "roundtrip_sig_123",
+		},
+	}
+	rawBytes, err := json.Marshal(raw)
+	require.NoError(t, err)
+
+	var functionCall responses.ResponseFunctionToolCall
+	require.NoError(t, json.Unmarshal(rawBytes, &functionCall))
+
+	inputItem := agents.TResponseInputItemFromResponseFunctionToolCall(
+		agents.ResponseFunctionToolCall(functionCall),
+	)
+
+	result, err := agents.ChatCmplConverter().ItemsToMessages(agents.InputItems{inputItem})
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	resultJSON, err := json.Marshal(result[0])
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(resultJSON, &payload))
+
+	toolCalls, ok := payload["tool_calls"].([]any)
+	require.True(t, ok)
+	require.Len(t, toolCalls, 1)
+	toolCall, ok := toolCalls[0].(map[string]any)
+	require.True(t, ok)
+
+	extraContent, ok := toolCall["extra_content"].(map[string]any)
+	require.True(t, ok)
+	googleData, ok := extraContent["google"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "roundtrip_sig_123", googleData["thought_signature"])
 }
 
 func TestItemsToMessagesWithStringUserContent(t *testing.T) {

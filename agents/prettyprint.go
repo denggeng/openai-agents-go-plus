@@ -66,6 +66,8 @@ func PrettyPrintResult(result RunResult) string {
 	_, _ = fmt.Fprintf(&sb, "\n- %d raw response(s)", len(result.RawResponses))
 	_, _ = fmt.Fprintf(&sb, "\n- %d input guardrail result(s)", len(result.InputGuardrailResults))
 	_, _ = fmt.Fprintf(&sb, "\n- %d output guardrail result(s)", len(result.OutputGuardrailResults))
+	_, _ = fmt.Fprintf(&sb, "\n- %d tool input guardrail result(s)", len(result.ToolInputGuardrailResults))
+	_, _ = fmt.Fprintf(&sb, "\n- %d tool output guardrail result(s)", len(result.ToolOutputGuardrailResults))
 	sb.WriteString("\n(See `RunResult` for more details)")
 
 	return sb.String()
@@ -87,6 +89,8 @@ func PrettyPrintRunResultStreaming(result RunResultStreaming) string {
 	_, _ = fmt.Fprintf(&sb, "\n- %d raw response(s)", len(result.RawResponses()))
 	_, _ = fmt.Fprintf(&sb, "\n- %d input guardrail result(s)", len(result.InputGuardrailResults()))
 	_, _ = fmt.Fprintf(&sb, "\n- %d output guardrail result(s)", len(result.OutputGuardrailResults()))
+	_, _ = fmt.Fprintf(&sb, "\n- %d tool input guardrail result(s)", len(result.ToolInputGuardrailResults()))
+	_, _ = fmt.Fprintf(&sb, "\n- %d tool output guardrail result(s)", len(result.ToolOutputGuardrailResults()))
 	sb.WriteString("\n(See `RunResultStreaming` for more details)")
 
 	return sb.String()
@@ -101,6 +105,8 @@ func PrettyPrintRunErrorDetails(d RunErrorDetails) string {
 	_, _ = fmt.Fprintf(&sb, "\n- %d raw response(s)", len(d.RawResponses))
 	_, _ = fmt.Fprintf(&sb, "\n- %d input guardrail result(s)", len(d.InputGuardrailResults))
 	_, _ = fmt.Fprintf(&sb, "\n- %d output guardrail result(s)", len(d.OutputGuardrailResults))
+	_, _ = fmt.Fprintf(&sb, "\n- %d tool input guardrail result(s)", len(d.ToolInputGuardrailResults))
+	_, _ = fmt.Fprintf(&sb, "\n- %d tool output guardrail result(s)", len(d.ToolOutputGuardrailResults))
 	sb.WriteString("\n(See `RunErrorDetails` for more details)")
 
 	return sb.String()

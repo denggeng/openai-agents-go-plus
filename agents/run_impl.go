@@ -108,6 +108,7 @@ type ProcessedResponse struct {
 	Functions       []ToolRunFunction
 	ComputerActions []ToolRunComputerAction
 	LocalShellCalls []ToolRunLocalShellCall
+	Interruptions   []ToolApprovalItem
 	// Names of all tools used, including hosted tools
 	ToolsUsed []string
 	// Only requests with callbacks
@@ -142,6 +143,12 @@ type NextStepRunAgain struct{}
 
 func (NextStepRunAgain) isNextStep() {}
 
+type NextStepInterruption struct {
+	Interruptions []ToolApprovalItem
+}
+
+func (NextStepInterruption) isNextStep() {}
+
 type SingleStepResult struct {
 	// The input items i.e. the items before Run() was called. May be mutated by handoff input filters.
 	OriginalInput Input
@@ -154,6 +161,12 @@ type SingleStepResult struct {
 
 	// Items generated during this current step.
 	NewStepItems []RunItem
+
+	// Results of tool input guardrails run during this step.
+	ToolInputGuardrailResults []ToolInputGuardrailResult
+
+	// Results of tool output guardrails run during this step.
+	ToolOutputGuardrailResults []ToolOutputGuardrailResult
 
 	// The next step to take.
 	NextStep NextStep
@@ -202,15 +215,17 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
-		functionResults []FunctionToolResult
-		computerResults []RunItem
-		toolErrors      [2]error
-		wg              sync.WaitGroup
+		functionResults            []FunctionToolResult
+		toolInputGuardrailResults  []ToolInputGuardrailResult
+		toolOutputGuardrailResults []ToolOutputGuardrailResult
+		computerResults            []RunItem
+		toolErrors                 [2]error
+		wg                         sync.WaitGroup
 	)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		functionResults, toolErrors[0] = ri.ExecuteFunctionToolCalls(
+		functionResults, toolInputGuardrailResults, toolOutputGuardrailResults, toolErrors[0] = ri.ExecuteFunctionToolCalls(
 			childCtx,
 			agent,
 			processedResponse.Functions,
@@ -246,9 +261,23 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 		newStepItems = append(newStepItems, approvalResults...)
 	}
 
+	if interruptions := processedResponse.Interruptions; len(interruptions) > 0 {
+		return &SingleStepResult{
+			OriginalInput:              originalInput,
+			ModelResponse:              newResponse,
+			PreStepItems:               preStepItems,
+			NewStepItems:               newStepItems,
+			ToolInputGuardrailResults:  toolInputGuardrailResults,
+			ToolOutputGuardrailResults: toolOutputGuardrailResults,
+			NextStep: NextStepInterruption{
+				Interruptions: slices.Clone(interruptions),
+			},
+		}, nil
+	}
+
 	// Next, check if there are any handoffs
 	if runHandoffs := processedResponse.Handoffs; len(runHandoffs) > 0 {
-		return ri.ExecuteHandoffs(
+		stepResult, err := ri.ExecuteHandoffs(
 			ctx,
 			agent,
 			originalInput,
@@ -259,6 +288,12 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 			hooks,
 			runConfig,
 		)
+		if err != nil {
+			return nil, err
+		}
+		stepResult.ToolInputGuardrailResults = toolInputGuardrailResults
+		stepResult.ToolOutputGuardrailResults = toolOutputGuardrailResults
+		return stepResult, nil
 	}
 
 	// Next, we'll check if the tool use should result in a final output
@@ -279,7 +314,7 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 			}
 		}
 
-		return ri.ExecuteFinalOutput(
+		stepResult, err := ri.ExecuteFinalOutput(
 			ctx,
 			agent,
 			originalInput,
@@ -289,6 +324,12 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 			checkToolUse.FinalOutput.Or(nil),
 			hooks,
 		)
+		if err != nil {
+			return nil, err
+		}
+		stepResult.ToolInputGuardrailResults = toolInputGuardrailResults
+		stepResult.ToolOutputGuardrailResults = toolOutputGuardrailResults
+		return stepResult, nil
 	}
 
 	// Now we can check if the model also produced a final output
@@ -315,7 +356,7 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 		if err != nil {
 			return nil, fmt.Errorf("final output type JSON validation failed: %w", err)
 		}
-		return ri.ExecuteFinalOutput(
+		stepResult, err := ri.ExecuteFinalOutput(
 			ctx,
 			agent,
 			originalInput,
@@ -325,8 +366,14 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 			finalOutput,
 			hooks,
 		)
+		if err != nil {
+			return nil, err
+		}
+		stepResult.ToolInputGuardrailResults = toolInputGuardrailResults
+		stepResult.ToolOutputGuardrailResults = toolOutputGuardrailResults
+		return stepResult, nil
 	} else if (outputType == nil || outputType.IsPlainText()) && !processedResponse.HasToolsOrApprovalsToRun() {
-		return ri.ExecuteFinalOutput(
+		stepResult, err := ri.ExecuteFinalOutput(
 			ctx,
 			agent,
 			originalInput,
@@ -336,14 +383,22 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 			potentialFinalOutputText,
 			hooks,
 		)
+		if err != nil {
+			return nil, err
+		}
+		stepResult.ToolInputGuardrailResults = toolInputGuardrailResults
+		stepResult.ToolOutputGuardrailResults = toolOutputGuardrailResults
+		return stepResult, nil
 	} else {
 		// If there's no final output, we can just run again
 		return &SingleStepResult{
-			OriginalInput: originalInput,
-			ModelResponse: newResponse,
-			PreStepItems:  preStepItems,
-			NewStepItems:  newStepItems,
-			NextStep:      NextStepRunAgain{},
+			OriginalInput:              originalInput,
+			ModelResponse:              newResponse,
+			PreStepItems:               preStepItems,
+			NewStepItems:               newStepItems,
+			ToolInputGuardrailResults:  toolInputGuardrailResults,
+			ToolOutputGuardrailResults: toolOutputGuardrailResults,
+			NextStep:                   NextStepRunAgain{},
 		}, nil
 	}
 }
@@ -377,6 +432,7 @@ func (runImpl) ProcessModelResponse(
 		functions           []ToolRunFunction
 		computerActions     []ToolRunComputerAction
 		localShellCalls     []ToolRunLocalShellCall
+		interruptions       []ToolApprovalItem
 		mcpApprovalRequests []ToolRunMCPApprovalRequest
 		computerTool        *ComputerTool
 		localShellTool      *LocalShellTool
@@ -509,6 +565,10 @@ func (runImpl) ProcessModelResponse(
 			} else {
 				Logger().Warn("MCP server has no OnApprovalRequest hook",
 					slog.String("serverLabel", output.ServerLabel))
+				interruptions = append(interruptions, ToolApprovalItem{
+					ToolName: output.Name,
+					RawItem:  output,
+				})
 			}
 		case "mcp_list_tools":
 			output := responses.ResponseOutputItemMcpListTools{
@@ -531,7 +591,7 @@ func (runImpl) ProcessModelResponse(
 				ServerLabel: outputUnion.ServerLabel,
 				Type:        constant.ValueOf[constant.McpCall](),
 				Error:       outputUnion.Error,
-				Output:      outputUnion.Output,
+				Output:      outputUnion.Output.OfString,
 			}
 			items = append(items, ToolCallItem{
 				Agent:   agent,
@@ -590,13 +650,21 @@ func (runImpl) ProcessModelResponse(
 				LocalShellTool: *localShellTool,
 			})
 		case "function_call":
-			output := responses.ResponseFunctionToolCall{
-				Arguments: outputUnion.Arguments,
-				CallID:    outputUnion.CallID,
-				Name:      outputUnion.Name,
-				Type:      constant.ValueOf[constant.FunctionCall](),
-				ID:        outputUnion.ID,
-				Status:    responses.ResponseFunctionToolCallStatus(outputUnion.Status),
+			var output responses.ResponseFunctionToolCall
+			if outputUnion.RawJSON() != "" {
+				output = outputUnion.AsFunctionCall()
+			} else {
+				output = responses.ResponseFunctionToolCall{
+					Arguments: outputUnion.Arguments,
+					CallID:    outputUnion.CallID,
+					Name:      outputUnion.Name,
+					Type:      constant.ValueOf[constant.FunctionCall](),
+					ID:        outputUnion.ID,
+					Status:    responses.ResponseFunctionToolCallStatus(outputUnion.Status),
+				}
+			}
+			if output.Type == "" {
+				output.Type = constant.ValueOf[constant.FunctionCall]()
 			}
 
 			toolsUsed = append(toolsUsed, output.Name)
@@ -642,6 +710,7 @@ func (runImpl) ProcessModelResponse(
 		Functions:           functions,
 		ComputerActions:     computerActions,
 		LocalShellCalls:     localShellCalls,
+		Interruptions:       interruptions,
 		ToolsUsed:           toolsUsed,
 		MCPApprovalRequests: mcpApprovalRequests,
 	}, nil
@@ -658,19 +727,21 @@ type FunctionToolResult struct {
 	RunItem RunItem
 }
 
-func (runImpl) ExecuteFunctionToolCalls(
+func (ri runImpl) ExecuteFunctionToolCalls(
 	ctx context.Context,
 	agent *Agent,
 	toolRuns []ToolRunFunction,
 	hooks RunHooks,
 	config RunConfig,
-) ([]FunctionToolResult, error) {
+) ([]FunctionToolResult, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, error) {
 	runSingleTool := func(
 		ctx context.Context,
 		funcTool FunctionTool,
 		toolCall ResponseFunctionToolCall,
-	) (any, error) {
+	) (any, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, error) {
 		var result any
+		var toolInputGuardrailResults []ToolInputGuardrailResult
+		var toolOutputGuardrailResults []ToolOutputGuardrailResult
 
 		traceIncludeSensitiveData := config.TraceIncludeSensitiveData.Or(true)
 
@@ -683,6 +754,11 @@ func (runImpl) ExecuteFunctionToolCalls(
 			ctx, tracing.FunctionSpanParams{Name: funcTool.Name},
 			func(ctx context.Context, spanFn tracing.Span) (err error) {
 				ctx = ContextWithToolData(ctx, toolCall.CallID, responses.ResponseFunctionToolCall(toolCall))
+				toolContextData := ToolContextData{
+					ToolName:      toolCall.Name,
+					ToolCallID:    toolCall.CallID,
+					ToolArguments: toolCall.Arguments,
+				}
 				if traceIncludeSensitiveData {
 					spanFn.SpanData().(*tracing.FunctionSpanData).Input = toolCall.Arguments
 				}
@@ -702,6 +778,24 @@ func (runImpl) ExecuteFunctionToolCalls(
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
 				defer cancel()
+
+				rejectionMessage, err := ri.executeToolInputGuardrails(
+					ctx,
+					agent,
+					funcTool,
+					toolContextData,
+					&toolInputGuardrailResults,
+				)
+				if err != nil {
+					return err
+				}
+				if rejectionMessage != nil {
+					result = *rejectionMessage
+					if traceIncludeSensitiveData {
+						spanFn.SpanData().(*tracing.FunctionSpanData).Output = result
+					}
+					return nil
+				}
 
 				var wg sync.WaitGroup
 
@@ -759,6 +853,18 @@ func (runImpl) ExecuteFunctionToolCalls(
 					})
 				}
 
+				result, err = ri.executeToolOutputGuardrails(
+					ctx,
+					agent,
+					funcTool,
+					toolContextData,
+					result,
+					&toolOutputGuardrailResults,
+				)
+				if err != nil {
+					return err
+				}
+
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -794,12 +900,14 @@ func (runImpl) ExecuteFunctionToolCalls(
 			})
 
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
-		return result, nil
+		return result, toolInputGuardrailResults, toolOutputGuardrailResults, nil
 	}
 
 	results := make([]any, len(toolRuns))
+	perToolInputGuardrailResults := make([][]ToolInputGuardrailResult, len(toolRuns))
+	perToolOutputGuardrailResults := make([][]ToolOutputGuardrailResult, len(toolRuns))
 	resultErrors := make([]error, len(toolRuns))
 
 	var cancel context.CancelFunc
@@ -810,18 +918,21 @@ func (runImpl) ExecuteFunctionToolCalls(
 	wg.Add(len(toolRuns))
 
 	for i, toolRun := range toolRuns {
-		go func() {
+		go func(i int, toolRun ToolRunFunction) {
 			defer wg.Done()
-			results[i], resultErrors[i] = runSingleTool(ctx, toolRun.FunctionTool, toolRun.ToolCall)
+			results[i],
+				perToolInputGuardrailResults[i],
+				perToolOutputGuardrailResults[i],
+				resultErrors[i] = runSingleTool(ctx, toolRun.FunctionTool, toolRun.ToolCall)
 			if resultErrors[i] != nil {
 				cancel()
 			}
-		}()
+		}(i, toolRun)
 	}
 
 	wg.Wait()
 	if err := errors.Join(resultErrors...); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	functionToolResults := make([]FunctionToolResult, len(results))
@@ -837,7 +948,7 @@ func (runImpl) ExecuteFunctionToolCalls(
 		default:
 			out, err := json.Marshal(v)
 			if err != nil {
-				return nil, err
+				return nil, nil, nil, err
 			}
 			strResult = string(out)
 		}
@@ -855,7 +966,97 @@ func (runImpl) ExecuteFunctionToolCalls(
 		}
 	}
 
-	return functionToolResults, nil
+	var toolInputGuardrailResults []ToolInputGuardrailResult
+	var toolOutputGuardrailResults []ToolOutputGuardrailResult
+	for i := range toolRuns {
+		toolInputGuardrailResults = append(toolInputGuardrailResults, perToolInputGuardrailResults[i]...)
+		toolOutputGuardrailResults = append(toolOutputGuardrailResults, perToolOutputGuardrailResults[i]...)
+	}
+
+	return functionToolResults, toolInputGuardrailResults, toolOutputGuardrailResults, nil
+}
+
+func (runImpl) executeToolInputGuardrails(
+	ctx context.Context,
+	agent *Agent,
+	funcTool FunctionTool,
+	toolContextData ToolContextData,
+	results *[]ToolInputGuardrailResult,
+) (*string, error) {
+	if len(funcTool.ToolInputGuardrails) == 0 {
+		return nil, nil
+	}
+
+	for _, guardrail := range funcTool.ToolInputGuardrails {
+		guardrailResult, err := guardrail.Run(ctx, ToolInputGuardrailData{
+			Context: toolContextData,
+			Agent:   agent,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		*results = append(*results, guardrailResult)
+
+		switch behaviorType := guardrailResult.Output.BehaviorType(); behaviorType {
+		case ToolGuardrailBehaviorTypeAllow:
+			// Continue to the next guardrail.
+		case ToolGuardrailBehaviorTypeRaiseException:
+			err := NewToolInputGuardrailTripwireTriggeredError(guardrail, guardrailResult.Output)
+			return nil, err
+		case ToolGuardrailBehaviorTypeRejectContent:
+			message := guardrailResult.Output.BehaviorMessage()
+			return &message, nil
+		default:
+			return nil, UserErrorf("unknown tool input guardrail behavior type %q", behaviorType)
+		}
+	}
+
+	return nil, nil
+}
+
+func (runImpl) executeToolOutputGuardrails(
+	ctx context.Context,
+	agent *Agent,
+	funcTool FunctionTool,
+	toolContextData ToolContextData,
+	realResult any,
+	results *[]ToolOutputGuardrailResult,
+) (any, error) {
+	if len(funcTool.ToolOutputGuardrails) == 0 {
+		return realResult, nil
+	}
+
+	finalResult := realResult
+	for _, guardrail := range funcTool.ToolOutputGuardrails {
+		guardrailResult, err := guardrail.Run(ctx, ToolOutputGuardrailData{
+			ToolInputGuardrailData: ToolInputGuardrailData{
+				Context: toolContextData,
+				Agent:   agent,
+			},
+			Output: realResult,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		*results = append(*results, guardrailResult)
+
+		switch behaviorType := guardrailResult.Output.BehaviorType(); behaviorType {
+		case ToolGuardrailBehaviorTypeAllow:
+			// Continue to the next guardrail.
+		case ToolGuardrailBehaviorTypeRaiseException:
+			err := NewToolOutputGuardrailTripwireTriggeredError(guardrail, guardrailResult.Output)
+			return nil, err
+		case ToolGuardrailBehaviorTypeRejectContent:
+			finalResult = guardrailResult.Output.BehaviorMessage()
+			return finalResult, nil
+		default:
+			return nil, UserErrorf("unknown tool output guardrail behavior type %q", behaviorType)
+		}
+	}
+
+	return finalResult, nil
 }
 
 func (runImpl) ExecuteLocalShellCalls(
