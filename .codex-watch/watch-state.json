@@ -1,8 +1,0 @@
-{
-  "sessionId": "warm-reef",
-  "lastTaskCompleteTurnId": "019c694a-6caa-7dd0-ad6f-ac1e693aeae9",
-  "lastCodexTuiLogMtime": 1771296277,
-  "lastRolloutJsonlMtime": 1771296286,
-  "lastSeenRolloutPath": "/Users/denggeng/.codex/sessions/2026/02/14/rollout-2026-02-14T19-53-39-019c5bff-d94c-7b61-837a-49790cee4b2c.jsonl",
-  "lastRestartAt": "2026-02-17T10:13:43+08:00"
-}
