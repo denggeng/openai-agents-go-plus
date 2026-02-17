@@ -17,7 +17,7 @@ package codex
 import (
 	"slices"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 // TurnOptions stores run-specific options for a Codex thread turn.

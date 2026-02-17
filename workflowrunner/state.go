@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 type ExecutionStatus string

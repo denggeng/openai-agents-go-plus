@@ -16,10 +16,11 @@ package agents_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/agentstesting"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/agentstesting"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"
@@ -237,6 +238,135 @@ func TestRunFromStateAutoAppliesStoredToolApprovalsSkipsExistingResponses(t *tes
 
 	resumeInput := agents.ItemHelpers().InputToNewInputList(model.LastTurnArgs.Input)
 	assert.Equal(t, 1, countMCPApprovalResponses(resumeInput, "approval_1", true))
+}
+
+func TestRunFromStateResumesApprovedApplyPatch(t *testing.T) {
+	editor := &recordingApplyPatchEditor{}
+	applyPatchTool := agents.ApplyPatchTool{
+		Editor:        editor,
+		NeedsApproval: agents.ApplyPatchNeedsApprovalEnabled(),
+	}
+
+	model := agentstesting.NewFakeModel(false, nil)
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{
+			Value: []agents.TResponseOutputItem{
+				mustApplyPatchCustomCall(t, "call_apply_1"),
+			},
+		},
+		{
+			Value: []agents.TResponseOutputItem{
+				agentstesting.GetTextMessage("done"),
+			},
+		},
+	})
+
+	agent := agents.New("apply-agent").WithModelInstance(model).WithTools(applyPatchTool)
+	first, err := agents.Runner{}.Run(t.Context(), agent, "update")
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Len(t, first.Interruptions, 1)
+
+	state := agents.NewRunStateFromResult(*first, 1, 3)
+	require.NoError(t, state.ApproveTool(first.Interruptions[0]))
+
+	resumed, err := agents.Runner{}.RunFromState(t.Context(), agent, state)
+	require.NoError(t, err)
+	require.NotNil(t, resumed)
+	assert.Equal(t, "done", resumed.FinalOutput)
+	assert.Empty(t, resumed.Interruptions)
+	assert.Len(t, editor.operations, 1)
+	assert.NotEmpty(t, collectApplyPatchOutputs(resumed.NewItems))
+}
+
+func TestRunFromStatePendingApplyPatchRemainsPending(t *testing.T) {
+	editor := &recordingApplyPatchEditor{}
+	applyPatchTool := agents.ApplyPatchTool{
+		Editor:        editor,
+		NeedsApproval: agents.ApplyPatchNeedsApprovalEnabled(),
+	}
+
+	model := agentstesting.NewFakeModel(false, nil)
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{
+			Value: []agents.TResponseOutputItem{
+				mustApplyPatchCustomCall(t, "call_apply_pending"),
+			},
+		},
+	})
+
+	agent := agents.New("apply-agent").WithModelInstance(model).WithTools(applyPatchTool)
+	first, err := agents.Runner{}.Run(t.Context(), agent, "update")
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Len(t, first.Interruptions, 1)
+
+	state := agents.NewRunStateFromResult(*first, 1, 3)
+	resumed, err := agents.Runner{}.RunFromState(t.Context(), agent, state)
+	require.NoError(t, err)
+	require.NotNil(t, resumed)
+	assert.NotEmpty(t, resumed.Interruptions)
+	assert.Empty(t, editor.operations)
+	assert.Empty(t, collectApplyPatchOutputs(resumed.NewItems))
+}
+
+type recordingApplyPatchEditor struct {
+	operations []agents.ApplyPatchOperation
+}
+
+func (r *recordingApplyPatchEditor) CreateFile(operation agents.ApplyPatchOperation) (any, error) {
+	r.operations = append(r.operations, operation)
+	return nil, nil
+}
+
+func (r *recordingApplyPatchEditor) UpdateFile(operation agents.ApplyPatchOperation) (any, error) {
+	r.operations = append(r.operations, operation)
+	return nil, nil
+}
+
+func (r *recordingApplyPatchEditor) DeleteFile(operation agents.ApplyPatchOperation) (any, error) {
+	r.operations = append(r.operations, operation)
+	return nil, nil
+}
+
+func mustApplyPatchCustomCall(t *testing.T, callID string) responses.ResponseOutputItemUnion {
+	t.Helper()
+	payload := map[string]any{
+		"type":    "custom_tool_call",
+		"name":    "apply_patch",
+		"call_id": callID,
+		"input":   `{"type":"update_file","path":"test.md","diff":"-a\n+b\n"}`,
+	}
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	var item responses.ResponseOutputItemUnion
+	require.NoError(t, json.Unmarshal(raw, &item))
+	return item
+}
+
+func collectApplyPatchOutputs(items []agents.RunItem) []agents.ToolCallOutputItem {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]agents.ToolCallOutputItem, 0)
+	for _, item := range items {
+		outputItem, ok := item.(agents.ToolCallOutputItem)
+		if !ok {
+			continue
+		}
+		raw, err := json.Marshal(outputItem.RawItem)
+		if err != nil {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			continue
+		}
+		if payload["type"] == "apply_patch_call_output" {
+			out = append(out, outputItem)
+		}
+	}
+	return out
 }
 
 func TestRunFromStatePreservesAndAppendsToolGuardrailResults(t *testing.T) {

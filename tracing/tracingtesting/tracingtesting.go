@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 )
 
 func Setup(t *testing.T) {

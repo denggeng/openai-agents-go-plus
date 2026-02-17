@@ -18,8 +18,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/memory"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/memory"
 	"github.com/openai/openai-go/v3/responses"
 )
 

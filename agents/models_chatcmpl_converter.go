@@ -22,8 +22,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
-	"github.com/nlpodyssey/openai-agents-go/openaitypes"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/openaitypes"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
@@ -94,6 +94,27 @@ func (chatCmplConverter) MessageToOutputItems(
 	items := make([]TResponseOutputItem, 0)
 	baseProviderData := firstNonEmptyMap(providerData...)
 	modelName := providerDataModelName(baseProviderData)
+
+	if reasoningContent := reasoningContentFromChatCompletionMessage(message); reasoningContent != "" {
+		reasoningItem := responses.ResponseOutputItemUnion{
+			ID: FakeResponsesID,
+			Summary: []responses.ResponseReasoningItemSummary{
+				{
+					Text: reasoningContent,
+					Type: constant.ValueOf[constant.SummaryText](),
+				},
+			},
+			Type: "reasoning",
+		}
+		if len(baseProviderData) > 0 {
+			withProviderData, err := responseOutputItemWithProviderData(reasoningItem, baseProviderData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode reasoning provider_data: %w", err)
+			}
+			reasoningItem = withProviderData
+		}
+		items = append(items, reasoningItem)
+	}
 
 	// Build content array
 	var content []responses.ResponseOutputMessageContentUnion
@@ -181,6 +202,11 @@ func responseOutputItemWithProviderData(
 		payload["call_id"] = item.CallID
 		payload["arguments"] = item.Arguments
 		payload["name"] = item.Name
+	case "reasoning":
+		payload["summary"] = item.Summary
+		if item.EncryptedContent != "" {
+			payload["encrypted_content"] = item.EncryptedContent
+		}
 	default:
 		return item, nil
 	}
@@ -213,6 +239,27 @@ func thoughtSignatureFromChatCompletionToolCall(
 		return sig
 	}
 	return ""
+}
+
+func reasoningContentFromChatCompletionMessage(message openai.ChatCompletionMessage) string {
+	extraFields := message.JSON.ExtraFields
+	if len(extraFields) == 0 {
+		return ""
+	}
+	field, ok := extraFields["reasoning_content"]
+	if !ok {
+		return ""
+	}
+	raw := field.Raw()
+	if raw == "" {
+		return ""
+	}
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return ""
+	}
+	str, _ := value.(string)
+	return str
 }
 
 func thoughtSignatureFromProviderSpecificFields(value any, modelName string) string {
@@ -270,6 +317,10 @@ func copyMap(src map[string]any) map[string]any {
 
 func isGeminiModelName(modelName string) bool {
 	return strings.Contains(strings.ToLower(modelName), "gemini")
+}
+
+func isDeepSeekModelName(modelName string) bool {
+	return strings.Contains(strings.ToLower(modelName), "deepseek")
 }
 
 func thoughtSignatureFromFunctionCallProviderData(funcCall responses.ResponseFunctionToolCallParam) (string, bool) {
@@ -428,6 +479,10 @@ func (chatCmplConverter) ExtractAllContentFromResponseInputContentUnionParams(
 // - tool calls get attached to the *current* assistant message, or create one if none.
 // - tool outputs => openai.ChatCompletionToolMessageParam
 func (conv chatCmplConverter) ItemsToMessages(items Input) ([]openai.ChatCompletionMessageParamUnion, error) {
+	return conv.ItemsToMessagesWithModel(items, "")
+}
+
+func (conv chatCmplConverter) ItemsToMessagesWithModel(items Input, model string) ([]openai.ChatCompletionMessageParamUnion, error) {
 	switch v := items.(type) {
 	case InputString:
 		return []openai.ChatCompletionMessageParamUnion{{
@@ -439,24 +494,30 @@ func (conv chatCmplConverter) ItemsToMessages(items Input) ([]openai.ChatComplet
 			},
 		}}, nil
 	case InputItems:
-		return conv.itemsToMessages(v)
+		return conv.itemsToMessagesWithModel(v, model)
 	default:
 		// This would be an unrecoverable implementation bug, so a panic is appropriate.
 		panic(fmt.Errorf("unexpected Input type %T", v))
 	}
 }
 
-func (conv chatCmplConverter) itemsToMessages(items []TResponseInputItem) ([]openai.ChatCompletionMessageParamUnion, error) {
+func (conv chatCmplConverter) itemsToMessagesWithModel(items []TResponseInputItem, model string) ([]openai.ChatCompletionMessageParamUnion, error) {
 	var result []openai.ChatCompletionMessageParamUnion
 
 	var currentAssistantMsg *openai.ChatCompletionAssistantMessageParam
+	var pendingReasoningContent string
 
 	flushAssistantMessage := func() {
 		if currentAssistantMsg != nil {
+			if len(currentAssistantMsg.ToolCalls) == 0 {
+				pendingReasoningContent = ""
+			}
 			result = append(result, openai.ChatCompletionMessageParamUnion{
 				OfAssistant: currentAssistantMsg,
 			})
 			currentAssistantMsg = nil
+		} else {
+			pendingReasoningContent = ""
 		}
 	}
 
@@ -650,6 +711,16 @@ func (conv chatCmplConverter) itemsToMessages(items []TResponseInputItem) ([]ope
 			asst := ensureAssistantMessage()
 			toolCalls := slices.Clone(asst.ToolCalls)
 
+			if pendingReasoningContent != "" {
+				assistantExtra := copyMap(asst.ExtraFields())
+				if assistantExtra == nil {
+					assistantExtra = map[string]any{}
+				}
+				assistantExtra["reasoning_content"] = pendingReasoningContent
+				asst.SetExtraFields(assistantExtra)
+				pendingReasoningContent = ""
+			}
+
 			arguments := funcCall.Arguments
 			if arguments == "" {
 				arguments = "{}"
@@ -706,9 +777,28 @@ func (conv chatCmplConverter) itemsToMessages(items []TResponseInputItem) ([]ope
 			result = append(result, msg)
 		} else if itemRef := item.OfItemReference; !param.IsOmitted(itemRef) { // 6) item reference => handle or return error
 			return nil, UserErrorf("encountered an item_reference, which is not supported: %+v", *itemRef)
-		} else if !param.IsOmitted(item.OfReasoning) { // 7) reasoning message => not handled
-			flushAssistantMessage()
-			return nil, nil
+		} else if reasoning := item.OfReasoning; !param.IsOmitted(reasoning) { // 7) reasoning message
+			if model != "" && isDeepSeekModelName(model) {
+				providerData := reasoning.ExtraFields()
+				itemModel := ""
+				if providerDataAny, ok := providerData["provider_data"]; ok {
+					if providerDataMap, ok := providerDataAny.(map[string]any); ok {
+						itemModel, _ = providerDataMap["model"].(string)
+					}
+				}
+
+				if itemModel == "" || isDeepSeekModelName(itemModel) {
+					summaryTexts := make([]string, 0, len(reasoning.Summary))
+					for _, summary := range reasoning.Summary {
+						if summary.Text != "" {
+							summaryTexts = append(summaryTexts, summary.Text)
+						}
+					}
+					if len(summaryTexts) > 0 {
+						pendingReasoningContent = strings.Join(summaryTexts, "\n")
+					}
+				}
+			}
 		} else { // 8) If we haven't recognized it => fail or ignore
 			return nil, UserErrorf("unhandled item type or structure: %+v", item)
 		}

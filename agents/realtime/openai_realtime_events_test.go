@@ -195,6 +195,29 @@ func TestHandleWSEventErrorInvalidErrorPayloadTypeEmitsError(t *testing.T) {
 	assert.Contains(t, errorEvent.Error.(error).Error(), "invalid field error")
 }
 
+func TestHandleWSEventErrorEmitsErrorEvent(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "invalid_request_error",
+			"code":    "invalid_api_key",
+			"message": "Invalid API key provided",
+		},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+	_, ok = errorEvent.Error.(map[string]any)
+	assert.True(t, ok)
+}
+
 func TestHandleWSEventResponseCreatedMissingResponseEmitsError(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	listener := &captureRealtimeListener{}
@@ -299,6 +322,46 @@ func TestHandleWSEventAudioDelta(t *testing.T) {
 	assert.Greater(t, audioState.AudioLengthMS, 0.0)
 }
 
+func TestHandleWSEventAudioDeltaAccumulatesTimingAndTracksCurrentItem(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})
+	model.audioStateTracker.SetAudioFormat("pcm16")
+
+	events := []map[string]any{
+		{
+			"type":          "response.output_audio.delta",
+			"response_id":   "resp_1",
+			"item_id":       "item_1",
+			"output_index":  0,
+			"content_index": 0,
+			"delta":         base64.StdEncoding.EncodeToString([]byte("test")),
+		},
+		{
+			"type":          "response.output_audio.delta",
+			"response_id":   "resp_1",
+			"item_id":       "item_1",
+			"output_index":  0,
+			"content_index": 0,
+			"delta":         base64.StdEncoding.EncodeToString([]byte("more")),
+		},
+	}
+
+	for _, event := range events {
+		require.NoError(t, model.handleWSEvent(t.Context(), event))
+	}
+
+	assert.Equal(t, "item_1", model.currentItemID)
+	audioState := model.audioStateTracker.GetState("item_1", 0)
+	require.NotNil(t, audioState)
+	expectedLength := (8.0 / (24000.0 * 2.0)) * 1000.0
+	assert.InDelta(t, expectedLength, audioState.AudioLengthMS, 1e-6)
+
+	last := model.audioStateTracker.GetLastAudioItem()
+	require.NotNil(t, last)
+	assert.Equal(t, "item_1", last.ItemID)
+	assert.Equal(t, 0, last.ItemContentIndex)
+}
+
 func TestHandleWSEventLegacyResponseAudioDeltaAlias(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})
@@ -357,6 +420,63 @@ func TestHandleWSEventOutputItemDoneFunctionCall(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "lookup_weather", toolCall.Name)
 	assert.Equal(t, `{"city":"SF"}`, toolCall.Arguments)
+}
+
+func TestHandleWSEventOutputItemAddedAndDoneEmitsItemUpdated(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":         "response.output_item.added",
+		"output_index": 0,
+		"item": map[string]any{
+			"id":   "msg_1",
+			"type": "message",
+			"role": "assistant",
+			"content": []map[string]any{
+				{"type": "output_text", "text": "hello"},
+			},
+		},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	itemUpdated, ok := listener.events[1].(RealtimeModelItemUpdatedEvent)
+	require.True(t, ok)
+	item, ok := itemUpdated.Item.(RealtimeMessageItem)
+	require.True(t, ok)
+	require.Len(t, item.Content, 1)
+	assert.Equal(t, "text", item.Content[0].Type)
+	if assert.NotNil(t, item.Content[0].Text) {
+		assert.Equal(t, "hello", *item.Content[0].Text)
+	}
+	require.NotNil(t, item.Status)
+	assert.Equal(t, "in_progress", *item.Status)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":         "response.output_item.done",
+		"output_index": 0,
+		"item": map[string]any{
+			"id":   "msg_1",
+			"type": "message",
+			"role": "assistant",
+			"content": []map[string]any{
+				{"type": "output_text", "text": "bye"},
+			},
+		},
+	}))
+
+	require.Len(t, listener.events, 4)
+	_, ok = listener.events[2].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	itemUpdated, ok = listener.events[3].(RealtimeModelItemUpdatedEvent)
+	require.True(t, ok)
+	item, ok = itemUpdated.Item.(RealtimeMessageItem)
+	require.True(t, ok)
+	require.NotNil(t, item.Status)
+	assert.Equal(t, "completed", *item.Status)
 }
 
 func TestHandleWSEventOutputItemMissingItemEmitsError(t *testing.T) {
@@ -874,6 +994,81 @@ func TestHandleWSEventSpeechStartedInterruptsAndCancels(t *testing.T) {
 	assert.False(t, model.ongoingResponse)
 }
 
+func TestHandleWSEventSpeechStartedDoesNotAutoInterruptWithoutPlayback(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":           "input_audio_buffer.speech_started",
+		"item_id":        "item_1",
+		"audio_start_ms": 0,
+	}))
+
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	assert.Empty(t, model.sentClientEvents)
+}
+
+func TestHandleWSEventSpeechStartedSkipsTruncateWhenAudioComplete(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})
+
+	model.audioStateTracker.SetAudioFormat("pcm16")
+	model.audioStateTracker.OnAudioDelta("item_1", 0, make([]byte, 48000))
+	key := modelAudioStateKey{itemID: "item_1", itemContentIndex: 0}
+	state, ok := model.audioStateTracker.states[key]
+	require.True(t, ok)
+	state.InitialReceivedTime = time.Now().Add(-5 * time.Second)
+	model.audioStateTracker.states[key] = state
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":           "input_audio_buffer.speech_started",
+		"item_id":        "item_1",
+		"audio_start_ms": 0,
+		"audio_end_ms":   0,
+	}))
+
+	truncates := make([]map[string]any, 0)
+	for _, event := range model.sentClientEvents {
+		if eventType, _ := event["type"].(string); eventType == "conversation.item.truncate" {
+			truncates = append(truncates, event)
+		}
+	}
+	assert.Empty(t, truncates)
+}
+
+func TestHandleWSEventSpeechStartedTruncatesWhenResponseOngoing(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})
+
+	model.audioStateTracker.SetAudioFormat("pcm16")
+	model.audioStateTracker.OnAudioDelta("item_1", 0, make([]byte, 48000))
+	key := modelAudioStateKey{itemID: "item_1", itemContentIndex: 0}
+	state, ok := model.audioStateTracker.states[key]
+	require.True(t, ok)
+	state.InitialReceivedTime = time.Now().Add(-5 * time.Second)
+	model.audioStateTracker.states[key] = state
+	model.ongoingResponse = true
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":           "input_audio_buffer.speech_started",
+		"item_id":        "item_1",
+		"audio_start_ms": 0,
+		"audio_end_ms":   0,
+	}))
+
+	truncates := make([]map[string]any, 0)
+	for _, event := range model.sentClientEvents {
+		if eventType, _ := event["type"].(string); eventType == "conversation.item.truncate" {
+			truncates = append(truncates, event)
+		}
+	}
+	require.Len(t, truncates, 1)
+	assert.Equal(t, 1000, truncates[0]["audio_end_ms"])
+}
+
 func TestHandleWSEventSpeechStartedMissingAudioStartMSEmitsError(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	listener := &captureRealtimeListener{}
@@ -890,6 +1085,28 @@ func TestHandleWSEventSpeechStartedMissingAudioStartMSEmitsError(t *testing.T) {
 	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
 	require.True(t, ok)
 	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field audio_start_ms")
+}
+
+func TestHandleWSEventInputAudioTimeoutTriggeredEmitsEvent(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":           "input_audio_buffer.timeout_triggered",
+		"item_id":        "item_1",
+		"audio_start_ms": 0,
+		"audio_end_ms":   100,
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	timeoutEvent, ok := listener.events[1].(RealtimeModelInputAudioTimeoutTriggeredEvent)
+	require.True(t, ok)
+	assert.Equal(t, "item_1", timeoutEvent.ItemID)
+	assert.Equal(t, 0, timeoutEvent.AudioStartMS)
+	assert.Equal(t, 100, timeoutEvent.AudioEndMS)
 }
 
 func TestHandleWSEventConversationItemMissingTypeEmitsError(t *testing.T) {
@@ -1022,7 +1239,7 @@ func TestConnectWithTransportDialerStartsListenerAndWritesSessionUpdate(t *testi
 	require.NoError(t, model.Connect(t.Context(), RealtimeModelConfig{
 		APIKey:          "sk-test",
 		EnableTransport: true,
-		TransportDialer: func(context.Context, string, map[string]string) (RealtimeWebSocketConn, error) {
+		TransportDialer: func(context.Context, string, map[string]string, *RealtimeTransportConfig) (RealtimeWebSocketConn, error) {
 			return fakeConn, nil
 		},
 		InitialSettings: RealtimeSessionModelSettings{},

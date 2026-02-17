@@ -23,8 +23,8 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/denggeng/openai-agents-go-plus/agents"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/nlpodyssey/openai-agents-go/agents"
 )
 
 // FakeMCPPromptServer is a fake MCP server for testing prompt functionality.

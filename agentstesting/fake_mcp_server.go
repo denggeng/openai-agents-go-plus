@@ -20,9 +20,9 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/denggeng/openai-agents-go-plus/agents"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/nlpodyssey/openai-agents-go/agents"
 )
 
 type FakeMCPServer struct {

@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -465,5 +465,6 @@ func getExecuteResultAllowingError(t *testing.T, params getExecuteResultParams) 
 		params.agent.OutputType,
 		hooks,
 		params.runConfig,
+		nil,
 	)
 }

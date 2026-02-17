@@ -17,11 +17,8 @@ package realtime
 import (
 	"context"
 	"fmt"
-	"strings"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/util/transforms"
-	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 	oairealtime "github.com/openai/openai-go/v3/realtime"
 )
 
@@ -38,7 +35,7 @@ func CollectEnabledHandoffs[T any](
 	for _, item := range agent.Handoffs {
 		switch v := item.(type) {
 		case agents.Handoff:
-			if isHandoffEnabled(v, agent) {
+			if isHandoffEnabled(v, agent, contextWrapper) {
 				enabled = append(enabled, v)
 			}
 		case *RealtimeAgent[T]:
@@ -53,7 +50,6 @@ func CollectEnabledHandoffs[T any](
 		}
 	}
 
-	_ = contextWrapper // reserved for future dynamic enabler evaluation
 	return enabled, nil
 }
 
@@ -105,34 +101,6 @@ func BuildModelSettingsFromAgent[T any](
 	return updated, nil
 }
 
-// RealtimeHandoff converts a realtime agent into an agent handoff descriptor.
-func RealtimeHandoff[T any](agent *RealtimeAgent[T]) agents.Handoff {
-	agentName := ""
-	if agent != nil {
-		agentName = agent.Name
-	}
-	name := transforms.TransformStringFunctionStyle("transfer_to_" + agentName)
-	return agents.Handoff{
-		ToolName:        name,
-		ToolDescription: fmt.Sprintf("Handoff to the %s agent to handle the request.", agentName),
-		InputJSONSchema: map[string]any{
-			"type":                 "object",
-			"additionalProperties": false,
-			"properties":           map[string]any{},
-			"required":             []string{},
-		},
-		OnInvokeHandoff: func(context.Context, string) (*agents.Agent, error) {
-			if strings.TrimSpace(agentName) == "" {
-				return nil, fmt.Errorf("realtime handoff target agent is missing")
-			}
-			return &agents.Agent{Name: agentName}, nil
-		},
-		AgentName:        agentName,
-		StrictJSONSchema: param.NewOpt(true),
-		IsEnabled:        agents.HandoffEnabled(),
-	}
-}
-
 func cloneSettingsMap(input RealtimeSessionModelSettings) RealtimeSessionModelSettings {
 	if input == nil {
 		return nil
@@ -144,11 +112,25 @@ func cloneSettingsMap(input RealtimeSessionModelSettings) RealtimeSessionModelSe
 	return out
 }
 
-func isHandoffEnabled[T any](handoff agents.Handoff, agent *RealtimeAgent[T]) bool {
+func isHandoffEnabled[T any](
+	handoff agents.Handoff,
+	agent *RealtimeAgent[T],
+	contextWrapper *agents.RunContextWrapper[T],
+) bool {
 	if handoff.IsEnabled == nil {
 		return true
 	}
-	enabled, err := handoff.IsEnabled.IsEnabled(context.Background(), &agents.Agent{Name: agent.Name})
+
+	ctx := context.Background()
+	if contextWrapper != nil {
+		anyContext := agents.NewRunContextWrapper[any](contextWrapper.Context)
+		anyContext.Usage = contextWrapper.Usage
+		anyContext.TurnInput = contextWrapper.TurnInput
+		anyContext.ToolInput = contextWrapper.ToolInput
+		ctx = agents.ContextWithRunContextValue(ctx, anyContext)
+	}
+
+	enabled, err := handoff.IsEnabled.IsEnabled(ctx, &agents.Agent{Name: agent.Name})
 	if err != nil {
 		return false
 	}

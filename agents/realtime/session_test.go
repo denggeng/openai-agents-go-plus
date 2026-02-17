@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -86,6 +86,64 @@ func TestRealtimeSessionEnterConnectsAndEmitsInitialHistory(t *testing.T) {
 	assert.Len(t, historyUpdated.History, 0)
 }
 
+func TestRealtimeSessionModelReturnsUnderlyingModel(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{},
+	)
+
+	assert.Equal(t, model, session.Model())
+}
+
+func TestRealtimeSessionEnterConnectsWithToolsAndHandoffs(t *testing.T) {
+	model := &mockRealtimeModel{}
+	tool := agents.FunctionTool{
+		Name:             "tool_one",
+		Description:      "Tool one",
+		ParamsJSONSchema: map[string]any{"type": "object"},
+		OnInvokeTool: func(_ context.Context, _ string) (any, error) {
+			return "ok", nil
+		},
+	}
+	childAgent := &RealtimeAgent[any]{Name: "one"}
+	parentAgent := &RealtimeAgent[any]{
+		Name:         "two",
+		Instructions: "instr_two",
+		Tools:        []agents.Tool{tool},
+		Handoffs:     []any{childAgent},
+	}
+
+	session := NewRealtimeSession(
+		model,
+		parentAgent,
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{},
+	)
+
+	require.NoError(t, session.Enter(t.Context()))
+	<-session.Events() // initial history event
+
+	settings := model.connectCfg.InitialSettings
+	require.NotNil(t, settings)
+	assert.Equal(t, "instr_two", settings["instructions"])
+
+	tools, ok := settings["tools"].([]agents.Tool)
+	require.True(t, ok)
+	require.Len(t, tools, 1)
+	assert.Equal(t, "tool_one", tools[0].ToolName())
+
+	handoffs, ok := settings["handoffs"].([]agents.Handoff)
+	require.True(t, ok)
+	require.Len(t, handoffs, 1)
+	assert.Equal(t, "transfer_to_one", handoffs[0].ToolName)
+	assert.Equal(t, "one", handoffs[0].AgentName)
+}
+
 func TestRealtimeSessionSendMethodsForwardEvents(t *testing.T) {
 	model := &mockRealtimeModel{}
 	session := NewRealtimeSession(
@@ -106,6 +164,122 @@ func TestRealtimeSessionSendMethodsForwardEvents(t *testing.T) {
 	assert.Equal(t, realtimeSendEventTypeUserInput, model.sentEvents[0].Type())
 	assert.Equal(t, realtimeSendEventTypeAudio, model.sentEvents[1].Type())
 	assert.Equal(t, realtimeSendEventTypeInterrupt, model.sentEvents[2].Type())
+}
+
+func TestRealtimeSessionErrorEventTransforms(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{"async_tool_calls": false},
+	)
+
+	errPayload := map[string]any{"message": "boom"}
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelErrorEvent{Error: errPayload}))
+
+	raw, ok := (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	assert.Equal(t, errPayload, raw.Data.(RealtimeModelErrorEvent).Error)
+
+	realtimeErr, ok := (<-session.Events()).(RealtimeErrorEvent)
+	require.True(t, ok)
+	assert.Equal(t, errPayload, realtimeErr.Error)
+}
+
+func TestRealtimeSessionAudioEventsTransform(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{"async_tool_calls": false},
+	)
+
+	audioEvent := RealtimeModelAudioEvent{
+		Data:         []byte("audio"),
+		ResponseID:   "resp_1",
+		ItemID:       "item_1",
+		ContentIndex: 0,
+	}
+	require.NoError(t, session.OnEvent(t.Context(), audioEvent))
+	_, ok := (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	audioSessionEvent, ok := (<-session.Events()).(RealtimeAudioEvent)
+	require.True(t, ok)
+	assert.Equal(t, audioEvent, audioSessionEvent.Audio)
+	assert.Equal(t, "item_1", audioSessionEvent.ItemID)
+
+	interrupted := RealtimeModelAudioInterruptedEvent{ItemID: "item_1", ContentIndex: 0}
+	require.NoError(t, session.OnEvent(t.Context(), interrupted))
+	_, ok = (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	_, ok = (<-session.Events()).(RealtimeAudioInterruptedEvent)
+	require.True(t, ok)
+
+	done := RealtimeModelAudioDoneEvent{ItemID: "item_1", ContentIndex: 0}
+	require.NoError(t, session.OnEvent(t.Context(), done))
+	_, ok = (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	_, ok = (<-session.Events()).(RealtimeAudioEndEvent)
+	require.True(t, ok)
+}
+
+func TestRealtimeSessionTurnEventsTransform(t *testing.T) {
+	model := &mockRealtimeModel{}
+	agent := &RealtimeAgent[any]{Name: "agent"}
+	session := NewRealtimeSession(
+		model,
+		agent,
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{"async_tool_calls": false},
+	)
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelTurnStartedEvent{}))
+	_, ok := (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	startEvent, ok := (<-session.Events()).(RealtimeAgentStartEvent)
+	require.True(t, ok)
+	assert.Equal(t, agent, startEvent.Agent)
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelTurnEndedEvent{}))
+	_, ok = (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	endEvent, ok := (<-session.Events()).(RealtimeAgentEndEvent)
+	require.True(t, ok)
+	assert.Equal(t, agent, endEvent.Agent)
+}
+
+func TestRealtimeSessionIgnoredEventsOnlyEmitRaw(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{"async_tool_calls": false},
+	)
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelTranscriptDeltaEvent{
+		ItemID:     "item_1",
+		Delta:      "hi",
+		ResponseID: "resp_1",
+	}))
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelConnectionStatusEvent{
+		Status: RealtimeConnectionStatusConnected,
+	}))
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelOtherEvent{
+		Data: map[string]any{"custom": "data"},
+	}))
+
+	require.Len(t, session.eventQueue, 3)
+	for i := 0; i < 3; i++ {
+		_, ok := (<-session.Events()).(RealtimeRawModelEvent)
+		require.True(t, ok)
+	}
 }
 
 func TestRealtimeSessionOnEventHistoryUpdateAndDelete(t *testing.T) {
@@ -685,6 +859,106 @@ func TestRealtimeSessionFunctionCallRunsToolAndSendsOutput(t *testing.T) {
 	assert.True(t, outputEvent.StartResponse)
 }
 
+func TestRealtimeSessionFunctionCallRunsAsyncByDefault(t *testing.T) {
+	model := &mockRealtimeModel{}
+	tool := agents.FunctionTool{
+		Name:             "echo",
+		Description:      "Echo tool",
+		ParamsJSONSchema: map[string]any{"type": "object"},
+		OnInvokeTool: func(_ context.Context, arguments string) (any, error) {
+			return "echo:" + arguments, nil
+		},
+	}
+	agent := &RealtimeAgent[any]{
+		Name:  "agent",
+		Tools: []agents.Tool{tool},
+	}
+	session := NewRealtimeSession(
+		model,
+		agent,
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{}, // async_tool_calls defaults to true
+	)
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelToolCallEvent{
+		Name:      "echo",
+		CallID:    "call_async_1",
+		Arguments: `{"value":"y"}`,
+	}))
+
+	started := false
+	ended := false
+	timeout := time.After(time.Second)
+	for !(started && ended) {
+		select {
+		case event := <-session.Events():
+			switch event.(type) {
+			case RealtimeToolStartEvent:
+				started = true
+			case RealtimeToolEndEvent:
+				ended = true
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for async tool events (start=%v end=%v)", started, ended)
+		}
+	}
+
+	require.Len(t, model.sentEvents, 1)
+	outputEvent, ok := model.sentEvents[0].(RealtimeModelSendToolOutput)
+	require.True(t, ok)
+	assert.Equal(t, "call_async_1", outputEvent.ToolCall.CallID)
+	assert.Equal(t, "echo:{\"value\":\"y\"}", outputEvent.Output)
+}
+
+func TestRealtimeSessionFunctionCallConvertsNonStringOutputForModel(t *testing.T) {
+	type toolResult struct {
+		Count int
+		Label string
+	}
+
+	model := &mockRealtimeModel{}
+	expected := toolResult{Count: 1, Label: "ok"}
+	tool := agents.FunctionTool{
+		Name:             "struct_tool",
+		Description:      "Returns struct",
+		ParamsJSONSchema: map[string]any{"type": "object"},
+		OnInvokeTool: func(_ context.Context, arguments string) (any, error) {
+			return expected, nil
+		},
+	}
+	agent := &RealtimeAgent[any]{
+		Name:  "agent",
+		Tools: []agents.Tool{tool},
+	}
+	session := NewRealtimeSession(
+		model,
+		agent,
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{"async_tool_calls": false},
+	)
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelToolCallEvent{
+		Name:      "struct_tool",
+		CallID:    "call_struct_1",
+		Arguments: `{"value":"x"}`,
+	}))
+
+	_, ok := (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	_, ok = (<-session.Events()).(RealtimeToolStartEvent)
+	require.True(t, ok)
+	toolEnd, ok := (<-session.Events()).(RealtimeToolEndEvent)
+	require.True(t, ok)
+	assert.Equal(t, expected, toolEnd.Output)
+
+	require.Len(t, model.sentEvents, 1)
+	outputEvent, ok := model.sentEvents[0].(RealtimeModelSendToolOutput)
+	require.True(t, ok)
+	assert.Equal(t, "{1 ok}", outputEvent.Output)
+}
+
 func TestRealtimeSessionFunctionCallUnknownToolEmitsError(t *testing.T) {
 	model := &mockRealtimeModel{}
 	session := NewRealtimeSession(
@@ -1162,6 +1436,31 @@ func TestRealtimeSessionTranscriptionCompletedAppendsNewHistoryItem(t *testing.T
 
 	history := session.History()
 	require.Len(t, history, 1)
+}
+
+func TestRealtimeSessionInputAudioTimeoutTriggeredEmitsEvent(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{},
+	)
+
+	require.NoError(t, session.Enter(t.Context()))
+	<-session.Events() // initial history event
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelInputAudioTimeoutTriggeredEvent{
+		ItemID:       "item_1",
+		AudioStartMS: 0,
+		AudioEndMS:   100,
+	}))
+
+	_, ok := (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	_, ok = (<-session.Events()).(RealtimeInputAudioTimeoutTriggeredEvent)
+	require.True(t, ok)
 }
 
 func TestRealtimeSessionTranscriptDeltaTriggersGuardrailTripwire(t *testing.T) {

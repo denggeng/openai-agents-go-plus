@@ -28,8 +28,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/denggeng/openai-agents-go-plus/agents"
 	"github.com/gorilla/websocket"
-	"github.com/nlpodyssey/openai-agents-go/agents"
 	oairealtime "github.com/openai/openai-go/v3/realtime"
 	"github.com/openai/openai-go/v3/responses"
 
@@ -79,6 +79,8 @@ type OpenAIRealtimeWebSocketModel struct {
 	currentItemID                        string
 	ongoingResponse                      bool
 	tracingConfig                        any
+	transportConfig                      *RealtimeTransportConfig
+	pingStop                             chan struct{}
 	listenersMutex                       sync.RWMutex
 }
 
@@ -87,6 +89,11 @@ func NewOpenAIRealtimeWebSocketModel() *OpenAIRealtimeWebSocketModel {
 	return &OpenAIRealtimeWebSocketModel{
 		model: defaultRealtimeModelName,
 	}
+}
+
+// SetTransportConfig updates the default transport configuration used for connections.
+func (m *OpenAIRealtimeWebSocketModel) SetTransportConfig(config *RealtimeTransportConfig) {
+	m.transportConfig = config
 }
 
 func (m *OpenAIRealtimeWebSocketModel) Connect(
@@ -117,19 +124,20 @@ func (m *OpenAIRealtimeWebSocketModel) Connect(
 		m.tracingConfig = "auto"
 	}
 
+	apiKey, err := options.ResolveAPIKey(ctx)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		return errors.New("api key is required but was not provided")
+	}
+
 	headers := make(map[string]string)
 	if len(options.Headers) > 0 {
 		for key, value := range options.Headers {
 			headers[key] = value
 		}
 	} else {
-		apiKey, err := options.ResolveAPIKey(ctx)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(apiKey) == "" {
-			return errors.New("api key is required but was not provided")
-		}
 		headers["Authorization"] = "Bearer " + apiKey
 	}
 
@@ -153,6 +161,10 @@ func (m *OpenAIRealtimeWebSocketModel) Connect(
 	}
 
 	if options.EnableTransport {
+		transportConfig := options.TransportConfig
+		if transportConfig == nil {
+			transportConfig = m.transportConfig
+		}
 		dialer := options.TransportDialer
 		if dialer == nil {
 			dialer = m.dialWebSocket
@@ -160,12 +172,13 @@ func (m *OpenAIRealtimeWebSocketModel) Connect(
 		if dialer == nil {
 			dialer = defaultRealtimeWebSocketDialer
 		}
-		conn, err := dialer(ctx, m.lastConnectURL, m.lastConnectHeads)
+		conn, err := dialer(ctx, m.lastConnectURL, m.lastConnectHeads, transportConfig)
 		if err != nil {
 			return fmt.Errorf("failed to connect websocket transport: %w", err)
 		}
 		m.websocketConn = conn
 		m.websocketDone = make(chan struct{})
+		m.configureTransport(conn, transportConfig)
 		m.sendClientEvent = func(_ context.Context, payload map[string]any) error {
 			return conn.WriteJSON(payload)
 		}
@@ -312,6 +325,10 @@ func (m *OpenAIRealtimeWebSocketModel) SendEvent(
 }
 
 func (m *OpenAIRealtimeWebSocketModel) Close(ctx context.Context) error {
+	if m.pingStop != nil {
+		close(m.pingStop)
+		m.pingStop = nil
+	}
 	if m.websocketConn != nil {
 		_ = m.websocketConn.Close()
 		if m.websocketDone != nil {
@@ -356,6 +373,56 @@ func (m *OpenAIRealtimeWebSocketModel) defaultRealtimeURL() string {
 		query.Set("model", modelName)
 	}
 	return "wss://api.openai.com/v1/realtime?" + query.Encode()
+}
+
+func (m *OpenAIRealtimeWebSocketModel) configureTransport(
+	conn RealtimeWebSocketConn,
+	config *RealtimeTransportConfig,
+) {
+	if conn == nil || config == nil {
+		return
+	}
+	ws, ok := conn.(*websocket.Conn)
+	if !ok {
+		return
+	}
+
+	pingEnabled := config.PingInterval != nil && *config.PingInterval > 0
+	if pingEnabled && config.PingTimeout != nil && *config.PingTimeout > 0 {
+		timeout := *config.PingTimeout
+		_ = ws.SetReadDeadline(time.Now().Add(timeout))
+		ws.SetPongHandler(func(string) error {
+			return ws.SetReadDeadline(time.Now().Add(timeout))
+		})
+	}
+
+	if !pingEnabled {
+		return
+	}
+	if m.pingStop != nil {
+		close(m.pingStop)
+	}
+	m.pingStop = make(chan struct{})
+	pingInterval := *config.PingInterval
+	deadline := pingInterval
+	if config.PingTimeout != nil && *config.PingTimeout > 0 {
+		deadline = *config.PingTimeout
+	}
+
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_ = ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(deadline))
+			case <-m.websocketDone:
+				return
+			case <-m.pingStop:
+				return
+			}
+		}
+	}()
 }
 
 func (m *OpenAIRealtimeWebSocketModel) sendSessionUpdatePayload(
@@ -520,8 +587,12 @@ func defaultRealtimeWebSocketDialer(
 	ctx context.Context,
 	rawURL string,
 	headers map[string]string,
+	transportConfig *RealtimeTransportConfig,
 ) (RealtimeWebSocketConn, error) {
 	dialer := websocket.Dialer{}
+	if transportConfig != nil && transportConfig.HandshakeTimeout != nil {
+		dialer.HandshakeTimeout = *transportConfig.HandshakeTimeout
+	}
 	httpHeaders := make(http.Header, len(headers))
 	for key, value := range headers {
 		httpHeaders.Set(key, value)
@@ -548,6 +619,9 @@ func (m *OpenAIRealtimeWebSocketModel) listenForMessages() {
 		_, payload, err := m.websocketConn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				_ = m.emitEvent(context.Background(), RealtimeModelConnectionStatusEvent{
+					Status: RealtimeConnectionStatusDisconnected,
+				})
 				return
 			}
 			contextMessage := "websocket error in message listener"
@@ -1488,12 +1562,14 @@ func (m *OpenAIRealtimeWebSocketModel) GetSessionConfig(
 		audioInput.Transcription = transcription
 	}
 
-	if turnDetectionSource, ok := inputAudioConfig["turn_detection"]; ok {
-		if turnDetection, ok := toTurnDetectionParam(turnDetectionSource); ok {
-			audioInput.TurnDetection = turnDetection
-		}
-	} else if turnDetectionSource, ok := modelSettings["turn_detection"]; ok {
-		if turnDetection, ok := toTurnDetectionParam(turnDetectionSource); ok {
+	turnDetectionSource, hasTurnDetection := inputAudioConfig["turn_detection"]
+	if !hasTurnDetection {
+		turnDetectionSource, hasTurnDetection = modelSettings["turn_detection"]
+	}
+	if hasTurnDetection {
+		if turnDetectionSource == nil {
+			audioInput.SetExtraFields(map[string]any{"turn_detection": nil})
+		} else if turnDetection, ok := toTurnDetectionParam(turnDetectionSource); ok {
 			audioInput.TurnDetection = turnDetection
 		}
 	} else if turnDetection, ok := toTurnDetectionParam(defaultRealtimeTurnDetection); ok {
@@ -1710,6 +1786,10 @@ func toTurnDetectionParam(
 		semantic := oairealtime.RealtimeAudioInputTurnDetectionSemanticVadParam{
 			Type: "semantic_vad",
 		}
+		if modelVersion, ok := mapping["model_version"].(string); ok &&
+			strings.TrimSpace(modelVersion) != "" {
+			semantic.SetExtraFields(map[string]any{"model_version": modelVersion})
+		}
 		if createResponse, ok := mapping["create_response"].(bool); ok {
 			semantic.CreateResponse = param.NewOpt(createResponse)
 		}
@@ -1725,6 +1805,10 @@ func toTurnDetectionParam(
 	case "server_vad":
 		server := oairealtime.RealtimeAudioInputTurnDetectionServerVadParam{
 			Type: "server_vad",
+		}
+		if modelVersion, ok := mapping["model_version"].(string); ok &&
+			strings.TrimSpace(modelVersion) != "" {
+			server.SetExtraFields(map[string]any{"model_version": modelVersion})
 		}
 		if idleTimeoutMS, ok := numericToInt64(mapping["idle_timeout_ms"]); ok {
 			server.IdleTimeoutMs = param.NewOpt(idleTimeoutMS)

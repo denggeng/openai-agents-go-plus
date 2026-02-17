@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 )
 
 const SearchAgentInstructions = "You are a research assistant. Given a search term, you search the web for that term and " +

@@ -17,6 +17,7 @@ package realtime
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -46,6 +47,21 @@ func mustConnectRealtimeModel(
 	require.NoError(t, model.Connect(t.Context(), cfg))
 	// Drop initial session.update emitted at connect time for test clarity.
 	model.sentClientEvents = nil
+}
+
+func TestRealtimeModelAddRemoveListenerDedupes(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+
+	model.AddListener(listener)
+	model.AddListener(listener)
+	assert.Len(t, model.listeners, 1)
+
+	model.RemoveListener(listener)
+	assert.Empty(t, model.listeners)
+
+	model.RemoveListener(listener)
+	assert.Empty(t, model.listeners)
 }
 
 func TestSendEventUserInput(t *testing.T) {
@@ -116,6 +132,44 @@ func TestSendEventSessionUpdate(t *testing.T) {
 	assert.Equal(t, "verse", string(model.createdSession.Audio.Output.Voice))
 }
 
+func TestSendEventDispatchSequence(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})
+
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendUserInput{UserInput: "hi"}))
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendAudio{
+		Audio:  []byte("a"),
+		Commit: false,
+	}))
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendAudio{
+		Audio:  []byte("a"),
+		Commit: true,
+	}))
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendToolOutput{
+		ToolCall: RealtimeModelToolCallEvent{
+			Name:      "t",
+			CallID:    "c",
+			Arguments: "{}",
+		},
+		Output:        "ok",
+		StartResponse: true,
+	}))
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendInterrupt{}))
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendSessionUpdate{
+		SessionSettings: RealtimeSessionModelSettings{"voice": "nova"},
+	}))
+
+	require.Len(t, model.sentClientEvents, 8)
+	assert.Equal(t, "conversation.item.create", model.sentClientEvents[0]["type"])
+	assert.Equal(t, "response.create", model.sentClientEvents[1]["type"])
+	assert.Equal(t, "input_audio_buffer.append", model.sentClientEvents[2]["type"])
+	assert.Equal(t, "input_audio_buffer.append", model.sentClientEvents[3]["type"])
+	assert.Equal(t, "input_audio_buffer.commit", model.sentClientEvents[4]["type"])
+	assert.Equal(t, "conversation.item.create", model.sentClientEvents[5]["type"])
+	assert.Equal(t, "response.create", model.sentClientEvents[6]["type"])
+	assert.Equal(t, "session.update", model.sentClientEvents[7]["type"])
+}
+
 func TestSendEventInterruptUsesPlaybackStateAndForceCancel(t *testing.T) {
 	playbackTracker := NewRealtimePlaybackTracker()
 	playbackTracker.OnPlayMS("item_1", 0, 250)
@@ -141,6 +195,60 @@ func TestSendEventInterruptUsesPlaybackStateAndForceCancel(t *testing.T) {
 	}))
 	require.Len(t, model.sentClientEvents, 2)
 	assert.Equal(t, "response.cancel", model.sentClientEvents[1]["type"])
+}
+
+func TestSendEventInterruptForceCancelOverridesAutoCancellation(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})
+
+	model.audioStateTracker.SetAudioFormat("pcm16")
+	model.audioStateTracker.OnAudioDelta("item_1", 0, make([]byte, 4800))
+	key := modelAudioStateKey{itemID: "item_1", itemContentIndex: 0}
+	state, ok := model.audioStateTracker.states[key]
+	require.True(t, ok)
+	state.InitialReceivedTime = time.Now().Add(-1 * time.Second)
+	model.audioStateTracker.states[key] = state
+
+	model.ongoingResponse = true
+	model.automaticResponseCancellationEnabled = true
+
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendInterrupt{
+		ForceResponseCancel: true,
+	}))
+
+	require.Len(t, model.sentClientEvents, 2)
+	payloadTypes := map[string]struct{}{
+		model.sentClientEvents[0]["type"].(string): {},
+		model.sentClientEvents[1]["type"].(string): {},
+	}
+	_, hasTruncate := payloadTypes["conversation.item.truncate"]
+	_, hasCancel := payloadTypes["response.cancel"]
+	assert.True(t, hasTruncate)
+	assert.True(t, hasCancel)
+	assert.False(t, model.ongoingResponse)
+	assert.Nil(t, model.audioStateTracker.GetLastAudioItem())
+}
+
+func TestSendEventInterruptRespectsAutoCancellationWhenNotForced(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})
+
+	model.audioStateTracker.SetAudioFormat("pcm16")
+	model.audioStateTracker.OnAudioDelta("item_1", 0, make([]byte, 4800))
+	key := modelAudioStateKey{itemID: "item_1", itemContentIndex: 0}
+	state, ok := model.audioStateTracker.states[key]
+	require.True(t, ok)
+	state.InitialReceivedTime = time.Now().Add(-1 * time.Second)
+	model.audioStateTracker.states[key] = state
+
+	model.ongoingResponse = true
+	model.automaticResponseCancellationEnabled = true
+
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendInterrupt{}))
+
+	require.Len(t, model.sentClientEvents, 1)
+	assert.Equal(t, "conversation.item.truncate", model.sentClientEvents[0]["type"])
+	assert.True(t, model.ongoingResponse)
 }
 
 func TestSendEventInvalidRawMessageReturnsError(t *testing.T) {

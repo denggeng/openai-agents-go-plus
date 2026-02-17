@@ -14,7 +14,7 @@
 
 package codex
 
-import "github.com/nlpodyssey/openai-agents-go/agents"
+import "github.com/denggeng/openai-agents-go-plus/agents"
 
 // ThreadItem is an item emitted inside item.* Codex stream events.
 type ThreadItem interface {

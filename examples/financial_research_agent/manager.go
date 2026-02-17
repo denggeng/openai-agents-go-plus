@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 )
 
 // summaryExtractor is a custom output extractor for sub‑agents that return an AnalysisSummary.

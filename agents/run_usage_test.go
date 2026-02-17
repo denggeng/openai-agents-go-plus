@@ -18,9 +18,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/agentstesting"
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/agentstesting"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -18,9 +18,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/agentstesting"
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/agentstesting"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"
@@ -233,6 +233,52 @@ func TestRunStateApproveAndRejectTool(t *testing.T) {
 	assert.False(t, approved)
 }
 
+func TestRunStateApproveToolUpdatesApprovalsForNonMCP(t *testing.T) {
+	state := agents.RunState{
+		SchemaVersion: agents.CurrentRunStateSchemaVersion,
+	}
+	approvalItem := agents.ToolApprovalItem{
+		ToolName: "apply_patch",
+		RawItem: map[string]any{
+			"type":    "apply_patch_call",
+			"call_id": "call-apply-1",
+		},
+	}
+
+	err := state.ApproveTool(approvalItem)
+	require.NoError(t, err)
+	assert.Empty(t, state.GeneratedItems)
+
+	ctx := agents.NewRunContextWrapper[any](nil)
+	state.ApplyToolApprovalsToContext(ctx)
+	approved, known := ctx.IsToolApproved("apply_patch", "call-apply-1")
+	require.True(t, known)
+	assert.True(t, approved)
+}
+
+func TestRunStateRejectToolUpdatesApprovalsForNonMCP(t *testing.T) {
+	state := agents.RunState{
+		SchemaVersion: agents.CurrentRunStateSchemaVersion,
+	}
+	approvalItem := agents.ToolApprovalItem{
+		ToolName: "apply_patch",
+		RawItem: map[string]any{
+			"type":    "apply_patch_call",
+			"call_id": "call-apply-2",
+		},
+	}
+
+	err := state.RejectTool(approvalItem, "denied")
+	require.NoError(t, err)
+	assert.Empty(t, state.GeneratedItems)
+
+	ctx := agents.NewRunContextWrapper[any](nil)
+	state.ApplyToolApprovalsToContext(ctx)
+	approved, known := ctx.IsToolApproved("apply_patch", "call-apply-2")
+	require.True(t, known)
+	assert.False(t, approved)
+}
+
 func TestRunStateApplyStoredToolApprovals(t *testing.T) {
 	state := agents.RunState{
 		SchemaVersion: agents.CurrentRunStateSchemaVersion,
@@ -304,6 +350,28 @@ func TestRunStateApplyStoredToolApprovalsSkipsExistingResponses(t *testing.T) {
 	err := state.ApplyStoredToolApprovals()
 	require.NoError(t, err)
 	require.Len(t, state.GeneratedItems, 1)
+}
+
+func TestRunStateApplyStoredToolApprovalsSkipsNonMCP(t *testing.T) {
+	state := agents.RunState{
+		SchemaVersion: agents.CurrentRunStateSchemaVersion,
+		Interruptions: []agents.ToolApprovalItem{
+			{
+				ToolName: "apply_patch",
+				RawItem: map[string]any{
+					"type":    "apply_patch_call",
+					"call_id": "call-apply-pending",
+				},
+			},
+		},
+	}
+	ctx := agents.NewRunContextWrapper[any](nil)
+	ctx.ApproveTool(state.Interruptions[0], false)
+	state.SetToolApprovalsFromContext(ctx)
+
+	err := state.ApplyStoredToolApprovals()
+	require.NoError(t, err)
+	assert.Empty(t, state.GeneratedItems)
 }
 
 func TestRunStateResumeGuardrailResultHelpers(t *testing.T) {

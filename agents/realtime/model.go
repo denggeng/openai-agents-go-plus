@@ -17,10 +17,18 @@ package realtime
 import (
 	"context"
 	"os"
+	"time"
 )
 
 // RealtimeAPIKeyProvider dynamically resolves API keys.
 type RealtimeAPIKeyProvider func(context.Context) (string, error)
+
+// RealtimeTransportConfig configures low-level websocket transport behavior.
+type RealtimeTransportConfig struct {
+	PingInterval     *time.Duration
+	PingTimeout      *time.Duration
+	HandshakeTimeout *time.Duration
+}
 
 // RealtimeWebSocketConn is the minimal websocket contract used by realtime transports.
 type RealtimeWebSocketConn interface {
@@ -34,6 +42,7 @@ type RealtimeWebSocketDialer func(
 	context.Context,
 	string,
 	map[string]string,
+	*RealtimeTransportConfig,
 ) (RealtimeWebSocketConn, error)
 
 // RealtimeModelConfig contains transport connection options.
@@ -44,6 +53,7 @@ type RealtimeModelConfig struct {
 	Headers         map[string]string
 	EnableTransport bool
 	TransportDialer RealtimeWebSocketDialer
+	TransportConfig *RealtimeTransportConfig
 	InitialSettings RealtimeSessionModelSettings
 	PlaybackTracker *RealtimePlaybackTracker
 	CallID          string

@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 	"github.com/openai/openai-go/v3/packages/param"
 )
 

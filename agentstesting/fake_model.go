@@ -19,10 +19,10 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 )

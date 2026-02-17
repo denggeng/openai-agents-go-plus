@@ -17,7 +17,7 @@ package agents
 import (
 	"maps"
 
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 )
 
 func mergedModelExtraJSON(modelSettings modelsettings.ModelSettings) map[string]any {

@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/denggeng/openai-agents-go-plus/util"
 	"github.com/invopop/jsonschema"
-	"github.com/nlpodyssey/openai-agents-go/util"
 	"github.com/openai/openai-go/v3/packages/param"
 )
 

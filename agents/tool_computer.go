@@ -17,7 +17,7 @@ package agents
 import (
 	"context"
 
-	"github.com/nlpodyssey/openai-agents-go/computer"
+	"github.com/denggeng/openai-agents-go-plus/computer"
 	"github.com/openai/openai-go/v3/responses"
 )
 

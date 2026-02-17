@@ -17,6 +17,7 @@ package agents
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -26,10 +27,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/nlpodyssey/openai-agents-go/memory"
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/memory"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 )
@@ -87,6 +88,9 @@ type RunConfig struct {
 
 	// A list of output guardrails to run on the final output of the run.
 	OutputGuardrails []OutputGuardrail
+
+	// Optional callback that formats tool error messages, such as approval rejections.
+	ToolErrorFormatter ToolErrorFormatter
 
 	// Whether tracing is disabled for the agent run. If disabled, we will not trace the agent run.
 	// Default: false (tracing enabled).
@@ -404,7 +408,7 @@ func (r Runner) runWithStartingTurnAndState(
 	}
 
 	// Prepare input with session if enabled
-	preparedInput, err := r.prepareInputWithSession(ctx, input)
+	preparedInput, err := r.prepareInputWithSession(ctx, input, resumeState != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -415,6 +419,15 @@ func (r Runner) runWithStartingTurnAndState(
 	}
 
 	toolUseTracker := NewAgentToolUseTracker()
+	contextWrapper := NewRunContextWrapper[any](nil)
+	if value, ok := RunContextValueFromContext(ctx); ok {
+		contextWrapper.Context = value
+	}
+	if resumeState != nil {
+		// Reset persisted count for the resumed turn and restore approval decisions.
+		resumeState.CurrentTurnPersistedItemCount = 0
+		resumeState.ApplyToolApprovalsToContext(contextWrapper)
+	}
 
 	var runResult *RunResult
 
@@ -457,6 +470,65 @@ func (r Runner) runWithStartingTurnAndState(
 
 		currentAgent := startingAgent
 		shouldRunAgentStartHooks := true
+
+		if resumeState != nil && len(resumeState.Interruptions) > 0 {
+			pendingInterruptions := slices.Clone(resumeState.Interruptions)
+			resolvedItems, pendingInterruptions, toolInputResults, toolOutputResults, err := r.resolveFunctionToolInterruptionsOnResume(
+				ctx,
+				currentAgent,
+				resumeState,
+				pendingInterruptions,
+				hooks,
+				r.Config,
+				contextWrapper,
+			)
+			if err != nil {
+				return err
+			}
+			if len(resolvedItems) > 0 {
+				generatedItems = append(generatedItems, resolvedItems...)
+			}
+			if len(toolInputResults) > 0 {
+				toolInputGuardrailResults = append(toolInputGuardrailResults, toolInputResults...)
+			}
+			if len(toolOutputResults) > 0 {
+				toolOutputGuardrailResults = append(toolOutputGuardrailResults, toolOutputResults...)
+			}
+
+			resolvedItems, pendingInterruptions, err = r.resolveApplyPatchInterruptionsOnResume(
+				ctx,
+				currentAgent,
+				resumeState,
+				pendingInterruptions,
+				hooks,
+				r.Config,
+			)
+			if err != nil {
+				return err
+			}
+			if len(resolvedItems) > 0 {
+				generatedItems = append(generatedItems, resolvedItems...)
+			}
+			pendingInterruptions = filterPendingMCPInterruptions(pendingInterruptions, contextWrapper)
+			if len(pendingInterruptions) > 0 {
+				interruptions = slices.Clone(pendingInterruptions)
+				runResult = &RunResult{
+					Input:                      originalInput,
+					NewItems:                   generatedItems,
+					RawResponses:               modelResponses,
+					InputGuardrailResults:      inputGuardrailResults,
+					OutputGuardrailResults:     outputGuardrailResults,
+					ToolInputGuardrailResults:  toolInputGuardrailResults,
+					ToolOutputGuardrailResults: toolOutputGuardrailResults,
+					Interruptions:              interruptions,
+					LastAgent:                  currentAgent,
+				}
+				if err := r.saveResultToSession(ctx, input, runResult, resumeState); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
 
 		defer func() {
 			if err != nil {
@@ -572,6 +644,7 @@ func (r Runner) runWithStartingTurnAndState(
 						r.Config,
 						shouldRunAgentStartHooks,
 						toolUseTracker,
+						contextWrapper,
 						r.Config.PreviousResponseID,
 					)
 					if turnError != nil {
@@ -594,6 +667,7 @@ func (r Runner) runWithStartingTurnAndState(
 					r.Config,
 					shouldRunAgentStartHooks,
 					toolUseTracker,
+					contextWrapper,
 					r.Config.PreviousResponseID,
 				)
 				if err != nil {
@@ -634,7 +708,7 @@ func (r Runner) runWithStartingTurnAndState(
 				}
 
 				// Save the conversation to session if enabled
-				err = r.saveResultToSession(ctx, input, runResult)
+				err = r.saveResultToSession(ctx, input, runResult, resumeState)
 				if err != nil {
 					return err
 				}
@@ -664,7 +738,7 @@ func (r Runner) runWithStartingTurnAndState(
 					LastAgent:                  currentAgent,
 				}
 
-				err = r.saveResultToSession(ctx, input, runResult)
+				err = r.saveResultToSession(ctx, input, runResult, resumeState)
 				if err != nil {
 					return err
 				}
@@ -677,6 +751,316 @@ func (r Runner) runWithStartingTurnAndState(
 		}
 	})
 	return runResult, err
+}
+
+func (r Runner) resolveApplyPatchInterruptionsOnResume(
+	ctx context.Context,
+	agent *Agent,
+	resumeState *RunState,
+	interruptions []ToolApprovalItem,
+	hooks RunHooks,
+	runConfig RunConfig,
+) ([]RunItem, []ToolApprovalItem, error) {
+	if resumeState == nil || len(interruptions) == 0 {
+		return nil, interruptions, nil
+	}
+
+	allTools, err := r.getAllTools(ctx, agent)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var applyPatchTool *ApplyPatchTool
+	for _, tool := range allTools {
+		if t, ok := tool.(ApplyPatchTool); ok {
+			applyPatchTool = &t
+			break
+		}
+	}
+	if applyPatchTool == nil || !hasApplyPatchInterruptions(interruptions, applyPatchTool) {
+		return nil, interruptions, nil
+	}
+
+	if len(resumeState.ModelResponses) == 0 {
+		return nil, interruptions, nil
+	}
+
+	handoffs, err := r.getHandoffs(ctx, agent)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
+	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	applyPatchCalls := filterApplyPatchCallsWithoutOutputs(processed.ApplyPatchCalls, resumeState.GeneratedItems)
+	if len(applyPatchCalls) == 0 {
+		return nil, interruptions, nil
+	}
+
+	contextWrapper := NewRunContextWrapper[any](nil)
+	resumeState.ApplyToolApprovalsToContext(contextWrapper)
+
+	results, interruptions, err := RunImpl().ExecuteApplyPatchCalls(
+		ctx,
+		agent,
+		applyPatchCalls,
+		hooks,
+		contextWrapper,
+		runConfig,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	pending := filterNonApplyPatchInterruptions(interruptions, applyPatchTool)
+	if len(interruptions) > 0 {
+		pending = append(pending, interruptions...)
+	}
+
+	return results, pending, nil
+}
+
+func (r Runner) resolveFunctionToolInterruptionsOnResume(
+	ctx context.Context,
+	agent *Agent,
+	resumeState *RunState,
+	interruptions []ToolApprovalItem,
+	hooks RunHooks,
+	runConfig RunConfig,
+	contextWrapper *RunContextWrapper[any],
+) ([]RunItem, []ToolApprovalItem, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, error) {
+	if resumeState == nil || len(interruptions) == 0 {
+		return nil, interruptions, nil, nil, nil
+	}
+
+	allTools, err := r.getAllTools(ctx, agent)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	functionToolNames := make(map[string]struct{})
+	for _, tool := range allTools {
+		if t, ok := tool.(FunctionTool); ok {
+			functionToolNames[t.Name] = struct{}{}
+		}
+	}
+	if len(functionToolNames) == 0 {
+		return nil, interruptions, nil, nil, nil
+	}
+
+	hasFunctionInterruptions := false
+	for _, interruption := range interruptions {
+		if _, ok := functionToolNames[resolveApprovalToolName(interruption)]; ok {
+			hasFunctionInterruptions = true
+			break
+		}
+	}
+	if !hasFunctionInterruptions {
+		return nil, interruptions, nil, nil, nil
+	}
+
+	if len(resumeState.ModelResponses) == 0 {
+		return nil, interruptions, nil, nil, nil
+	}
+
+	handoffs, err := r.getHandoffs(ctx, agent)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
+	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	functionCalls := filterFunctionCallsWithoutOutputs(processed.Functions, resumeState.GeneratedItems)
+	if len(functionCalls) == 0 {
+		return nil, interruptions, nil, nil, nil
+	}
+
+	if contextWrapper == nil {
+		contextWrapper = NewRunContextWrapper[any](nil)
+	}
+	resumeState.ApplyToolApprovalsToContext(contextWrapper)
+
+	functionResults, toolInputResults, toolOutputResults, pendingInterruptions, err := RunImpl().ExecuteFunctionToolCalls(
+		ctx,
+		agent,
+		functionCalls,
+		hooks,
+		contextWrapper,
+		runConfig,
+	)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	resolvedItems := make([]RunItem, 0, len(functionResults))
+	for _, result := range functionResults {
+		if result.RunItem == nil {
+			continue
+		}
+		resolvedItems = append(resolvedItems, result.RunItem)
+	}
+
+	pending := filterNonFunctionToolInterruptions(interruptions, functionToolNames)
+	if len(pendingInterruptions) > 0 {
+		pending = append(pending, pendingInterruptions...)
+	}
+
+	return resolvedItems, pending, toolInputResults, toolOutputResults, nil
+}
+
+func filterApplyPatchCallsWithoutOutputs(
+	calls []ToolRunApplyPatchCall,
+	generatedItems []TResponseInputItem,
+) []ToolRunApplyPatchCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]ToolRunApplyPatchCall, 0, len(calls))
+	for _, call := range calls {
+		callID, err := extractApplyPatchCallID(call.ToolCall)
+		if err != nil || callID == "" {
+			continue
+		}
+		if applyPatchOutputExists(callID, generatedItems) {
+			continue
+		}
+		out = append(out, call)
+	}
+	return out
+}
+
+func filterFunctionCallsWithoutOutputs(
+	calls []ToolRunFunction,
+	generatedItems []TResponseInputItem,
+) []ToolRunFunction {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]ToolRunFunction, 0, len(calls))
+	for _, call := range calls {
+		callID := call.ToolCall.CallID
+		if callID == "" {
+			continue
+		}
+		if functionCallOutputExists(callID, generatedItems) {
+			continue
+		}
+		out = append(out, call)
+	}
+	return out
+}
+
+func applyPatchOutputExists(callID string, items []TResponseInputItem) bool {
+	for _, item := range items {
+		itemType := item.GetType()
+		if itemType == nil || *itemType != "apply_patch_call_output" {
+			continue
+		}
+		existingID := item.GetCallID()
+		if existingID != nil && *existingID == callID {
+			return true
+		}
+	}
+	return false
+}
+
+func functionCallOutputExists(callID string, items []TResponseInputItem) bool {
+	for _, item := range items {
+		itemType := item.GetType()
+		if itemType == nil || *itemType != "function_call_output" {
+			continue
+		}
+		existingID := item.GetCallID()
+		if existingID != nil && *existingID == callID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasApplyPatchInterruptions(interruptions []ToolApprovalItem, tool *ApplyPatchTool) bool {
+	for _, interruption := range interruptions {
+		if isApplyPatchName(resolveApprovalToolName(interruption), tool) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterNonFunctionToolInterruptions(
+	interruptions []ToolApprovalItem,
+	functionToolNames map[string]struct{},
+) []ToolApprovalItem {
+	if len(interruptions) == 0 {
+		return nil
+	}
+	out := make([]ToolApprovalItem, 0, len(interruptions))
+	for _, interruption := range interruptions {
+		if _, ok := functionToolNames[resolveApprovalToolName(interruption)]; ok {
+			continue
+		}
+		out = append(out, interruption)
+	}
+	return out
+}
+
+func filterPendingMCPInterruptions(
+	interruptions []ToolApprovalItem,
+	contextWrapper *RunContextWrapper[any],
+) []ToolApprovalItem {
+	if len(interruptions) == 0 {
+		return nil
+	}
+	if contextWrapper == nil {
+		return interruptions
+	}
+	out := make([]ToolApprovalItem, 0, len(interruptions))
+	for _, interruption := range interruptions {
+		if !isMCPApprovalItem(interruption) {
+			out = append(out, interruption)
+			continue
+		}
+		callID := resolveApprovalCallID(interruption)
+		if callID == "" {
+			out = append(out, interruption)
+			continue
+		}
+		_, known := contextWrapper.GetApprovalStatus(
+			resolveApprovalToolName(interruption),
+			callID,
+			&interruption,
+		)
+		if known {
+			continue
+		}
+		out = append(out, interruption)
+	}
+	return out
+}
+
+func filterNonApplyPatchInterruptions(
+	interruptions []ToolApprovalItem,
+	tool *ApplyPatchTool,
+) []ToolApprovalItem {
+	if len(interruptions) == 0 {
+		return nil
+	}
+	out := make([]ToolApprovalItem, 0, len(interruptions))
+	for _, interruption := range interruptions {
+		if isApplyPatchName(resolveApprovalToolName(interruption), tool) {
+			continue
+		}
+		out = append(out, interruption)
+	}
+	return out
 }
 
 func (r Runner) runStreamed(ctx context.Context, startingAgent *Agent, input Input) (*RunResultStreaming, error) {
@@ -757,7 +1141,7 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 			hooks,
 			r.Config,
 			r.Config.PreviousResponseID,
-			resumeState != nil,
+			resumeState,
 		)
 	})
 
@@ -882,7 +1266,7 @@ func (r Runner) startStreaming(
 	hooks RunHooks,
 	runConfig RunConfig,
 	previousResponseID string,
-	isResumedState bool,
+	resumeState *RunState,
 ) (err error) {
 	currentAgent := startingAgent
 	var currentSpan tracing.Span
@@ -942,6 +1326,16 @@ func (r Runner) startStreaming(
 	currentTurn := startingTurn
 	shouldRunAgentStartHooks := true
 	toolUseTracker := NewAgentToolUseTracker()
+	isResumedState := resumeState != nil
+	contextWrapper := NewRunContextWrapper[any](nil)
+	if value, ok := RunContextValueFromContext(ctx); ok {
+		contextWrapper.Context = value
+	}
+	if resumeState != nil {
+		// Reset persisted count for the resumed turn and restore approval decisions.
+		resumeState.CurrentTurnPersistedItemCount = 0
+		resumeState.ApplyToolApprovalsToContext(contextWrapper)
+	}
 
 	streamedResult.eventQueue.Put(AgentUpdatedStreamEvent{
 		NewAgent: currentAgent,
@@ -949,7 +1343,7 @@ func (r Runner) startStreaming(
 	})
 
 	// Prepare input with session if enabled
-	preparedInput, err := r.prepareInputWithSession(ctx, startingInput)
+	preparedInput, err := r.prepareInputWithSession(ctx, startingInput, isResumedState)
 	if err != nil {
 		return err
 	}
@@ -1029,8 +1423,10 @@ func (r Runner) startStreaming(
 			runConfig,
 			shouldRunAgentStartHooks,
 			toolUseTracker,
+			contextWrapper,
 			allTools,
 			previousResponseID,
+			nil,
 		)
 		if err != nil {
 			return err
@@ -1080,7 +1476,7 @@ func (r Runner) startStreaming(
 				Interruptions:              streamedResult.Interruptions(),
 				LastAgent:                  currentAgent,
 			}
-			err = r.saveResultToSession(ctx, startingInput, tempResult)
+			err = r.saveResultToSession(ctx, startingInput, tempResult, resumeState)
 			if err != nil {
 				return err
 			}
@@ -1115,7 +1511,7 @@ func (r Runner) startStreaming(
 				Interruptions:              streamedResult.Interruptions(),
 				LastAgent:                  currentAgent,
 			}
-			err = r.saveResultToSession(ctx, startingInput, tempResult)
+			err = r.saveResultToSession(ctx, startingInput, tempResult, resumeState)
 			if err != nil {
 				return err
 			}
@@ -1139,8 +1535,10 @@ func (r Runner) runSingleTurnStreamed(
 	runConfig RunConfig,
 	shouldRunAgentStartHooks bool,
 	toolUseTracker *AgentToolUseTracker,
+	contextWrapper *RunContextWrapper[any],
 	allTools []Tool,
 	previousResponseID string,
+	serverConversationTracker *OpenAIServerConversationTracker,
 ) (*SingleStepResult, error) {
 	if shouldRunAgentStartHooks {
 		childCtx, cancel := context.WithCancel(ctx)
@@ -1199,9 +1597,17 @@ func (r Runner) runSingleTurnStreamed(
 
 	var finalResponse *ModelResponse
 
-	input := ItemHelpers().InputToNewInputList(streamedResult.Input())
-	for _, item := range streamedResult.NewItems() {
-		input = append(input, item.ToInputItem())
+	var input []TResponseInputItem
+	if serverConversationTracker != nil {
+		input = serverConversationTracker.PrepareInput(
+			streamedResult.Input(),
+			streamedResult.NewItems(),
+		)
+	} else {
+		input = ItemHelpers().InputToNewInputList(streamedResult.Input())
+		for _, item := range streamedResult.NewItems() {
+			input = append(input, item.ToInputItem())
+		}
 	}
 
 	filtered, err := r.maybeFilterModelInput(
@@ -1213,6 +1619,9 @@ func (r Runner) runSingleTurnStreamed(
 	)
 	if err != nil {
 		return nil, err
+	}
+	if serverConversationTracker != nil {
+		serverConversationTracker.MarkInputAsSent(filtered.Input)
 	}
 
 	// Call hook just before the model is invoked, with the correct system prompt.
@@ -1299,6 +1708,7 @@ func (r Runner) runSingleTurnStreamed(
 		hooks,
 		runConfig,
 		toolUseTracker,
+		contextWrapper,
 	)
 	if err != nil {
 		return nil, err
@@ -1318,6 +1728,7 @@ func (r Runner) runSingleTurn(
 	runConfig RunConfig,
 	shouldRunAgentStartHooks bool,
 	toolUseTracker *AgentToolUseTracker,
+	contextWrapper *RunContextWrapper[any],
 	previousResponseID string,
 ) (*SingleStepResult, error) {
 	// Ensure we run the hooks before anything else
@@ -1381,6 +1792,7 @@ func (r Runner) runSingleTurn(
 		handoffs,
 		runConfig,
 		toolUseTracker,
+		nil,
 		previousResponseID,
 		promptConfig,
 	)
@@ -1400,6 +1812,7 @@ func (r Runner) runSingleTurn(
 		hooks,
 		runConfig,
 		toolUseTracker,
+		contextWrapper,
 	)
 }
 
@@ -1452,6 +1865,7 @@ func (Runner) getSingleStepResultFromResponse(
 	hooks RunHooks,
 	runConfig RunConfig,
 	toolUseTracker *AgentToolUseTracker,
+	contextWrapper *RunContextWrapper[any],
 ) (*SingleStepResult, error) {
 	processedResponse, err := RunImpl().ProcessModelResponse(
 		ctx,
@@ -1476,6 +1890,7 @@ func (Runner) getSingleStepResultFromResponse(
 		outputType,
 		hooks,
 		runConfig,
+		contextWrapper,
 	)
 }
 
@@ -1617,6 +2032,7 @@ func (r Runner) getNewResponse(
 	handoffs []Handoff,
 	runConfig RunConfig,
 	toolUseTracker *AgentToolUseTracker,
+	serverConversationTracker *OpenAIServerConversationTracker,
 	previousResponseID string,
 	promptConfig responses.ResponsePromptParam,
 ) (*ModelResponse, error) {
@@ -1630,6 +2046,9 @@ func (r Runner) getNewResponse(
 	)
 	if err != nil {
 		return nil, err
+	}
+	if serverConversationTracker != nil {
+		serverConversationTracker.MarkInputAsSent(filtered.Input)
 	}
 
 	model, err := r.getModel(agent, runConfig)
@@ -1770,7 +2189,7 @@ func (r Runner) getModel(agent *Agent, runConfig RunConfig) (Model, error) {
 }
 
 // prepareInputWithSession prepares input by combining it with session history if enabled.
-func (r Runner) prepareInputWithSession(ctx context.Context, input Input) (Input, error) {
+func (r Runner) prepareInputWithSession(ctx context.Context, input Input, allowInputItems bool) (Input, error) {
 	session := r.Config.Session
 	if session == nil {
 		return input, nil
@@ -1779,12 +2198,16 @@ func (r Runner) prepareInputWithSession(ctx context.Context, input Input) (Input
 	// Validate that we don't have both a session and a list input, as this creates
 	// ambiguity about whether the list should append to or replace existing session history
 	if _, ok := input.(InputItems); ok {
-		return nil, NewUserError(
-			"Cannot provide both a session and a list of input items. " +
-				"When using session memory, provide only a string input to append to the " +
-				"conversation, or use Session: nil and provide a list to manually manage " +
-				"conversation history.",
-		)
+		if !allowInputItems {
+			return nil, NewUserError(
+				"Cannot provide both a session and a list of input items. " +
+					"When using session memory, provide only a string input to append to the " +
+					"conversation, or use Session: nil and provide a list to manually manage " +
+					"conversation history.",
+			)
+		}
+		// When resuming with a session, assume the input already includes history.
+		return input, nil
 	}
 
 	limit := r.Config.LimitMemory
@@ -1804,26 +2227,49 @@ func (r Runner) prepareInputWithSession(ctx context.Context, input Input) (Input
 }
 
 // saveResultToSession saves the conversation turn to session.
-func (r Runner) saveResultToSession(ctx context.Context, originalInput Input, result *RunResult) error {
+func (r Runner) saveResultToSession(ctx context.Context, originalInput Input, result *RunResult, resumeState *RunState) error {
 	session := r.Config.Session
 	if session == nil {
 		return nil
 	}
 
-	// Convert original input to list format if needed
-	inputList := ItemHelpers().InputToNewInputList(originalInput)
+	alreadyPersisted := 0
+	if resumeState != nil {
+		alreadyPersisted = int(resumeState.CurrentTurnPersistedItemCount)
+	}
 
-	// Convert new items to input format
-	newItemsAsInput := make([]TResponseInputItem, len(result.NewItems))
-	for i, item := range result.NewItems {
+	newRunItems := result.NewItems
+	if alreadyPersisted >= len(newRunItems) {
+		newRunItems = nil
+	} else if alreadyPersisted > 0 {
+		newRunItems = newRunItems[alreadyPersisted:]
+	}
+
+	// Convert original input to list format if needed.
+	// For resumed runs, assume prior input items are already persisted in the session.
+	inputList := ItemHelpers().InputToNewInputList(originalInput)
+	if resumeState != nil {
+		inputList = nil
+	}
+
+	// Convert new items to input format.
+	newItemsAsInput := make([]TResponseInputItem, len(newRunItems))
+	for i, item := range newRunItems {
 		newItemsAsInput[i] = item.ToInputItem()
 	}
 
-	// Save all items from this turn
-	itemsToSave := slices.Concat(inputList, newItemsAsInput)
-	err := session.AddItems(ctx, itemsToSave)
-	if err != nil {
-		return fmt.Errorf("failed to add session items: %w", err)
+	// Save all items from this turn, deduplicating within the batch.
+	itemsToSave := deduplicateInputItemsPreferringLatest(slices.Concat(inputList, newItemsAsInput))
+	savedRunItemsCount := countSavedInputItems(newItemsAsInput, itemsToSave)
+
+	if len(itemsToSave) > 0 {
+		if err := session.AddItems(ctx, itemsToSave); err != nil {
+			return fmt.Errorf("failed to add session items: %w", err)
+		}
+	}
+
+	if resumeState != nil {
+		resumeState.CurrentTurnPersistedItemCount = uint64(alreadyPersisted + savedRunItemsCount)
 	}
 
 	if usageTrackingSession, ok := session.(memory.RunUsageTrackingAwareSession); ok {
@@ -1859,5 +2305,51 @@ func (r Runner) saveResultToSession(ctx context.Context, originalInput Input, re
 		}
 	}
 
-	return err
+	return nil
+}
+
+func deduplicateInputItemsPreferringLatest(items []TResponseInputItem) []TResponseInputItem {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]TResponseInputItem, 0, len(items))
+	for i := len(items) - 1; i >= 0; i-- {
+		key := fingerprintInputItem(items[i])
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, items[i])
+	}
+	slices.Reverse(out)
+	return out
+}
+
+func countSavedInputItems(newItems []TResponseInputItem, itemsToSave []TResponseInputItem) int {
+	if len(newItems) == 0 || len(itemsToSave) == 0 {
+		return 0
+	}
+	counts := make(map[string]int, len(itemsToSave))
+	for _, item := range itemsToSave {
+		key := fingerprintInputItem(item)
+		counts[key]++
+	}
+	saved := 0
+	for _, item := range newItems {
+		key := fingerprintInputItem(item)
+		if counts[key] > 0 {
+			counts[key]--
+			saved++
+		}
+	}
+	return saved
+}
+
+func fingerprintInputItem(item TResponseInputItem) string {
+	data, err := json.Marshal(item)
+	if err != nil {
+		return fmt.Sprintf("%#v", item)
+	}
+	return string(data)
 }

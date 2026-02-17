@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 )
 
 type SpanProcessorEvent string

@@ -69,9 +69,10 @@ type ToolGuardrailResultState struct {
 type RunState struct {
 	SchemaVersion string `json:"$schemaVersion"`
 
-	CurrentTurn      uint64 `json:"current_turn"`
-	MaxTurns         uint64 `json:"max_turns"`
-	CurrentAgentName string `json:"current_agent_name,omitempty"`
+	CurrentTurn                   uint64 `json:"current_turn"`
+	MaxTurns                      uint64 `json:"max_turns"`
+	CurrentAgentName              string `json:"current_agent_name,omitempty"`
+	CurrentTurnPersistedItemCount uint64 `json:"current_turn_persisted_item_count,omitempty"`
 
 	OriginalInput  []TResponseInputItem `json:"original_input,omitempty"`
 	GeneratedItems []TResponseInputItem `json:"generated_items,omitempty"`
@@ -209,11 +210,13 @@ func (s *RunState) ApproveTool(approvalItem ToolApprovalItem) error {
 	if s == nil {
 		return nil
 	}
-	item, err := buildMCPApprovalResponseInputItem(approvalItem, true, "")
-	if err != nil {
-		return err
+	if isMCPApprovalItem(approvalItem) {
+		item, err := buildMCPApprovalResponseInputItem(approvalItem, true, "")
+		if err != nil {
+			return err
+		}
+		s.GeneratedItems = append(s.GeneratedItems, item)
 	}
-	s.GeneratedItems = append(s.GeneratedItems, item)
 	s.applyDecisionToToolApprovals(approvalItem, true)
 	return nil
 }
@@ -223,11 +226,13 @@ func (s *RunState) RejectTool(approvalItem ToolApprovalItem, reason string) erro
 	if s == nil {
 		return nil
 	}
-	item, err := buildMCPApprovalResponseInputItem(approvalItem, false, reason)
-	if err != nil {
-		return err
+	if isMCPApprovalItem(approvalItem) {
+		item, err := buildMCPApprovalResponseInputItem(approvalItem, false, reason)
+		if err != nil {
+			return err
+		}
+		s.GeneratedItems = append(s.GeneratedItems, item)
 	}
-	s.GeneratedItems = append(s.GeneratedItems, item)
 	s.applyDecisionToToolApprovals(approvalItem, false)
 	return nil
 }
@@ -289,6 +294,9 @@ func (s *RunState) ApplyStoredToolApprovals() error {
 
 	existingResponses := existingApprovalResponseIDs(s.GeneratedItems)
 	for _, interruption := range s.Interruptions {
+		if !isMCPApprovalItem(interruption) {
+			continue
+		}
 		approvalRequestID := resolveApprovalCallID(interruption)
 		if approvalRequestID == "" {
 			continue
@@ -522,6 +530,19 @@ func existingApprovalResponseIDs(items []TResponseInputItem) map[string]struct{}
 		out[*approvalRequestID] = struct{}{}
 	}
 	return out
+}
+
+func isMCPApprovalItem(approvalItem ToolApprovalItem) bool {
+	if _, ok := providerDataApprovalID(approvalItem.RawItem); ok {
+		return true
+	}
+	if v, ok := stringFromMap(approvalItem.RawItem, "type"); ok && v == "mcp_approval_request" {
+		return true
+	}
+	if v, ok := stringFromField(approvalItem.RawItem, "Type"); ok && v == "mcp_approval_request" {
+		return true
+	}
+	return false
 }
 
 func (s *RunState) applyDecisionToToolApprovals(approvalItem ToolApprovalItem, approve bool) {

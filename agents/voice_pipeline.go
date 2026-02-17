@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 )
 
 // VoicePipeline is an opinionated voice agent pipeline.

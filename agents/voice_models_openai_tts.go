@@ -24,6 +24,7 @@ import (
 	"net/http"
 
 	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/packages/param"
 )
 
 const DefaultOpenAITTSModelVoice = openai.AudioSpeechNewParamsVoiceAsh
@@ -47,11 +48,15 @@ func (m *OpenAITTSModel) ModelName() string {
 }
 
 func (m *OpenAITTSModel) Run(ctx context.Context, text string, settings TTSModelSettings) TTSModelRunResult {
+	instructions := settings.Instructions
+	if !instructions.Valid() {
+		instructions = param.NewOpt(DefaultTTSInstructions)
+	}
 	resp, err := m.client.Audio.Speech.New(ctx, openai.AudioSpeechNewParams{
 		Model:          m.model,
 		Voice:          cmp.Or(openai.AudioSpeechNewParamsVoice(settings.Voice), DefaultOpenAITTSModelVoice),
 		Input:          text,
-		Instructions:   settings.Instructions,
+		Instructions:   instructions,
 		Speed:          settings.Speed,
 		ResponseFormat: openai.AudioSpeechNewParamsResponseFormatPCM,
 		StreamFormat:   openai.AudioSpeechNewParamsStreamFormatAudio,

@@ -19,7 +19,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 // OutputSchemaFile stores the optional schema file path and cleanup callback.

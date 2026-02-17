@@ -8,9 +8,9 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/memory"
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/memory"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/param"
 )

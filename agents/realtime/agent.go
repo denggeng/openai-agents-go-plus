@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 // RealtimeInstructionsFunc computes dynamic instructions for realtime agents.

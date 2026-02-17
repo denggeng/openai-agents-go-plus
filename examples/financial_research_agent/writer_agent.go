@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 // Writer agent brings together the raw search results and optionally calls out

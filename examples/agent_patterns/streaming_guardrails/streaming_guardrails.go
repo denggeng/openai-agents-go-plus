@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/asynctask"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/asynctask"
 )
 
 /*

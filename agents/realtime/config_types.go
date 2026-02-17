@@ -14,7 +14,7 @@
 
 package realtime
 
-import "github.com/nlpodyssey/openai-agents-go/agents"
+import "github.com/denggeng/openai-agents-go-plus/agents"
 
 // RealtimeSessionModelSettings stores transport model settings for realtime sessions.
 type RealtimeSessionModelSettings map[string]any

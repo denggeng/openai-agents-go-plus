@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 )
 
 // Given a search term, use web search to pull back a brief summary.

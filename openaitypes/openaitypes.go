@@ -179,6 +179,33 @@ func ResponseInputItemUnionParamFromResponseFunctionToolCall(
 	}
 }
 
+func ResponseInputItemUnionParamFromResponseFunctionShellToolCall(
+	input responses.ResponseFunctionShellToolCall,
+) responses.ResponseInputItemUnionParam {
+	v := ResponseFunctionShellToolCallToParam(input)
+	return responses.ResponseInputItemUnionParam{
+		OfShellCall: &v,
+	}
+}
+
+func ResponseInputItemUnionParamFromResponseCompactionItem(
+	input responses.ResponseCompactionItem,
+) responses.ResponseInputItemUnionParam {
+	v := ResponseCompactionItemToParam(input)
+	return responses.ResponseInputItemUnionParam{
+		OfCompaction: &v,
+	}
+}
+
+func ResponseInputItemUnionParamFromResponseApplyPatchToolCall(
+	input responses.ResponseApplyPatchToolCall,
+) responses.ResponseInputItemUnionParam {
+	v := ResponseApplyPatchToolCallToParam(input)
+	return responses.ResponseInputItemUnionParam{
+		OfApplyPatchCall: &v,
+	}
+}
+
 func ResponseFunctionToolCallToParam(
 	input responses.ResponseFunctionToolCall,
 ) responses.ResponseFunctionToolCallParam {
@@ -194,6 +221,87 @@ func ResponseFunctionToolCallToParam(
 		out.SetExtraFields(extraFields)
 	}
 	return out
+}
+
+func ResponseFunctionShellToolCallToParam(
+	input responses.ResponseFunctionShellToolCall,
+) responses.ResponseInputItemShellCallParam {
+	out := responses.ResponseInputItemShellCallParam{
+		Action:      ResponseInputItemShellCallActionParamFromResponseFunctionShellToolCallAction(input.Action),
+		CallID:      input.CallID,
+		Environment: ResponseInputItemShellCallEnvironmentUnionParamFromResponseFunctionShellToolCallEnvironmentUnion(input.Environment),
+		Status:      string(input.Status),
+		Type:        constant.ValueOf[constant.ShellCall](),
+	}
+	if input.ID != "" {
+		out.ID = makeOpt(input.ID)
+	}
+	if extraFields := decodedExtraFields(input.JSON.ExtraFields); len(extraFields) > 0 {
+		out.SetExtraFields(extraFields)
+	}
+	return out
+}
+
+func ResponseCompactionItemToParam(
+	input responses.ResponseCompactionItem,
+) responses.ResponseCompactionItemParam {
+	out := responses.ResponseCompactionItemParam{
+		EncryptedContent: input.EncryptedContent,
+		Type:             constant.ValueOf[constant.Compaction](),
+	}
+	if input.ID != "" {
+		out.ID = makeOpt(input.ID)
+	}
+	if extraFields := decodedExtraFields(input.JSON.ExtraFields); len(extraFields) > 0 {
+		out.SetExtraFields(extraFields)
+	}
+	return out
+}
+
+func ResponseApplyPatchToolCallToParam(
+	input responses.ResponseApplyPatchToolCall,
+) responses.ResponseInputItemApplyPatchCallParam {
+	opParam, _ := ResponseApplyPatchToolCallOperationToParam(input.Operation)
+	out := responses.ResponseInputItemApplyPatchCallParam{
+		CallID:    input.CallID,
+		Operation: opParam,
+		Status:    string(input.Status),
+		ID:        makeOpt(input.ID),
+		Type:      constant.ValueOf[constant.ApplyPatchCall](),
+	}
+	if extraFields := decodedExtraFields(input.JSON.ExtraFields); len(extraFields) > 0 {
+		out.SetExtraFields(extraFields)
+	}
+	return out
+}
+
+func ResponseApplyPatchToolCallOperationToParam(
+	input responses.ResponseApplyPatchToolCallOperationUnion,
+) (responses.ResponseInputItemApplyPatchCallOperationUnionParam, bool) {
+	switch input.Type {
+	case "create_file":
+		v := responses.ResponseInputItemApplyPatchCallOperationCreateFileParam{
+			Diff: input.Diff,
+			Path: input.Path,
+			Type: constant.ValueOf[constant.CreateFile](),
+		}
+		return responses.ResponseInputItemApplyPatchCallOperationUnionParam{OfCreateFile: &v}, true
+	case "delete_file":
+		v := responses.ResponseInputItemApplyPatchCallOperationDeleteFileParam{
+			Path: input.Path,
+			Type: constant.ValueOf[constant.DeleteFile](),
+		}
+		return responses.ResponseInputItemApplyPatchCallOperationUnionParam{OfDeleteFile: &v}, true
+	case "update_file":
+		v := responses.ResponseInputItemApplyPatchCallOperationUpdateFileParam{
+			Diff: input.Diff,
+			Path: input.Path,
+			Type: constant.ValueOf[constant.UpdateFile](),
+		}
+		return responses.ResponseInputItemApplyPatchCallOperationUnionParam{OfUpdateFile: &v}, true
+	default:
+		return responses.ResponseInputItemApplyPatchCallOperationUnionParam{}, false
+	}
 }
 
 func ResponseInputItemUnionParamFromResponseInputItemFunctionCallOutputParam(
@@ -218,6 +326,61 @@ func ResponseInputItemUnionParamFromResponseInputItemLocalShellCallOutputParam(
 	return responses.ResponseInputItemUnionParam{
 		OfLocalShellCallOutput: &input,
 	}
+}
+
+func ResponseInputItemUnionParamFromResponseInputItemShellCallOutputParam(
+	input responses.ResponseInputItemShellCallOutputParam,
+) responses.ResponseInputItemUnionParam {
+	return responses.ResponseInputItemUnionParam{
+		OfShellCallOutput: &input,
+	}
+}
+
+func ResponseInputItemUnionParamFromResponseInputItemApplyPatchCallOutputParam(
+	input responses.ResponseInputItemApplyPatchCallOutputParam,
+) responses.ResponseInputItemUnionParam {
+	return responses.ResponseInputItemUnionParam{
+		OfApplyPatchCallOutput: &input,
+	}
+}
+
+func ResponseInputItemApplyPatchCallOutputParamFromResponseOutputItemUnion(
+	input responses.ResponseOutputItemUnion,
+) responses.ResponseInputItemApplyPatchCallOutputParam {
+	out := responses.ResponseInputItemApplyPatchCallOutputParam{
+		CallID: input.CallID,
+		Status: input.Status,
+		ID:     makeOpt(input.ID),
+		Type:   constant.ValueOf[constant.ApplyPatchCallOutput](),
+	}
+	if input.Output.OfString != "" {
+		out.Output = param.NewOpt(input.Output.OfString)
+	}
+	return out
+}
+
+func ResponseInputItemShellCallOutputParamFromResponseOutputItemUnion(
+	input responses.ResponseOutputItemUnion,
+) responses.ResponseInputItemShellCallOutputParam {
+	out := responses.ResponseInputItemShellCallOutputParam{
+		CallID: input.CallID,
+		Type:   constant.ValueOf[constant.ShellCallOutput](),
+		Status: input.Status,
+	}
+	if input.ID != "" {
+		out.ID = makeOpt(input.ID)
+	}
+	if input.JSON.MaxOutputLength.Valid() {
+		out.MaxOutputLength = param.NewOpt(input.MaxOutputLength)
+	}
+	if outputs := input.Output.OfResponseFunctionShellToolCallOutputOutputArray; len(outputs) > 0 {
+		converted := make([]responses.ResponseFunctionShellCallOutputContentParam, 0, len(outputs))
+		for _, entry := range outputs {
+			converted = append(converted, ResponseFunctionShellToolCallOutputOutputToParam(entry))
+		}
+		out.Output = converted
+	}
+	return out
 }
 
 func ResponseInputItemUnionParamFromResponseReasoningItem(
@@ -245,6 +408,20 @@ func ResponseReasoningItemToParam(
 	}
 	if extraFields := decodedExtraFields(input.JSON.ExtraFields); len(extraFields) > 0 {
 		out.SetExtraFields(extraFields)
+	}
+	return out
+}
+
+func ResponseFunctionShellToolCallOutputOutputToParam(
+	input responses.ResponseFunctionShellToolCallOutputOutput,
+) responses.ResponseFunctionShellCallOutputContentParam {
+	var out responses.ResponseFunctionShellCallOutputContentParam
+	data, err := json.Marshal(input)
+	if err != nil {
+		return out
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return responses.ResponseFunctionShellCallOutputContentParam{}
 	}
 	return out
 }
@@ -328,12 +505,44 @@ func ResponseInputItemUnionParamFromResponseOutputItemUnion(
 			Status:              responses.ResponseComputerToolCallStatus(input.Status),
 			Type:                responses.ResponseComputerToolCallType(input.Type),
 		})
+	case "shell_call":
+		return ResponseInputItemUnionParamFromResponseFunctionShellToolCall(responses.ResponseFunctionShellToolCall{
+			ID:          input.ID,
+			Action:      ResponseFunctionShellToolCallActionFromResponseOutputItemUnionAction(input.Action),
+			CallID:      input.CallID,
+			Environment: input.Environment,
+			Status:      responses.ResponseFunctionShellToolCallStatus(input.Status),
+			Type:        constant.ValueOf[constant.ShellCall](),
+		})
+	case "shell_call_output":
+		return ResponseInputItemUnionParamFromResponseInputItemShellCallOutputParam(
+			ResponseInputItemShellCallOutputParamFromResponseOutputItemUnion(input),
+		)
+	case "apply_patch_call":
+		return ResponseInputItemUnionParamFromResponseApplyPatchToolCall(responses.ResponseApplyPatchToolCall{
+			ID:        input.ID,
+			CallID:    input.CallID,
+			Operation: input.Operation,
+			Status:    responses.ResponseApplyPatchToolCallStatus(input.Status),
+			Type:      constant.ValueOf[constant.ApplyPatchCall](),
+			CreatedBy: input.CreatedBy,
+		})
+	case "apply_patch_call_output":
+		return ResponseInputItemUnionParamFromResponseInputItemApplyPatchCallOutputParam(
+			ResponseInputItemApplyPatchCallOutputParamFromResponseOutputItemUnion(input),
+		)
 	case "reasoning":
 		return ResponseInputItemUnionParamFromResponseReasoningItem(responses.ResponseReasoningItem{
 			ID:      input.ID,
 			Summary: input.Summary,
 			Type:    constant.ValueOf[constant.Reasoning](),
 			Status:  responses.ResponseReasoningItemStatus(input.Status),
+		})
+	case "compaction":
+		return ResponseInputItemUnionParamFromResponseCompactionItem(responses.ResponseCompactionItem{
+			ID:               input.ID,
+			EncryptedContent: input.EncryptedContent,
+			Type:             constant.ValueOf[constant.Compaction](),
 		})
 	default:
 		panic(fmt.Errorf("unexpected ResponseOutputItemUnion type %q", input.Type))
@@ -507,6 +716,37 @@ func ResponseInputItemLocalShellCallActionParamFromResponseOutputItemLocalShellC
 	}
 }
 
+func ResponseInputItemShellCallActionParamFromResponseFunctionShellToolCallAction(
+	input responses.ResponseFunctionShellToolCallAction,
+) responses.ResponseInputItemShellCallActionParam {
+	return responses.ResponseInputItemShellCallActionParam{
+		Commands:        input.Commands,
+		MaxOutputLength: param.NewOpt(input.MaxOutputLength),
+		TimeoutMs:       param.NewOpt(input.TimeoutMs),
+	}
+}
+
+func ResponseInputItemShellCallEnvironmentUnionParamFromResponseFunctionShellToolCallEnvironmentUnion(
+	input responses.ResponseFunctionShellToolCallEnvironmentUnion,
+) responses.ResponseInputItemShellCallEnvironmentUnionParam {
+	if raw := input.RawJSON(); raw != "" {
+		return param.Override[responses.ResponseInputItemShellCallEnvironmentUnionParam](json.RawMessage(raw))
+	}
+	switch input.Type {
+	case "container_reference":
+		container := responses.ContainerReferenceParam{
+			ContainerID: input.ContainerID,
+			Type:        constant.ValueOf[constant.ContainerReference](),
+		}
+		return responses.ResponseInputItemShellCallEnvironmentUnionParam{OfContainerReference: &container}
+	case "local":
+		local := responses.LocalEnvironmentParam{Type: constant.ValueOf[constant.Local]()}
+		return responses.ResponseInputItemShellCallEnvironmentUnionParam{OfLocal: &local}
+	default:
+		return responses.ResponseInputItemShellCallEnvironmentUnionParam{}
+	}
+}
+
 func ResponseComputerToolCallActionUnionFromResponseOutputItemUnionAction(
 	input responses.ResponseOutputItemUnionAction,
 ) responses.ResponseComputerToolCallActionUnion {
@@ -533,6 +773,16 @@ func ResponseOutputItemLocalShellCallActionFromResponseOutputItemUnionAction(
 		TimeoutMs:        input.TimeoutMs,
 		User:             input.User,
 		WorkingDirectory: input.WorkingDirectory,
+	}
+}
+
+func ResponseFunctionShellToolCallActionFromResponseOutputItemUnionAction(
+	input responses.ResponseOutputItemUnionAction,
+) responses.ResponseFunctionShellToolCallAction {
+	return responses.ResponseFunctionShellToolCallAction{
+		Commands:        input.Commands,
+		MaxOutputLength: input.MaxOutputLength,
+		TimeoutMs:       input.TimeoutMs,
 	}
 }
 

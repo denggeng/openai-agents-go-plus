@@ -1,8 +1,8 @@
 {
-  "latest_log": ".codex-watch/resume-019c5146-a10e-7b00-a1dd-1039e4bb80ca-20260213-185651.log",
-  "size": 49361,
-  "lines": 19,
-  "hash10": "3ae1fa30d97ea2c07c692be174cb867c71ce0a48ea4501b424086970c9e1acad",
-  "last_line": "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_9\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc \\\"rg -n \\\\\\\"NewRunContextWrapper\\\\\\\\[\\\\\\\" agents | sed -n '1,260p'\\\"\",\"aggregated_output\":\"agents/run_state.go:287:\\tapprovalContext := NewRunContextWrapper[any](nil)\\nagents/run_state.go:532:\\tapprovalContext := NewRunContextWrapper[any](nil)\\nagents/run_state_test.go:164:\\trunContext := agents.NewRunContextWrapper[any](nil)\\nagents/run_state_test.go:187:\\trestoredContext := agents.NewRunContextWrapper[any](nil)\\nagents/run_state_test.go:229:\\trestoredContext := agents.NewRunContextWrapper[any](nil)\\nagents/run_state_test.go:260:\\tstate.SetToolApprovalsFromContext(agents.NewRunContextWrapper[any](nil))\\nagents/run_state_test.go:262:\\trunContext := agents.NewRunContextWrapper[any](nil)\\nagents/run_state_test.go:300:\\trunContext := agents.NewRunContextWrapper[any](nil)\\nagents/run_context_test.go:26:\\tctx := agents.NewRunContextWrapper[any](nil)\\nagents/run_context_test.go:51:\\tctx := agents.NewRunContextWrapper[any](nil)\\nagents/run_context_test.go:71:\\tctx := agents.NewRunContextWrapper[any](nil)\\nagents/run_context_test.go:90:\\tctx := agents.NewRunContextWrapper[any](nil)\\nagents/run_context_test.go:106:\\tctx := agents.NewRunContextWrapper[any](nil)\\nagents/run_context_test.go:119:\\trestored := agents.NewRunContextWrapper[any](nil)\\nagents/run_state_resume_test.go:167:\\trunContext := agents.NewRunContextWrapper[any](nil)\\nagents/run_state_resume_test.go:209:\\trunContext := agents.NewRunContextWrapper[any](nil)\\nagents/run_context.go:53:func NewRunContextWrapper[T any](ctx T) *RunContextWrapper[T] {\\nagents/realtime/model_settings_builder_test.go:37:\\tenabled, err := CollectEnabledHandoffs(parent, agents.NewRunContextWrapper[any](nil))\\nagents/realtime/model_settings_builder_test.go:66:\\t\\tagents.NewRunContextWrapper[any](nil),\\nagents/realtime/agent_test.go:47:\\tinstructions, err := dynamicAgent.GetSystemPrompt(agents.NewRunContextWrapper[any](nil))\\nagents/realtime/model_settings_builder.go:176:\\tcontextWrapper := agents.NewRunContextWrapper[T](contextValue)\\nagents/realtime/session.go:82:\\tcontextWrapper := agents.NewRunContextWrapper[any](contextValue)\\n\",\"exit_code\":0,\"status\":\"completed\"}}",
-  "mtime": 1770980240.3865037
+  "sessionId": "warm-reef",
+  "lastTaskCompleteTurnId": "019c694a-6caa-7dd0-ad6f-ac1e693aeae9",
+  "lastCodexTuiLogMtime": 1771296277,
+  "lastRolloutJsonlMtime": 1771296286,
+  "lastSeenRolloutPath": "/Users/denggeng/.codex/sessions/2026/02/14/rollout-2026-02-14T19-53-39-019c5bff-d94c-7b61-837a-49790cee4b2c.jsonl",
+  "lastRestartAt": "2026-02-17T10:13:43+08:00"
 }

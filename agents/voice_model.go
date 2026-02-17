@@ -21,7 +21,7 @@ import (
 	"github.com/openai/openai-go/v3/packages/param"
 )
 
-const DefaultTTSInstructions = "You will receive partial sentences. Do not complete the sentence, just read out the text."
+const DefaultTTSInstructions = "You will receive partial sentences. Do not complete the sentence just read out the text."
 
 type TTSVoice string
 

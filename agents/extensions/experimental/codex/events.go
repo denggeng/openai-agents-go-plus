@@ -14,7 +14,7 @@
 
 package codex
 
-import "github.com/nlpodyssey/openai-agents-go/agents"
+import "github.com/denggeng/openai-agents-go-plus/agents"
 
 // ThreadEvent is one JSONL event emitted by the Codex CLI.
 type ThreadEvent interface {

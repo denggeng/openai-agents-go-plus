@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 type inputGuardrailBuilder func(context.Context, GuardrailDeclaration) (agents.InputGuardrail, error)

@@ -17,8 +17,8 @@ package agents_test
 import (
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/agentstesting"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/agentstesting"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"

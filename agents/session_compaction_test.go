@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/memory"
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/memory"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"
@@ -94,7 +94,7 @@ func TestSaveResultToSessionRunsCompactionForCompactionAwareSession(t *testing.T
 		},
 	}
 
-	err := runner.saveResultToSession(t.Context(), InputString("hello"), result)
+	err := runner.saveResultToSession(t.Context(), InputString("hello"), result, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, session.addCalls)
 	require.Len(t, session.runCompactionCalls, 1)
@@ -116,7 +116,7 @@ func TestSaveResultToSessionSkipsCompactionWithoutResponseID(t *testing.T) {
 		},
 	}
 
-	err := runner.saveResultToSession(t.Context(), InputString("hello"), result)
+	err := runner.saveResultToSession(t.Context(), InputString("hello"), result, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, session.addCalls)
 	assert.Empty(t, session.runCompactionCalls)
@@ -152,7 +152,7 @@ func TestSaveResultToSessionPropagatesCompactionError(t *testing.T) {
 		},
 	}
 
-	err := runner.saveResultToSession(t.Context(), InputString("hello"), result)
+	err := runner.saveResultToSession(t.Context(), InputString("hello"), result, nil)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "failed to run session compaction")
 	assert.ErrorContains(t, err, "compact failed")
@@ -183,7 +183,7 @@ func TestSaveResultToSessionStoresRunUsageForUsageTrackingSession(t *testing.T) 
 		},
 	}
 
-	err := runner.saveResultToSession(t.Context(), InputString("hello"), result)
+	err := runner.saveResultToSession(t.Context(), InputString("hello"), result, nil)
 	require.NoError(t, err)
 	require.Len(t, session.storedUsageCalls, 1)
 	require.NotNil(t, session.storedUsageCalls[0])
@@ -214,7 +214,7 @@ func TestSaveResultToSessionPropagatesStoreRunUsageError(t *testing.T) {
 		},
 	}
 
-	err := runner.saveResultToSession(t.Context(), InputString("hello"), result)
+	err := runner.saveResultToSession(t.Context(), InputString("hello"), result, nil)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "failed to store run usage")
 	assert.ErrorContains(t, err, "store usage failed")

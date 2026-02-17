@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"math/rand"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 // HowManyJokes returns a random integer of jokes to tell between 1 and 10 (inclusive).

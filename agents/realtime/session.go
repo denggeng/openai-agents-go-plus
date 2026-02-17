@@ -23,7 +23,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 const defaultRealtimeApprovalRejectionMessage = "Tool call rejected because approval was not granted."
@@ -697,6 +697,10 @@ func (s *RealtimeSession) handleHandoffCall(
 			})
 		}
 	}()
+
+	if s.contextWrapper != nil {
+		ctx = agents.ContextWithRunContextValue(ctx, s.contextWrapper)
+	}
 
 	invokedAgent, err := handoff.OnInvokeHandoff(ctx, event.Arguments)
 	if err != nil {

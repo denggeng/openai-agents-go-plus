@@ -19,10 +19,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
 )
 
 func main() {

@@ -18,7 +18,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -101,6 +101,39 @@ func TestSessionConfigRespectsAudioBlockAndOutputModalities(t *testing.T) {
 	assert.Equal(t, true, *td.GetCreateResponse())
 	require.NotNil(t, td.GetSilenceDurationMs())
 	assert.Equal(t, int64(450), *td.GetSilenceDurationMs())
+}
+
+func TestSessionConfigNormalizesTurnDetectionModelVersion(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+
+	cfg, err := model.GetSessionConfig(RealtimeSessionModelSettings{
+		"audio": map[string]any{
+			"input": map[string]any{
+				"turn_detection": map[string]any{
+					"type":              "server_vad",
+					"createResponse":    true,
+					"silenceDurationMs": 450,
+					"modelVersion":      "default",
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	raw, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(raw, &payload))
+
+	audio := payload["audio"].(map[string]any)
+	input := audio["input"].(map[string]any)
+	turnDetection := input["turn_detection"].(map[string]any)
+
+	assert.Equal(t, true, turnDetection["create_response"])
+	assert.Equal(t, float64(450), turnDetection["silence_duration_ms"])
+	assert.Equal(t, "default", turnDetection["model_version"])
+	_, hasModelVersion := turnDetection["modelVersion"]
+	assert.False(t, hasModelVersion)
 }
 
 func TestCallIDSessionUpdateOmitsNullAudioFormats(t *testing.T) {

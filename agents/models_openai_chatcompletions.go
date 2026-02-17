@@ -23,11 +23,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
-	"github.com/nlpodyssey/openai-agents-go/openaitypes"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
-	"github.com/nlpodyssey/openai-agents-go/usage"
-	"github.com/nlpodyssey/openai-agents-go/util"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/openaitypes"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
+	"github.com/denggeng/openai-agents-go-plus/usage"
+	"github.com/denggeng/openai-agents-go-plus/util"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -289,9 +289,13 @@ func (m OpenAIChatCompletionsModel) prepareRequest(
 	modelTracing ModelTracing,
 	stream bool,
 ) (*openai.ChatCompletionNewParams, []option.RequestOption, error) {
-	convertedMessages, err := ChatCmplConverter().ItemsToMessages(input)
+	convertedMessages, err := ChatCmplConverter().ItemsToMessagesWithModel(input, string(m.Model))
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if m.modelImpl == "litellm" && shouldFixLiteLLMToolMessageOrdering(string(m.Model)) {
+		convertedMessages = fixToolMessageOrdering(convertedMessages)
 	}
 
 	if systemInstructions.Valid() {

@@ -236,8 +236,8 @@ func (s *OpenAIResponsesCompactionSession) RunCompaction(
 		}
 	}
 	currentResponseID := s.responseID
-	resolvedMode := s.resolveCompactionModeForResponse(currentResponseID, store, requestedMode)
 	s.mu.Unlock()
+	resolvedMode := s.resolveCompactionModeForResponse(currentResponseID, store, requestedMode)
 
 	if resolvedMode == resolvedCompactionModePreviousResponseID && currentResponseID == "" {
 		return errors.New(

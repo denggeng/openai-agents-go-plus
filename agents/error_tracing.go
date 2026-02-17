@@ -4,7 +4,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 )
 
 func AttachErrorToSpan(span tracing.Span, err tracing.SpanError) {

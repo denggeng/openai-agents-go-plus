@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 // A sub‑agent specializing in identifying risk factors or concerns.

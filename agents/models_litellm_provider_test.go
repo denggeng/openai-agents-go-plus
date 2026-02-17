@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/stretchr/testify/assert"
@@ -40,6 +40,10 @@ func TestLiteLLMProvider_GetModelUsesDefaultModelWhenEmpty(t *testing.T) {
 }
 
 func TestLiteLLMProvider_UsesDefaultsWhenNoParamsProvided(t *testing.T) {
+	t.Setenv("LITELLM_BASE_URL", "")
+	t.Setenv("LITELLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+
 	provider := NewLiteLLMProvider(LiteLLMProviderParams{})
 
 	assert.Equal(t, DefaultLiteLLMBaseURL, provider.provider.params.BaseURL.Or(""))

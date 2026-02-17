@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"math/rand"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/agents/extensions/handoff_prompt"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents/extensions/handoff_prompt"
 )
 
 /*

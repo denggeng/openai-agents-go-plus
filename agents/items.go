@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nlpodyssey/openai-agents-go/openaitypes"
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/openaitypes"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
@@ -137,13 +137,11 @@ func (itemHelpers) TextMessageOutput(message MessageOutputItem) string {
 // ToolCallOutputItem creates a tool call output item from a tool call and its output.
 func (itemHelpers) ToolCallOutputItem(
 	toolCall ResponseFunctionToolCall,
-	output string,
+	output any,
 ) responses.ResponseInputItemFunctionCallOutputParam {
 	return responses.ResponseInputItemFunctionCallOutputParam{
 		CallID: toolCall.CallID,
-		Output: responses.ResponseInputItemFunctionCallOutputOutputUnionParam{
-			OfString: param.NewOpt(output),
-		},
-		Type: constant.ValueOf[constant.FunctionCallOutput](),
+		Output: convertToolOutput(output),
+		Type:   constant.ValueOf[constant.FunctionCallOutput](),
 	}
 }

@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-module github.com/nlpodyssey/openai-agents-go
+module github.com/denggeng/openai-agents-go-plus
 
 go 1.24.3
 
 require (
+	github.com/alicebob/miniredis/v2 v2.34.0
 	github.com/go-audio/audio v1.0.0
 	github.com/go-audio/wav v1.1.0
 	github.com/google/jsonschema-go v0.2.3
@@ -30,13 +31,13 @@ require (
 	github.com/modelcontextprotocol/go-sdk v0.5.0
 	github.com/openai/openai-go/v3 v3.21.0
 	github.com/playwright-community/playwright-go v0.5200.0
+	github.com/redis/go-redis/v9 v9.7.0
 	github.com/stretchr/testify v1.11.1
 	github.com/xeipuuv/gojsonschema v1.2.0
 )
 
 require (
 	github.com/alicebob/gopher-json v0.0.0-20230218143504-906a9b012302 // indirect
-	github.com/alicebob/miniredis/v2 v2.34.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
@@ -51,7 +52,6 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mailru/easyjson v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/redis/go-redis/v9 v9.7.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.2.0 // indirect

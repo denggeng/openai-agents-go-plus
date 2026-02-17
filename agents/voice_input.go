@@ -18,10 +18,10 @@ import (
 	"encoding/base64"
 	"fmt"
 
+	"github.com/denggeng/openai-agents-go-plus/asyncqueue"
+	"github.com/denggeng/openai-agents-go-plus/util"
 	"github.com/go-audio/audio"
 	"github.com/go-audio/wav"
-	"github.com/nlpodyssey/openai-agents-go/asyncqueue"
-	"github.com/nlpodyssey/openai-agents-go/util"
 )
 
 const (

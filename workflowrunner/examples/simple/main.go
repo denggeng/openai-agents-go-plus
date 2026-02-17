@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nlpodyssey/openai-agents-go/workflowrunner"
+	"github.com/denggeng/openai-agents-go-plus/workflowrunner"
 )
 
 func main() {

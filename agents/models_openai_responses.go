@@ -16,15 +16,16 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
 	"slices"
 
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -502,6 +503,33 @@ func (conv responsesConverter) convertTool(
 		convertedTool = &responses.ToolUnionParam{
 			OfLocalShell: &responses.ToolLocalShellParam{
 				Type: constant.ValueOf[constant.LocalShell](),
+			},
+		}
+		includes = nil
+	case ShellTool:
+		environment := t.Environment
+		if normalized, err := normalizeShellToolEnvironment(environment); err == nil {
+			environment = normalized
+		}
+		var envParam responses.FunctionShellToolEnvironmentUnionParam
+		if environment != nil {
+			raw, err := json.Marshal(environment)
+			if err != nil {
+				return nil, nil, err
+			}
+			envParam = param.Override[responses.FunctionShellToolEnvironmentUnionParam](json.RawMessage(raw))
+		}
+		convertedTool = &responses.ToolUnionParam{
+			OfShell: &responses.FunctionShellToolParam{
+				Type:        constant.ValueOf[constant.Shell](),
+				Environment: envParam,
+			},
+		}
+		includes = nil
+	case ApplyPatchTool:
+		convertedTool = &responses.ToolUnionParam{
+			OfApplyPatch: &responses.ApplyPatchToolParam{
+				Type: constant.ValueOf[constant.ApplyPatch](),
 			},
 		}
 		includes = nil

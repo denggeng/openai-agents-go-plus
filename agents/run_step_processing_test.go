@@ -16,10 +16,11 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
-	"github.com/nlpodyssey/openai-agents-go/computer"
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/computer"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"
@@ -568,4 +569,424 @@ func TestToolAndHandoffParsedCorrectly(t *testing.T) {
 	assert.Equal(t, DefaultHandoffToolName(agent1), handoff.Handoff.ToolName)
 	assert.Equal(t, DefaultHandoffToolDescription(agent1), handoff.Handoff.ToolDescription)
 	assert.Equal(t, "test_1", handoff.Handoff.AgentName)
+}
+
+func TestProcessModelResponseApplyPatchCallWithoutToolRaises(t *testing.T) {
+	agent := &Agent{Name: "no-apply"}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustApplyPatchCallOutputItem(t, map[string]any{
+				"type":    "apply_patch_call",
+				"call_id": "apply-1",
+				"status":  "completed",
+				"operation": map[string]any{
+					"type": "update_file",
+					"path": "test.md",
+					"diff": "-old\n+new\n",
+				},
+			}),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	_, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		nil,
+		response,
+		nil,
+	)
+	assert.ErrorAs(t, err, &ModelBehaviorError{})
+}
+
+func TestProcessModelResponseSanitizesApplyPatchCallModelObject(t *testing.T) {
+	editor := noopApplyPatchEditor{}
+	applyPatchTool := ApplyPatchTool{Editor: editor}
+	agent := &Agent{Name: "apply-agent", Tools: []Tool{applyPatchTool}}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustApplyPatchCallOutputItem(t, map[string]any{
+				"type":       "apply_patch_call",
+				"id":         "ap_call_1",
+				"call_id":    "call_apply_1",
+				"status":     "completed",
+				"created_by": "server",
+				"operation": map[string]any{
+					"type": "update_file",
+					"path": "test.md",
+					"diff": "-old\n+new\n",
+				},
+			}),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, processed.NewItems, 1)
+	item, ok := processed.NewItems[0].(ToolCallItem)
+	require.True(t, ok)
+
+	rawPayload := mustJSONMap(t, item.RawItem)
+	_, hasCreatedBy := rawPayload["created_by"]
+	assert.False(t, hasCreatedBy)
+
+	nextInput := item.ToInputItem()
+	nextPayload := mustJSONMap(t, nextInput)
+	_, hasCreatedBy = nextPayload["created_by"]
+	assert.False(t, hasCreatedBy)
+
+	require.Len(t, processed.ApplyPatchCalls, 1)
+	queuedCall := processed.ApplyPatchCalls[0].ToolCall
+	queuedPayload := mustJSONMap(t, queuedCall)
+	assert.Equal(t, "apply_patch_call", queuedPayload["type"])
+	_, hasCreatedBy = queuedPayload["created_by"]
+	assert.False(t, hasCreatedBy)
+
+	assert.Equal(t, []string{applyPatchTool.ToolName()}, processed.ToolsUsed)
+}
+
+func TestProcessModelResponseShellCallWithoutToolRaises(t *testing.T) {
+	agent := &Agent{Name: "no-shell"}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustOutputItem(t, map[string]any{
+				"type":    "shell_call",
+				"id":      "shell-1",
+				"call_id": "shell-1",
+				"status":  "completed",
+				"action": map[string]any{
+					"type":       "exec",
+					"commands":   []string{"echo hi"},
+					"timeout_ms": 1000,
+				},
+			}),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	_, err = RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	assert.ErrorAs(t, err, &ModelBehaviorError{})
+	assert.Contains(t, err.Error(), "shell tool")
+}
+
+func TestProcessModelResponseSkipsLocalShellExecutionForHostedEnvironment(t *testing.T) {
+	shellTool := ShellTool{
+		Environment: map[string]any{"type": "container_auto"},
+	}
+	agent := &Agent{Name: "hosted-shell", Tools: []Tool{shellTool}}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustOutputItem(t, map[string]any{
+				"type":    "shell_call",
+				"id":      "shell-hosted-1",
+				"call_id": "shell-hosted-1",
+				"status":  "completed",
+				"action": map[string]any{
+					"type":       "exec",
+					"commands":   []string{"echo hi"},
+					"timeout_ms": 1000,
+				},
+			}),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, processed.NewItems, 1)
+	_, ok := processed.NewItems[0].(ToolCallItem)
+	require.True(t, ok)
+	assert.Empty(t, processed.ShellCalls)
+	assert.Equal(t, []string{shellTool.ToolName()}, processed.ToolsUsed)
+}
+
+func TestProcessModelResponseSanitizesShellCallModelObject(t *testing.T) {
+	shellCall := responses.ResponseFunctionShellToolCall{
+		Type:      constant.ValueOf[constant.ShellCall](),
+		ID:        "sh_call_2",
+		CallID:    "call_shell_2",
+		Status:    responses.ResponseFunctionShellToolCallStatusCompleted,
+		CreatedBy: "server",
+		Action: responses.ResponseFunctionShellToolCallAction{
+			Commands:        []string{"echo hi"},
+			TimeoutMs:       1000,
+			MaxOutputLength: 0,
+		},
+	}
+	shellTool := ShellTool{
+		Environment: map[string]any{"type": "container_auto"},
+	}
+	agent := &Agent{Name: "hosted-shell-model", Tools: []Tool{shellTool}}
+	response := ModelResponse{
+		Output:     []TResponseOutputItem{mustOutputItem(t, shellCall)},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, processed.NewItems, 1)
+	item, ok := processed.NewItems[0].(ToolCallItem)
+	require.True(t, ok)
+	rawPayload := mustJSONMap(t, item.RawItem)
+	assert.Equal(t, "shell_call", rawPayload["type"])
+	_, hasCreatedBy := rawPayload["created_by"]
+	assert.False(t, hasCreatedBy)
+
+	nextInput := item.ToInputItem()
+	nextPayload := mustJSONMap(t, nextInput)
+	assert.Equal(t, "shell_call", nextPayload["type"])
+	_, hasCreatedBy = nextPayload["created_by"]
+	assert.False(t, hasCreatedBy)
+	assert.Empty(t, processed.ShellCalls)
+	assert.Equal(t, []string{shellTool.ToolName()}, processed.ToolsUsed)
+}
+
+func TestProcessModelResponsePreservesShellCallOutput(t *testing.T) {
+	shellOutput := map[string]any{
+		"type":              "shell_call_output",
+		"id":                "sh_out_1",
+		"call_id":           "call_shell_1",
+		"status":            "completed",
+		"max_output_length": 1000,
+		"output": []map[string]any{
+			{
+				"stdout":  "ok\n",
+				"stderr":  "",
+				"outcome": map[string]any{"type": "exit", "exit_code": 0},
+			},
+		},
+	}
+	agent := &Agent{Name: "shell-output"}
+	response := ModelResponse{
+		Output:     []TResponseOutputItem{mustOutputItem(t, shellOutput)},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, processed.NewItems, 1)
+	outputItem, ok := processed.NewItems[0].(ToolCallOutputItem)
+	require.True(t, ok)
+	assert.Equal(t, mustJSONMap(t, shellOutput), mustJSONMap(t, outputItem.RawItem))
+	assert.Equal(t, []string{"shell"}, processed.ToolsUsed)
+	assert.Empty(t, processed.ShellCalls)
+}
+
+func TestProcessModelResponseSanitizesShellCallOutputModelObject(t *testing.T) {
+	shellOutput := responses.ResponseFunctionShellToolCallOutput{
+		Type:      constant.ValueOf[constant.ShellCallOutput](),
+		ID:        "sh_out_2",
+		CallID:    "call_shell_2",
+		Status:    responses.ResponseFunctionShellToolCallOutputStatusCompleted,
+		CreatedBy: "server",
+		Output: []responses.ResponseFunctionShellToolCallOutputOutput{
+			{
+				Stdout: "ok\n",
+				Stderr: "",
+				Outcome: responses.ResponseFunctionShellToolCallOutputOutputOutcomeUnion{
+					Type:     "exit",
+					ExitCode: 0,
+				},
+				CreatedBy: "server",
+			},
+		},
+	}
+	agent := &Agent{Name: "shell-output-model"}
+	response := ModelResponse{
+		Output:     []TResponseOutputItem{mustOutputItem(t, shellOutput)},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, processed.NewItems, 1)
+	item, ok := processed.NewItems[0].(ToolCallOutputItem)
+	require.True(t, ok)
+	rawPayload := mustJSONMap(t, item.RawItem)
+	assert.Equal(t, "shell_call_output", rawPayload["type"])
+	_, hasCreatedBy := rawPayload["created_by"]
+	assert.False(t, hasCreatedBy)
+	outputEntries := rawPayload["output"].([]any)
+	entry := outputEntries[0].(map[string]any)
+	_, hasCreatedBy = entry["created_by"]
+	assert.False(t, hasCreatedBy)
+
+	nextInput := item.ToInputItem()
+	nextPayload := mustJSONMap(t, nextInput)
+	assert.Equal(t, "shell_call_output", nextPayload["type"])
+	_, hasStatus := nextPayload["status"]
+	assert.False(t, hasStatus)
+	_, hasCreatedBy = nextPayload["created_by"]
+	assert.False(t, hasCreatedBy)
+	nextOutputEntries := nextPayload["output"].([]any)
+	nextEntry := nextOutputEntries[0].(map[string]any)
+	_, hasCreatedBy = nextEntry["created_by"]
+	assert.False(t, hasCreatedBy)
+	assert.Equal(t, []string{"shell"}, processed.ToolsUsed)
+}
+
+func TestProcessModelResponseConvertsCustomApplyPatchCall(t *testing.T) {
+	editor := noopApplyPatchEditor{}
+	applyPatchTool := ApplyPatchTool{Editor: editor}
+	agent := &Agent{Name: "apply-agent", Tools: []Tool{applyPatchTool}}
+
+	customInput := `{"type":"update_file","path":"test.md","diff":"-a\n+b\n"}`
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustApplyPatchCallOutputItem(t, map[string]any{
+				"type":    "custom_tool_call",
+				"name":    "apply_patch",
+				"call_id": "custom-apply-1",
+				"input":   customInput,
+			}),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, processed.ApplyPatchCalls, 1)
+	queuedCall := processed.ApplyPatchCalls[0].ToolCall
+	queuedPayload := mustJSONMap(t, queuedCall)
+	assert.Equal(t, "apply_patch_call", queuedPayload["type"])
+	assert.Equal(t, []string{applyPatchTool.ToolName()}, processed.ToolsUsed)
+}
+
+func TestProcessModelResponseHandlesCompactionItem(t *testing.T) {
+	agent := &Agent{Name: "compaction-agent"}
+	compactionItem := responses.ResponseCompactionItem{
+		ID:               "comp-1",
+		EncryptedContent: "enc",
+		Type:             constant.ValueOf[constant.Compaction](),
+		CreatedBy:        "server",
+	}
+	response := ModelResponse{
+		Output:     []TResponseOutputItem{mustOutputItem(t, compactionItem)},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, processed.NewItems, 1)
+	item, ok := processed.NewItems[0].(CompactionItem)
+	require.True(t, ok)
+	rawPayload := mustJSONMap(t, item.RawItem)
+	assert.Equal(t, "compaction", rawPayload["type"])
+	assert.Equal(t, "enc", rawPayload["encrypted_content"])
+	_, hasCreatedBy := rawPayload["created_by"]
+	assert.False(t, hasCreatedBy)
+}
+
+type noopApplyPatchEditor struct{}
+
+func (noopApplyPatchEditor) CreateFile(ApplyPatchOperation) (any, error) { return nil, nil }
+func (noopApplyPatchEditor) UpdateFile(ApplyPatchOperation) (any, error) { return nil, nil }
+func (noopApplyPatchEditor) DeleteFile(ApplyPatchOperation) (any, error) { return nil, nil }
+
+func mustApplyPatchCallOutputItem(t *testing.T, payload map[string]any) responses.ResponseOutputItemUnion {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	var item responses.ResponseOutputItemUnion
+	require.NoError(t, json.Unmarshal(raw, &item))
+	return item
+}
+
+func mustOutputItem(t *testing.T, payload any) responses.ResponseOutputItemUnion {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	var item responses.ResponseOutputItemUnion
+	require.NoError(t, json.Unmarshal(raw, &item))
+	return item
+}
+
+func mustJSONMap(t *testing.T, value any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	require.NoError(t, err)
+	var out map[string]any
+	require.NoError(t, json.Unmarshal(raw, &out))
+	return out
 }

@@ -22,9 +22,9 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/denggeng/openai-agents-go-plus/tracing"
+	"github.com/denggeng/openai-agents-go-plus/util"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
-	"github.com/nlpodyssey/openai-agents-go/util"
 	"github.com/openai/openai-go/v3/packages/param"
 )
 

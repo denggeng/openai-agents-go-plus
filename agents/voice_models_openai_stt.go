@@ -14,15 +14,14 @@ import (
 	"slices"
 	"time"
 
+	"github.com/denggeng/openai-agents-go-plus/asyncqueue"
+	"github.com/denggeng/openai-agents-go-plus/asynctask"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 	"github.com/gorilla/websocket"
-	"github.com/nlpodyssey/openai-agents-go/asyncqueue"
-	"github.com/nlpodyssey/openai-agents-go/asynctask"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
 	"github.com/openai/openai-go/v3"
 )
 
-const (
-
+var (
 	// VoiceModelsOpenAIEventInactivityTimeout is the timeout for inactivity in event processing.
 	VoiceModelsOpenAIEventInactivityTimeout = 1000 * time.Second
 
@@ -32,6 +31,8 @@ const (
 	// VoiceModelsOpenAISessionUpdateTimeout is the timeout waiting for session.updated event
 	VoiceModelsOpenAISessionUpdateTimeout = 10 * time.Second
 )
+
+var voiceModelsOpenAITimeNow = time.Now
 
 var voiceModelsOpenAIDefaultTurnDetection = map[string]any{"type": "semantic_vad"}
 
@@ -63,9 +64,9 @@ func voiceModelsOpenAIWaitForEvent(
 	expectedTypes []string,
 	timeout time.Duration,
 ) (map[string]any, error) {
-	startTime := time.Now()
+	startTime := voiceModelsOpenAITimeNow()
 	for {
-		remaining := timeout - (time.Now().Sub(startTime))
+		remaining := timeout - (voiceModelsOpenAITimeNow().Sub(startTime))
 		if remaining <= 0 {
 			return nil, voiceModelsOpenAITimeoutError{error: fmt.Errorf("timeout waiting for event(s): %v", expectedTypes)}
 		}
@@ -273,11 +274,16 @@ func (s *OpenAISTTTranscriptionSession) configureSession() error {
 		return fmt.Errorf("websocket not initialized")
 	}
 	return s.websocket.WriteJSON(map[string]any{
-		"type": "transcription_session.update",
+		"type": "session.update",
 		"session": map[string]any{
-			"input_audio_format":        "pcm16",
-			"input_audio_transcription": map[string]any{"model": s.model},
-			"turn_detection":            s.turnDetection,
+			"type": "transcription",
+			"audio": map[string]any{
+				"input": map[string]any{
+					"format":         map[string]any{"type": "audio/pcm", "rate": 24000},
+					"transcription":  map[string]any{"model": s.model},
+					"turn_detection": s.turnDetection,
+				},
+			},
 		},
 	})
 }
@@ -299,7 +305,7 @@ func (s *OpenAISTTTranscriptionSession) setupConnection(ctx context.Context, c *
 	)
 	if err != nil {
 		if errors.As(err, &voiceModelsOpenAITimeoutError{}) {
-			err = STTWebsocketConnectionErrorf("timeout waiting for transcription_session.created event: %w", err)
+			err = STTWebsocketConnectionErrorf("Timeout waiting for transcription_session.created event: %w", err)
 		}
 		return err
 	}
@@ -315,7 +321,7 @@ func (s *OpenAISTTTranscriptionSession) setupConnection(ctx context.Context, c *
 	)
 	if err != nil {
 		if errors.As(err, &voiceModelsOpenAITimeoutError{}) {
-			err = STTWebsocketConnectionErrorf("timeout waiting for transcription_session.updated event: %w", err)
+			err = STTWebsocketConnectionErrorf("Timeout waiting for transcription_session.updated event: %w", err)
 		}
 		return err
 	}
@@ -348,7 +354,7 @@ loop:
 			break loop
 		case openAISTTTranscriptionSessionEventQueueValueMap:
 			eventType, _ := event["type"].(string)
-			if eventType == "conversation.item.input_audio_transcription.completed" {
+			if eventType == "input_audio_transcription_completed" || eventType == "conversation.item.input_audio_transcription.completed" {
 				transcript, _ := event["transcript"].(string)
 				if transcript != "" {
 					if err = s.endTurn(ctx, transcript); err != nil {
@@ -414,7 +420,6 @@ func (s *OpenAISTTTranscriptionSession) processWebsocketConnection(ctx context.C
 	if s.client.APIKey.Valid() {
 		header.Set("Authorization", "Bearer "+s.client.APIKey.Value)
 	}
-	header.Set("OpenAI-Beta", "realtime=v1")
 	header.Set("OpenAI-Log-Session", "1")
 	c, _, err := websocket.DefaultDialer.Dial(s.websocketURL, header)
 	if err != nil {

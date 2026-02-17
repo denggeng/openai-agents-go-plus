@@ -159,7 +159,7 @@ func normalizeSQLiteURLPath(path string) string {
 
 	// SQLAlchemy absolute SQLite URLs commonly end up with double-leading slash here.
 	if strings.HasPrefix(path, "//") {
-		return "/" + strings.TrimPrefix(path, "//")
+		return "/" + strings.TrimLeft(path, "/")
 	}
 
 	// Relative path from `sqlite:///relative.db`.

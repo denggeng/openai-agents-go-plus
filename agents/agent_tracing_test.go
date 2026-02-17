@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
-	"github.com/nlpodyssey/openai-agents-go/agentstesting"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
-	"github.com/nlpodyssey/openai-agents-go/tracing/tracingtesting"
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/agentstesting"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
+	"github.com/denggeng/openai-agents-go-plus/tracing/tracingtesting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

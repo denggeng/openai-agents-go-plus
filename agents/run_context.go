@@ -15,9 +15,10 @@
 package agents
 
 import (
+	"fmt"
 	"reflect"
 
-	"github.com/nlpodyssey/openai-agents-go/usage"
+	"github.com/denggeng/openai-agents-go-plus/usage"
 )
 
 type toolApprovalRecord struct {
@@ -311,11 +312,7 @@ func stringFromMap(rawItem any, key string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	s, ok := v.(string)
-	if !ok || s == "" {
-		return "", false
-	}
-	return s, true
+	return coerceStringValue(v)
 }
 
 func anyFromMap(rawItem any, key string) (any, bool) {
@@ -339,11 +336,7 @@ func stringFromField(rawItem any, fieldName string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	s, ok := value.(string)
-	if !ok || s == "" {
-		return "", false
-	}
-	return s, true
+	return coerceStringValue(value)
 }
 
 func anyFromField(rawItem any, fieldName string) (any, bool) {
@@ -365,4 +358,33 @@ func anyFromField(rawItem any, fieldName string) (any, bool) {
 		return nil, false
 	}
 	return field.Interface(), true
+}
+
+func coerceStringValue(value any) (string, bool) {
+	if value == nil {
+		return "", false
+	}
+	switch v := value.(type) {
+	case string:
+		if v == "" {
+			return "", false
+		}
+		return v, true
+	case fmt.Stringer:
+		s := v.String()
+		if s == "" {
+			return "", false
+		}
+		return s, true
+	}
+
+	rv := reflect.ValueOf(value)
+	if rv.Kind() == reflect.String {
+		s := rv.String()
+		if s == "" {
+			return "", false
+		}
+		return s, true
+	}
+	return "", false
 }

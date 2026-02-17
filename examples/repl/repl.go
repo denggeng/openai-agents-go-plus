@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 func main() {

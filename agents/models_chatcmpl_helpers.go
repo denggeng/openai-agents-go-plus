@@ -17,7 +17,7 @@ package agents
 import (
 	"strings"
 
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/param"
 )
@@ -73,4 +73,127 @@ func (chatCmplHelpers) CleanGeminiToolCallID(toolCallID string, model string) st
 		}
 	}
 	return toolCallID
+}
+
+func shouldFixLiteLLMToolMessageOrdering(modelName string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	return strings.Contains(name, "anthropic") ||
+		strings.Contains(name, "claude") ||
+		strings.Contains(name, "gemini")
+}
+
+func fixToolMessageOrdering(
+	messages []openai.ChatCompletionMessageParamUnion,
+) []openai.ChatCompletionMessageParamUnion {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	type toolCallEntry struct {
+		index   int
+		message openai.ChatCompletionMessageParamUnion
+	}
+	type toolResultEntry struct {
+		index   int
+		message openai.ChatCompletionMessageParamUnion
+	}
+
+	toolCallMessages := map[string]toolCallEntry{}
+	toolResultMessages := map[string]toolResultEntry{}
+
+	for i, message := range messages {
+		if message.OfAssistant != nil && len(message.OfAssistant.ToolCalls) > 0 {
+			for _, toolCall := range message.OfAssistant.ToolCalls {
+				toolID := toolCallID(toolCall)
+				if toolID == "" {
+					continue
+				}
+				single := cloneAssistantMessageWithToolCall(*message.OfAssistant, toolCall)
+				toolCallMessages[toolID] = toolCallEntry{
+					index:   i,
+					message: openai.ChatCompletionMessageParamUnion{OfAssistant: &single},
+				}
+			}
+			continue
+		}
+
+		if message.OfTool != nil {
+			toolID := strings.TrimSpace(message.OfTool.ToolCallID)
+			if toolID == "" {
+				continue
+			}
+			toolResultMessages[toolID] = toolResultEntry{
+				index:   i,
+				message: message,
+			}
+		}
+	}
+
+	pairedToolResultIndices := map[int]struct{}{}
+	for toolID := range toolCallMessages {
+		if toolResult, ok := toolResultMessages[toolID]; ok {
+			pairedToolResultIndices[toolResult.index] = struct{}{}
+		}
+	}
+
+	fixed := make([]openai.ChatCompletionMessageParamUnion, 0, len(messages))
+	usedIndices := map[int]struct{}{}
+
+	for i, original := range messages {
+		if _, used := usedIndices[i]; used {
+			continue
+		}
+
+		if original.OfAssistant != nil && len(original.OfAssistant.ToolCalls) > 0 {
+			for _, toolCall := range original.OfAssistant.ToolCalls {
+				toolID := toolCallID(toolCall)
+				if toolID == "" {
+					continue
+				}
+				callEntry, ok := toolCallMessages[toolID]
+				if !ok {
+					continue
+				}
+				if resultEntry, ok := toolResultMessages[toolID]; ok {
+					fixed = append(fixed, callEntry.message, resultEntry.message)
+					usedIndices[callEntry.index] = struct{}{}
+					usedIndices[resultEntry.index] = struct{}{}
+					continue
+				}
+				fixed = append(fixed, callEntry.message)
+				usedIndices[callEntry.index] = struct{}{}
+			}
+			usedIndices[i] = struct{}{}
+			continue
+		}
+
+		if original.OfTool != nil {
+			if _, paired := pairedToolResultIndices[i]; !paired {
+				fixed = append(fixed, original)
+			}
+			usedIndices[i] = struct{}{}
+			continue
+		}
+
+		fixed = append(fixed, original)
+		usedIndices[i] = struct{}{}
+	}
+
+	return fixed
+}
+
+func toolCallID(call openai.ChatCompletionMessageToolCallUnionParam) string {
+	if call.OfFunction != nil {
+		return strings.TrimSpace(call.OfFunction.ID)
+	}
+	return ""
+}
+
+func cloneAssistantMessageWithToolCall(
+	message openai.ChatCompletionAssistantMessageParam,
+	toolCall openai.ChatCompletionMessageToolCallUnionParam,
+) openai.ChatCompletionAssistantMessageParam {
+	single := message
+	single.ToolCalls = []openai.ChatCompletionMessageToolCallUnionParam{toolCall}
+	return single
 }

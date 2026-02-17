@@ -17,7 +17,7 @@ package codex
 import (
 	"slices"
 
-	"github.com/nlpodyssey/openai-agents-go/agents"
+	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
 // ThreadOptions stores execution options used for a Codex thread.

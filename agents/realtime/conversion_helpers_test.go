@@ -225,6 +225,36 @@ func TestConvertUserInputToConversationItemDict(t *testing.T) {
 	assert.Equal(t, "World", content[1]["text"])
 }
 
+func TestConvertUserInputToConversationItemDictSkipsUnknownParts(t *testing.T) {
+	userInputDict := map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{
+			map[string]any{"type": "input_text", "text": "Hello"},
+			map[string]any{
+				"type":      "input_image",
+				"image_url": "http://x/y.png",
+				"detail":    "auto",
+			},
+			map[string]any{"type": "bogus", "x": 1},
+		},
+	}
+	event := RealtimeModelSendUserInput{UserInput: userInputDict}
+
+	result := ConvertUserInputToConversationItem(event)
+	assert.Equal(t, "message", result["type"])
+	assert.Equal(t, "user", result["role"])
+
+	content, ok := result["content"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, content, 2)
+	assert.Equal(t, "input_text", content[0]["type"])
+	assert.Equal(t, "Hello", content[0]["text"])
+	assert.Equal(t, "input_image", content[1]["type"])
+	assert.Equal(t, "http://x/y.png", content[1]["image_url"])
+	assert.Equal(t, "auto", content[1]["detail"])
+}
+
 func TestConvertUserInputToConversationItemDictEmptyContent(t *testing.T) {
 	userInputDict := map[string]any{
 		"type":    "message",

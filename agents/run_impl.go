@@ -21,13 +21,14 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 
-	"github.com/nlpodyssey/openai-agents-go/asyncqueue"
-	"github.com/nlpodyssey/openai-agents-go/computer"
-	"github.com/nlpodyssey/openai-agents-go/modelsettings"
-	"github.com/nlpodyssey/openai-agents-go/openaitypes"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/denggeng/openai-agents-go-plus/asyncqueue"
+	"github.com/denggeng/openai-agents-go-plus/computer"
+	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/openaitypes"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
@@ -102,12 +103,24 @@ type ToolRunLocalShellCall struct {
 	LocalShellTool LocalShellTool
 }
 
+type ToolRunShellCall struct {
+	ToolCall  any
+	ShellTool ShellTool
+}
+
+type ToolRunApplyPatchCall struct {
+	ToolCall       any
+	ApplyPatchTool ApplyPatchTool
+}
+
 type ProcessedResponse struct {
 	NewItems        []RunItem
 	Handoffs        []ToolRunHandoff
 	Functions       []ToolRunFunction
 	ComputerActions []ToolRunComputerAction
 	LocalShellCalls []ToolRunLocalShellCall
+	ShellCalls      []ToolRunShellCall
+	ApplyPatchCalls []ToolRunApplyPatchCall
 	Interruptions   []ToolApprovalItem
 	// Names of all tools used, including hosted tools
 	ToolsUsed []string
@@ -120,6 +133,7 @@ func (pr *ProcessedResponse) HasToolsOrApprovalsToRun() bool {
 	// Hosted tools have already run, so there's nothing to do.
 	return len(pr.Handoffs) > 0 || len(pr.Functions) > 0 ||
 		len(pr.ComputerActions) > 0 || len(pr.LocalShellCalls) > 0 ||
+		len(pr.ShellCalls) > 0 || len(pr.ApplyPatchCalls) > 0 ||
 		len(pr.MCPApprovalRequests) > 0
 }
 
@@ -204,6 +218,7 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 	outputType OutputTypeInterface,
 	hooks RunHooks,
 	runConfig RunConfig,
+	contextWrapper *RunContextWrapper[any],
 ) (*SingleStepResult, error) {
 	// Make a copy of the generated items
 	preStepItems = slices.Clone(preStepItems)
@@ -218,18 +233,25 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 		functionResults            []FunctionToolResult
 		toolInputGuardrailResults  []ToolInputGuardrailResult
 		toolOutputGuardrailResults []ToolOutputGuardrailResult
+		functionInterruptions      []ToolApprovalItem
 		computerResults            []RunItem
+		localShellResults          []RunItem
+		shellResults               []RunItem
+		applyPatchResults          []RunItem
+		shellInterruptions         []ToolApprovalItem
+		applyPatchInterruptions    []ToolApprovalItem
 		toolErrors                 [2]error
 		wg                         sync.WaitGroup
 	)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		functionResults, toolInputGuardrailResults, toolOutputGuardrailResults, toolErrors[0] = ri.ExecuteFunctionToolCalls(
+		functionResults, toolInputGuardrailResults, toolOutputGuardrailResults, functionInterruptions, toolErrors[0] = ri.ExecuteFunctionToolCalls(
 			childCtx,
 			agent,
 			processedResponse.Functions,
 			hooks,
+			contextWrapper,
 			runConfig,
 		)
 	}()
@@ -248,9 +270,57 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 	}
 
 	for _, result := range functionResults {
-		newStepItems = append(newStepItems, result.RunItem)
+		if result.RunItem != nil {
+			newStepItems = append(newStepItems, result.RunItem)
+		}
 	}
 	newStepItems = append(newStepItems, computerResults...)
+
+	if len(processedResponse.LocalShellCalls) > 0 {
+		var err error
+		localShellResults, err = ri.ExecuteLocalShellCalls(
+			ctx,
+			agent,
+			processedResponse.LocalShellCalls,
+			hooks,
+		)
+		if err != nil {
+			return nil, err
+		}
+		newStepItems = append(newStepItems, localShellResults...)
+	}
+
+	if len(processedResponse.ShellCalls) > 0 {
+		var err error
+		shellResults, shellInterruptions, err = ri.ExecuteShellCalls(
+			ctx,
+			agent,
+			processedResponse.ShellCalls,
+			hooks,
+			contextWrapper,
+			runConfig,
+		)
+		if err != nil {
+			return nil, err
+		}
+		newStepItems = append(newStepItems, shellResults...)
+	}
+
+	if len(processedResponse.ApplyPatchCalls) > 0 {
+		var err error
+		applyPatchResults, applyPatchInterruptions, err = ri.ExecuteApplyPatchCalls(
+			ctx,
+			agent,
+			processedResponse.ApplyPatchCalls,
+			hooks,
+			contextWrapper,
+			runConfig,
+		)
+		if err != nil {
+			return nil, err
+		}
+		newStepItems = append(newStepItems, applyPatchResults...)
+	}
 
 	// Next, run the MCP approval requests
 	if mcpApprovalRequests := processedResponse.MCPApprovalRequests; len(mcpApprovalRequests) > 0 {
@@ -261,7 +331,18 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 		newStepItems = append(newStepItems, approvalResults...)
 	}
 
-	if interruptions := processedResponse.Interruptions; len(interruptions) > 0 {
+	interruptions := slices.Clone(processedResponse.Interruptions)
+	if len(functionInterruptions) > 0 {
+		interruptions = append(interruptions, functionInterruptions...)
+	}
+	if len(shellInterruptions) > 0 {
+		interruptions = append(interruptions, shellInterruptions...)
+	}
+	if len(applyPatchInterruptions) > 0 {
+		interruptions = append(interruptions, applyPatchInterruptions...)
+	}
+
+	if len(interruptions) > 0 {
 		return &SingleStepResult{
 			OriginalInput:              originalInput,
 			ModelResponse:              newResponse,
@@ -432,10 +513,14 @@ func (runImpl) ProcessModelResponse(
 		functions           []ToolRunFunction
 		computerActions     []ToolRunComputerAction
 		localShellCalls     []ToolRunLocalShellCall
+		shellCalls          []ToolRunShellCall
+		applyPatchCalls     []ToolRunApplyPatchCall
 		interruptions       []ToolApprovalItem
 		mcpApprovalRequests []ToolRunMCPApprovalRequest
 		computerTool        *ComputerTool
 		localShellTool      *LocalShellTool
+		shellTool           *ShellTool
+		applyPatchTool      *ApplyPatchTool
 		toolsUsed           []string
 	)
 
@@ -455,6 +540,11 @@ func (runImpl) ProcessModelResponse(
 			computerTool = &t
 		case LocalShellTool:
 			localShellTool = &t
+		case ShellTool:
+			shellTool = &t
+		case ApplyPatchTool:
+			toolCopy := t
+			applyPatchTool = &toolCopy
 		case HostedMCPTool:
 			hostedMCPServerMap[t.ToolConfig.ServerLabel] = t
 		}
@@ -514,6 +604,29 @@ func (runImpl) ProcessModelResponse(
 				Agent:   agent,
 				RawItem: output,
 				Type:    "reasoning_item",
+			})
+		case "compaction":
+			var rawItem map[string]any
+			if outputUnion.RawJSON() != "" {
+				if err := json.Unmarshal([]byte(outputUnion.RawJSON()), &rawItem); err != nil {
+					rawItem = nil
+				}
+			}
+			if rawItem == nil {
+				rawItem = map[string]any{
+					"type":              "compaction",
+					"id":                outputUnion.ID,
+					"encrypted_content": outputUnion.EncryptedContent,
+				}
+			}
+			delete(rawItem, "created_by")
+			if _, ok := rawItem["type"]; !ok {
+				rawItem["type"] = "compaction"
+			}
+			items = append(items, CompactionItem{
+				Agent:   agent,
+				RawItem: CompactionItemRawItem(rawItem),
+				Type:    "compaction_item",
 			})
 		case "computer_call":
 			output := responses.ResponseComputerToolCall{
@@ -627,6 +740,103 @@ func (runImpl) ProcessModelResponse(
 				Type:    "tool_call_item",
 			})
 			toolsUsed = append(toolsUsed, "code_interpreter")
+		case "shell_call":
+			var rawCall map[string]any
+			if outputUnion.RawJSON() != "" {
+				if err := json.Unmarshal([]byte(outputUnion.RawJSON()), &rawCall); err != nil {
+					rawCall = nil
+				}
+			}
+			if rawCall == nil {
+				rawCall = map[string]any{
+					"type":        "shell_call",
+					"id":          outputUnion.ID,
+					"call_id":     outputUnion.CallID,
+					"status":      outputUnion.Status,
+					"action":      openaitypes.ResponseFunctionShellToolCallActionFromResponseOutputItemUnionAction(outputUnion.Action),
+					"environment": outputUnion.Environment,
+				}
+			}
+			delete(rawCall, "created_by")
+			if _, ok := rawCall["type"]; !ok {
+				rawCall["type"] = "shell_call"
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ShellToolCallRawItem(rawCall),
+				Type:    "tool_call_item",
+			})
+			if shellTool == nil {
+				toolsUsed = append(toolsUsed, "shell")
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Shell tool not found"})
+				return nil, NewModelBehaviorError("model produced shell call without a shell tool")
+			}
+			toolsUsed = append(toolsUsed, shellTool.ToolName())
+			environment := shellTool.Environment
+			if normalized, err := normalizeShellToolEnvironment(environment); err == nil {
+				environment = normalized
+			}
+			envType := "local"
+			if environment != nil {
+				if value, ok := environment["type"]; ok {
+					if str, ok := coerceStringValue(value); ok && str != "" {
+						envType = strings.ToLower(str)
+					}
+				}
+			}
+			if envType != "local" {
+				continue
+			}
+			if shellTool.Executor == nil {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Local shell executor not found"})
+				return nil, NewModelBehaviorError("model produced local shell call without a local shell executor")
+			}
+			shellCalls = append(shellCalls, ToolRunShellCall{
+				ToolCall:  rawCall,
+				ShellTool: *shellTool,
+			})
+		case "shell_call_output":
+			toolName := "shell"
+			if shellTool != nil {
+				toolName = shellTool.ToolName()
+			}
+			toolsUsed = append(toolsUsed, toolName)
+
+			rawItem := ShellCallOutputRawItem{
+				"type":    "shell_call_output",
+				"call_id": outputUnion.CallID,
+			}
+			if outputUnion.ID != "" {
+				rawItem["id"] = outputUnion.ID
+			}
+			if outputUnion.Status != "" {
+				rawItem["status"] = outputUnion.Status
+			}
+			if outputUnion.JSON.MaxOutputLength.Valid() {
+				rawItem["max_output_length"] = outputUnion.MaxOutputLength
+			}
+			if len(outputUnion.Output.OfResponseFunctionShellToolCallOutputOutputArray) > 0 {
+				outputEntries := make([]any, 0, len(outputUnion.Output.OfResponseFunctionShellToolCallOutputOutputArray))
+				for _, entry := range outputUnion.Output.OfResponseFunctionShellToolCallOutputOutputArray {
+					payload := map[string]any{}
+					if data, err := json.Marshal(entry); err == nil {
+						if err := json.Unmarshal(data, &payload); err != nil {
+							payload = map[string]any{}
+						}
+					}
+					delete(payload, "created_by")
+					outputEntries = append(outputEntries, payload)
+				}
+				rawItem["output"] = outputEntries
+			} else if outputUnion.Output.OfString != "" {
+				rawItem["output"] = outputUnion.Output.OfString
+			}
+			items = append(items, ToolCallOutputItem{
+				Agent:   agent,
+				RawItem: rawItem,
+				Output:  rawItem["output"],
+				Type:    "tool_call_output_item",
+			})
 		case "local_shell_call":
 			output := responses.ResponseOutputItemLocalShellCall{
 				ID:     outputUnion.ID,
@@ -640,15 +850,93 @@ func (runImpl) ProcessModelResponse(
 				RawItem: ResponseOutputItemLocalShellCall(output),
 				Type:    "tool_call_item",
 			})
-			toolsUsed = append(toolsUsed, "local_shell")
-			if localShellTool == nil {
-				AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Local shell tool not found"})
-				return nil, NewModelBehaviorError("model produced local shell call without a local shell tool")
+			if localShellTool != nil {
+				toolsUsed = append(toolsUsed, "local_shell")
+				localShellCalls = append(localShellCalls, ToolRunLocalShellCall{
+					ToolCall:       output,
+					LocalShellTool: *localShellTool,
+				})
+				continue
 			}
-			localShellCalls = append(localShellCalls, ToolRunLocalShellCall{
-				ToolCall:       output,
-				LocalShellTool: *localShellTool,
+			if shellTool != nil {
+				toolsUsed = append(toolsUsed, shellTool.ToolName())
+				shellCalls = append(shellCalls, ToolRunShellCall{
+					ToolCall:  output,
+					ShellTool: *shellTool,
+				})
+				continue
+			}
+			toolsUsed = append(toolsUsed, "local_shell")
+			AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Local shell tool not found"})
+			return nil, NewModelBehaviorError("model produced local shell call without a local shell tool")
+		case "apply_patch_call":
+			var rawCall map[string]any
+			if outputUnion.RawJSON() != "" {
+				if err := json.Unmarshal([]byte(outputUnion.RawJSON()), &rawCall); err != nil {
+					rawCall = nil
+				}
+			}
+			if rawCall == nil {
+				rawCall = map[string]any{
+					"type":      "apply_patch_call",
+					"id":        outputUnion.ID,
+					"call_id":   outputUnion.CallID,
+					"status":    outputUnion.Status,
+					"operation": outputUnion.Operation,
+				}
+			}
+			delete(rawCall, "created_by")
+			if _, ok := rawCall["type"]; !ok {
+				rawCall["type"] = "apply_patch_call"
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ApplyPatchToolCallRawItem(rawCall),
+				Type:    "tool_call_item",
 			})
+			if applyPatchTool == nil {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Apply patch tool not found"})
+				return nil, NewModelBehaviorError("model produced apply_patch call without an apply_patch tool")
+			}
+			toolsUsed = append(toolsUsed, applyPatchTool.ToolName())
+			applyPatchCalls = append(applyPatchCalls, ToolRunApplyPatchCall{
+				ToolCall:       rawCall,
+				ApplyPatchTool: *applyPatchTool,
+			})
+		case "custom_tool_call":
+			output := outputUnion.AsCustomToolCall()
+			if isApplyPatchName(output.Name, applyPatchTool) {
+				parsedOperation, err := parseApplyPatchCustomInput(output.Input)
+				if err != nil {
+					return nil, err
+				}
+				operationUnion, err := applyPatchOperationUnionFromMap(parsedOperation)
+				if err != nil {
+					return nil, err
+				}
+				pseudoCall := responses.ResponseApplyPatchToolCall{
+					CallID:    output.CallID,
+					Operation: operationUnion,
+					Status:    responses.ResponseApplyPatchToolCallStatusInProgress,
+					Type:      constant.ValueOf[constant.ApplyPatchCall](),
+				}
+				items = append(items, ToolCallItem{
+					Agent:   agent,
+					RawItem: ResponseApplyPatchToolCall(pseudoCall),
+					Type:    "tool_call_item",
+				})
+				if applyPatchTool == nil {
+					AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Apply patch tool not found"})
+					return nil, NewModelBehaviorError("model produced apply_patch call without an apply_patch tool")
+				}
+				toolsUsed = append(toolsUsed, applyPatchTool.ToolName())
+				applyPatchCalls = append(applyPatchCalls, ToolRunApplyPatchCall{
+					ToolCall:       pseudoCall,
+					ApplyPatchTool: *applyPatchTool,
+				})
+			} else {
+				Logger().Warn(fmt.Sprintf("unexpected custom tool call %q, ignoring", output.Name))
+			}
 		case "function_call":
 			var output responses.ResponseFunctionToolCall
 			if outputUnion.RawJSON() != "" {
@@ -665,6 +953,40 @@ func (runImpl) ProcessModelResponse(
 			}
 			if output.Type == "" {
 				output.Type = constant.ValueOf[constant.FunctionCall]()
+			}
+
+			if isApplyPatchName(output.Name, applyPatchTool) {
+				if _, ok := functionMap[output.Name]; !ok {
+					parsedOperation, err := parseApplyPatchFunctionArgs(output.Arguments)
+					if err != nil {
+						return nil, err
+					}
+					operationUnion, err := applyPatchOperationUnionFromMap(parsedOperation)
+					if err != nil {
+						return nil, err
+					}
+					pseudoCall := responses.ResponseApplyPatchToolCall{
+						CallID:    output.CallID,
+						Operation: operationUnion,
+						Status:    responses.ResponseApplyPatchToolCallStatusInProgress,
+						Type:      constant.ValueOf[constant.ApplyPatchCall](),
+					}
+					items = append(items, ToolCallItem{
+						Agent:   agent,
+						RawItem: ResponseApplyPatchToolCall(pseudoCall),
+						Type:    "tool_call_item",
+					})
+					if applyPatchTool == nil {
+						AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Apply patch tool not found"})
+						return nil, NewModelBehaviorError("model produced apply_patch call without an apply_patch tool")
+					}
+					toolsUsed = append(toolsUsed, applyPatchTool.ToolName())
+					applyPatchCalls = append(applyPatchCalls, ToolRunApplyPatchCall{
+						ToolCall:       pseudoCall,
+						ApplyPatchTool: *applyPatchTool,
+					})
+					continue
+				}
 			}
 
 			toolsUsed = append(toolsUsed, output.Name)
@@ -710,6 +1032,8 @@ func (runImpl) ProcessModelResponse(
 		Functions:           functions,
 		ComputerActions:     computerActions,
 		LocalShellCalls:     localShellCalls,
+		ShellCalls:          shellCalls,
+		ApplyPatchCalls:     applyPatchCalls,
 		Interruptions:       interruptions,
 		ToolsUsed:           toolsUsed,
 		MCPApprovalRequests: mcpApprovalRequests,
@@ -732,14 +1056,27 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 	agent *Agent,
 	toolRuns []ToolRunFunction,
 	hooks RunHooks,
+	contextWrapper *RunContextWrapper[any],
 	config RunConfig,
-) ([]FunctionToolResult, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, error) {
+) ([]FunctionToolResult, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, []ToolApprovalItem, error) {
+	if len(toolRuns) == 0 {
+		return nil, nil, nil, nil, nil
+	}
+	if contextWrapper == nil {
+		if value, ok := RunContextValueFromContext(ctx); ok {
+			contextWrapper = NewRunContextWrapper[any](value)
+		} else {
+			contextWrapper = NewRunContextWrapper[any](nil)
+		}
+	}
+
 	runSingleTool := func(
 		ctx context.Context,
 		funcTool FunctionTool,
 		toolCall ResponseFunctionToolCall,
-	) (any, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, error) {
+	) (any, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, *ToolApprovalItem, error) {
 		var result any
+		var approvalItem *ToolApprovalItem
 		var toolInputGuardrailResults []ToolInputGuardrailResult
 		var toolOutputGuardrailResults []ToolOutputGuardrailResult
 
@@ -778,6 +1115,64 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
 				defer cancel()
+
+				if funcTool.NeedsApproval != nil {
+					parsedArgs := map[string]any{}
+					if toolCall.Arguments != "" {
+						if err := json.Unmarshal([]byte(toolCall.Arguments), &parsedArgs); err != nil {
+							parsedArgs = map[string]any{}
+						}
+					}
+					needsApproval, err := funcTool.NeedsApproval.NeedsApproval(
+						ctx,
+						contextWrapper,
+						funcTool,
+						parsedArgs,
+						toolCall.CallID,
+					)
+					if err != nil {
+						return err
+					}
+					if needsApproval {
+						pending := ToolApprovalItem{
+							ToolName: funcTool.Name,
+							RawItem:  responses.ResponseFunctionToolCall(toolCall),
+						}
+						approved, known := contextWrapper.GetApprovalStatus(
+							funcTool.Name,
+							toolCall.CallID,
+							&pending,
+						)
+						if known && !approved {
+							rejectionMessage := resolveApprovalRejectionMessage(
+								contextWrapper,
+								config,
+								"function",
+								funcTool.Name,
+								toolCall.CallID,
+							)
+							AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+								Message: rejectionMessage,
+								Data: map[string]any{
+									"tool_name": funcTool.Name,
+									"error": fmt.Sprintf(
+										"Tool execution for %s was manually rejected by user.",
+										toolCall.CallID,
+									),
+								},
+							})
+							result = rejectionMessage
+							if traceIncludeSensitiveData {
+								spanFn.SpanData().(*tracing.FunctionSpanData).Output = result
+							}
+							return nil
+						}
+						if !known {
+							approvalItem = &pending
+							return nil
+						}
+					}
+				}
 
 				rejectionMessage, err := ri.executeToolInputGuardrails(
 					ctx,
@@ -900,14 +1295,15 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 			})
 
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		return result, toolInputGuardrailResults, toolOutputGuardrailResults, nil
+		return result, toolInputGuardrailResults, toolOutputGuardrailResults, approvalItem, nil
 	}
 
 	results := make([]any, len(toolRuns))
 	perToolInputGuardrailResults := make([][]ToolInputGuardrailResult, len(toolRuns))
 	perToolOutputGuardrailResults := make([][]ToolOutputGuardrailResult, len(toolRuns))
+	perToolApprovalItems := make([]*ToolApprovalItem, len(toolRuns))
 	resultErrors := make([]error, len(toolRuns))
 
 	var cancel context.CancelFunc
@@ -923,6 +1319,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 			results[i],
 				perToolInputGuardrailResults[i],
 				perToolOutputGuardrailResults[i],
+				perToolApprovalItems[i],
 				resultErrors[i] = runSingleTool(ctx, toolRun.FunctionTool, toolRun.ToolCall)
 			if resultErrors[i] != nil {
 				cancel()
@@ -932,25 +1329,21 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 
 	wg.Wait()
 	if err := errors.Join(resultErrors...); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	functionToolResults := make([]FunctionToolResult, len(results))
+	functionInterruptions := make([]ToolApprovalItem, 0)
 	for i, result := range results {
 		toolRun := toolRuns[i]
-
-		var strResult string
-		switch v := result.(type) {
-		case string:
-			strResult = v
-		case []byte:
-			strResult = string(v)
-		default:
-			out, err := json.Marshal(v)
-			if err != nil {
-				return nil, nil, nil, err
+		if approvalItem := perToolApprovalItems[i]; approvalItem != nil {
+			functionInterruptions = append(functionInterruptions, *approvalItem)
+			functionToolResults[i] = FunctionToolResult{
+				Tool:    toolRun.FunctionTool,
+				Output:  nil,
+				RunItem: nil,
 			}
-			strResult = string(out)
+			continue
 		}
 
 		functionToolResults[i] = FunctionToolResult{
@@ -959,7 +1352,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 			RunItem: ToolCallOutputItem{
 				Agent: agent,
 				RawItem: ResponseInputItemFunctionCallOutputParam(
-					ItemHelpers().ToolCallOutputItem(toolRun.ToolCall, strResult)),
+					ItemHelpers().ToolCallOutputItem(toolRun.ToolCall, result)),
 				Output: result,
 				Type:   "tool_call_output_item",
 			},
@@ -973,7 +1366,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 		toolOutputGuardrailResults = append(toolOutputGuardrailResults, perToolOutputGuardrailResults[i]...)
 	}
 
-	return functionToolResults, toolInputGuardrailResults, toolOutputGuardrailResults, nil
+	return functionToolResults, toolInputGuardrailResults, toolOutputGuardrailResults, functionInterruptions, nil
 }
 
 func (runImpl) executeToolInputGuardrails(
@@ -1077,6 +1470,94 @@ func (runImpl) ExecuteLocalShellCalls(
 	}
 
 	return results, nil
+}
+
+func (runImpl) ExecuteShellCalls(
+	ctx context.Context,
+	agent *Agent,
+	calls []ToolRunShellCall,
+	hooks RunHooks,
+	contextWrapper *RunContextWrapper[any],
+	config RunConfig,
+) ([]RunItem, []ToolApprovalItem, error) {
+	if len(calls) == 0 {
+		return nil, nil, nil
+	}
+	if contextWrapper == nil {
+		if value, ok := RunContextValueFromContext(ctx); ok {
+			contextWrapper = NewRunContextWrapper[any](value)
+		} else {
+			contextWrapper = NewRunContextWrapper[any](nil)
+		}
+	}
+
+	results := make([]RunItem, 0, len(calls))
+	interruptions := make([]ToolApprovalItem, 0)
+
+	for _, call := range calls {
+		result, err := ShellAction().Execute(ctx, agent, call, hooks, contextWrapper, config)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch v := result.(type) {
+		case ToolCallOutputItem:
+			results = append(results, v)
+		case *ToolCallOutputItem:
+			results = append(results, *v)
+		case ToolApprovalItem:
+			interruptions = append(interruptions, v)
+		case *ToolApprovalItem:
+			interruptions = append(interruptions, *v)
+		default:
+			return nil, nil, fmt.Errorf("unexpected shell action result type %T", result)
+		}
+	}
+
+	return results, interruptions, nil
+}
+
+func (runImpl) ExecuteApplyPatchCalls(
+	ctx context.Context,
+	agent *Agent,
+	calls []ToolRunApplyPatchCall,
+	hooks RunHooks,
+	contextWrapper *RunContextWrapper[any],
+	config RunConfig,
+) ([]RunItem, []ToolApprovalItem, error) {
+	if len(calls) == 0 {
+		return nil, nil, nil
+	}
+	if contextWrapper == nil {
+		if value, ok := RunContextValueFromContext(ctx); ok {
+			contextWrapper = NewRunContextWrapper[any](value)
+		} else {
+			contextWrapper = NewRunContextWrapper[any](nil)
+		}
+	}
+
+	results := make([]RunItem, 0, len(calls))
+	interruptions := make([]ToolApprovalItem, 0)
+
+	for _, call := range calls {
+		result, err := ApplyPatchAction().Execute(ctx, agent, call, hooks, contextWrapper, config)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch v := result.(type) {
+		case ToolCallOutputItem:
+			results = append(results, v)
+		case *ToolCallOutputItem:
+			results = append(results, *v)
+		case ToolApprovalItem:
+			interruptions = append(interruptions, v)
+		case *ToolApprovalItem:
+			interruptions = append(interruptions, *v)
+		default:
+			return nil, nil, fmt.Errorf("unexpected apply_patch action result type %T", result)
+		}
+	}
+
+	return results, interruptions, nil
 }
 
 func (runImpl) ExecuteComputerActions(

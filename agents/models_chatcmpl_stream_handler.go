@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/nlpodyssey/openai-agents-go/openaitypes"
+	"github.com/denggeng/openai-agents-go-plus/openaitypes"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/respjson"
 	"github.com/openai/openai-go/v3/packages/ssestream"

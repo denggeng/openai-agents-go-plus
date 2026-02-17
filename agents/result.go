@@ -22,9 +22,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/nlpodyssey/openai-agents-go/asyncqueue"
-	"github.com/nlpodyssey/openai-agents-go/asynctask"
-	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/denggeng/openai-agents-go-plus/asyncqueue"
+	"github.com/denggeng/openai-agents-go-plus/asynctask"
+	"github.com/denggeng/openai-agents-go-plus/tracing"
 )
 
 type RunResult struct {
