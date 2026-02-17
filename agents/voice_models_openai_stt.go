@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/denggeng/openai-agents-go-plus/asyncqueue"
@@ -57,6 +59,16 @@ func voiceModelsOpenAIAudioToBase64(audioData []AudioData) string {
 }
 
 type voiceModelsOpenAITimeoutError struct{ error }
+
+func isIgnorableWebsocketErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, websocket.ErrCloseSent) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
+}
 
 // Wait for an event from eventQueue whose type is in expectedTypes within the specified timeout.
 func voiceModelsOpenAIWaitForEvent(
@@ -237,7 +249,7 @@ func (s *OpenAISTTTranscriptionSession) eventListener(ctx context.Context) (err 
 	for {
 		_, message, err := s.websocket.ReadMessage()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure) || isIgnorableWebsocketErr(err) {
 				break
 			}
 			return fmt.Errorf("error reading websocket message: %w", err)
@@ -489,7 +501,11 @@ func (s *OpenAISTTTranscriptionSession) TranscribeTurns(ctx context.Context) Str
 func (s *OpenAISTTTranscriptionSession) Close(context.Context) (err error) {
 	if s.websocket != nil {
 		if err = s.websocket.Close(); err != nil {
-			err = fmt.Errorf("error closing websocket connection: %w", err)
+			if isIgnorableWebsocketErr(err) {
+				err = nil
+			} else {
+				err = fmt.Errorf("error closing websocket connection: %w", err)
+			}
 		}
 	}
 
@@ -521,7 +537,12 @@ func (o *openAISTTTranscriptionSessionTranscribeTurns) Seq() iter.Seq[string] {
 					canYield = yield(string(t))
 				}
 
-			case voiceModelsOpenAIErrorSentinel, voiceModelsOpenAISessionCompleteSentinel:
+			case voiceModelsOpenAIErrorSentinel:
+				if !isIgnorableWebsocketErr(t.err) {
+					o.err = errors.Join(o.err, t.err)
+				}
+				break loop
+			case voiceModelsOpenAISessionCompleteSentinel:
 				break loop
 			default:
 				// This would be an unrecoverable implementation bug, so a panic is appropriate.
@@ -538,12 +559,16 @@ func (o *openAISTTTranscriptionSessionTranscribeTurns) Seq() iter.Seq[string] {
 
 		if s.websocket != nil {
 			if err := s.websocket.Close(); err != nil {
-				o.err = errors.Join(o.err, fmt.Errorf("error closing websocket connection: %w", err))
+				if !isIgnorableWebsocketErr(err) {
+					o.err = errors.Join(o.err, fmt.Errorf("error closing websocket connection: %w", err))
+				}
 			}
 		}
 
 		s.checkErrors()
-		o.err = errors.Join(o.err, s.storedError)
+		if !isIgnorableWebsocketErr(s.storedError) {
+			o.err = errors.Join(o.err, s.storedError)
+		}
 	}
 }
 

@@ -293,6 +293,9 @@ func TestOpenAISTTTranscriptionEventPutsOutputInQueue(t *testing.T) {
 				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"transcription_session.created"}`)); err != nil {
 					return err
 				}
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return err
+				}
 				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"transcription_session.updated"}`)); err != nil {
 					return err
 				}
@@ -343,7 +346,11 @@ func TestOpenAISTTTimeoutWaitingForCreatedEvent(t *testing.T) {
 	withSTTTimeouts(t, 20*time.Millisecond, 20*time.Millisecond, 20*time.Millisecond)
 
 	server := newWSTestServer(t, func(conn *websocket.Conn, _ *http.Request) error {
-		return conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"unknown"}`))
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"unknown"}`)); err != nil {
+			return err
+		}
+		time.Sleep(2 * VoiceModelsOpenAISessionCreationTimeout)
+		return conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	})
 	defer server.Close()
 
