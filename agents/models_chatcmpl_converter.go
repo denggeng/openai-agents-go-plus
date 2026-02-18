@@ -34,6 +34,18 @@ type chatCmplConverter struct{}
 
 func ChatCmplConverter() chatCmplConverter { return chatCmplConverter{} }
 
+type ItemsToMessagesOption func(*itemsToMessagesOptions)
+
+type itemsToMessagesOptions struct {
+	preserveThinkingBlocks bool
+}
+
+func WithPreserveThinkingBlocks() ItemsToMessagesOption {
+	return func(o *itemsToMessagesOptions) {
+		o.preserveThinkingBlocks = true
+	}
+}
+
 func (chatCmplConverter) ConvertToolChoice(toolChoice modelsettings.ToolChoice) (openai.ChatCompletionToolChoiceOptionUnionParam, error) {
 	switch toolChoice := toolChoice.(type) {
 	case nil:
@@ -96,22 +108,13 @@ func (chatCmplConverter) MessageToOutputItems(
 	modelName := providerDataModelName(baseProviderData)
 
 	if reasoningContent := reasoningContentFromChatCompletionMessage(message); reasoningContent != "" {
-		reasoningItem := responses.ResponseOutputItemUnion{
-			ID: FakeResponsesID,
-			Summary: []responses.ResponseReasoningItemSummary{
-				{
-					Text: reasoningContent,
-					Type: constant.ValueOf[constant.SummaryText](),
-				},
-			},
-			Type: "reasoning",
-		}
-		if len(baseProviderData) > 0 {
-			withProviderData, err := responseOutputItemWithProviderData(reasoningItem, baseProviderData)
-			if err != nil {
-				return nil, fmt.Errorf("failed to encode reasoning provider_data: %w", err)
-			}
-			reasoningItem = withProviderData
+		reasoningItem, err := buildReasoningOutputItem(
+			reasoningContent,
+			thinkingBlocksFromChatCompletionMessage(message),
+			baseProviderData,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode reasoning content: %w", err)
 		}
 		items = append(items, reasoningItem)
 	}
@@ -207,10 +210,75 @@ func responseOutputItemWithProviderData(
 		if item.EncryptedContent != "" {
 			payload["encrypted_content"] = item.EncryptedContent
 		}
+		if item.JSON.Content.Valid() {
+			var contentValue any
+			if err := decodeRawJSONField(item.JSON.Content.Raw(), &contentValue); err == nil && contentValue != nil {
+				payload["content"] = contentValue
+			}
+		}
 	default:
 		return item, nil
 	}
 	payload["provider_data"] = providerData
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return responses.ResponseOutputItemUnion{}, err
+	}
+
+	var out responses.ResponseOutputItemUnion
+	if err := json.Unmarshal(jsonPayload, &out); err != nil {
+		return responses.ResponseOutputItemUnion{}, err
+	}
+	return out, nil
+}
+
+func decodeRawJSONField(raw string, target any) error {
+	if raw == "" || raw == "null" {
+		return nil
+	}
+	return json.Unmarshal([]byte(raw), target)
+}
+
+func buildReasoningOutputItem(
+	reasoningContent string,
+	thinkingBlocks []map[string]any,
+	providerData map[string]any,
+) (responses.ResponseOutputItemUnion, error) {
+	payload := map[string]any{
+		"id": FakeResponsesID,
+		"summary": []map[string]any{
+			{
+				"text": reasoningContent,
+				"type": "summary_text",
+			},
+		},
+		"type": "reasoning",
+	}
+
+	contentItems := make([]map[string]any, 0)
+	signatures := make([]string, 0)
+	for _, block := range thinkingBlocks {
+		thinkingText, _ := block["thinking"].(string)
+		if thinkingText != "" {
+			contentItems = append(contentItems, map[string]any{
+				"type": "reasoning_text",
+				"text": thinkingText,
+			})
+		}
+		if signature, _ := block["signature"].(string); signature != "" {
+			signatures = append(signatures, signature)
+		}
+	}
+	if len(contentItems) > 0 {
+		payload["content"] = contentItems
+	}
+	if len(signatures) > 0 {
+		payload["encrypted_content"] = strings.Join(signatures, "\n")
+	}
+	if len(providerData) > 0 {
+		payload["provider_data"] = providerData
+	}
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
@@ -260,6 +328,26 @@ func reasoningContentFromChatCompletionMessage(message openai.ChatCompletionMess
 	}
 	str, _ := value.(string)
 	return str
+}
+
+func thinkingBlocksFromChatCompletionMessage(message openai.ChatCompletionMessage) []map[string]any {
+	extraFields := message.JSON.ExtraFields
+	if len(extraFields) == 0 {
+		return nil
+	}
+	field, ok := extraFields["thinking_blocks"]
+	if !ok {
+		return nil
+	}
+	raw := field.Raw()
+	if raw == "" {
+		return nil
+	}
+	var blocks []map[string]any
+	if err := json.Unmarshal([]byte(raw), &blocks); err != nil {
+		return nil
+	}
+	return blocks
 }
 
 func thoughtSignatureFromProviderSpecificFields(value any, modelName string) string {
@@ -321,6 +409,11 @@ func isGeminiModelName(modelName string) bool {
 
 func isDeepSeekModelName(modelName string) bool {
 	return strings.Contains(strings.ToLower(modelName), "deepseek")
+}
+
+func isAnthropicModelName(modelName string) bool {
+	normalized := strings.ToLower(modelName)
+	return strings.Contains(normalized, "claude") || strings.Contains(normalized, "anthropic")
 }
 
 func thoughtSignatureFromFunctionCallProviderData(funcCall responses.ResponseFunctionToolCallParam) (string, bool) {
@@ -482,7 +575,11 @@ func (conv chatCmplConverter) ItemsToMessages(items Input) ([]openai.ChatComplet
 	return conv.ItemsToMessagesWithModel(items, "")
 }
 
-func (conv chatCmplConverter) ItemsToMessagesWithModel(items Input, model string) ([]openai.ChatCompletionMessageParamUnion, error) {
+func (conv chatCmplConverter) ItemsToMessagesWithModel(items Input, model string, options ...ItemsToMessagesOption) ([]openai.ChatCompletionMessageParamUnion, error) {
+	parsedOptions := itemsToMessagesOptions{}
+	for _, option := range options {
+		option(&parsedOptions)
+	}
 	switch v := items.(type) {
 	case InputString:
 		return []openai.ChatCompletionMessageParamUnion{{
@@ -494,17 +591,18 @@ func (conv chatCmplConverter) ItemsToMessagesWithModel(items Input, model string
 			},
 		}}, nil
 	case InputItems:
-		return conv.itemsToMessagesWithModel(v, model)
+		return conv.itemsToMessagesWithModel(v, model, parsedOptions)
 	default:
 		// This would be an unrecoverable implementation bug, so a panic is appropriate.
 		panic(fmt.Errorf("unexpected Input type %T", v))
 	}
 }
 
-func (conv chatCmplConverter) itemsToMessagesWithModel(items []TResponseInputItem, model string) ([]openai.ChatCompletionMessageParamUnion, error) {
+func (conv chatCmplConverter) itemsToMessagesWithModel(items []TResponseInputItem, model string, options itemsToMessagesOptions) ([]openai.ChatCompletionMessageParamUnion, error) {
 	var result []openai.ChatCompletionMessageParamUnion
 
 	var currentAssistantMsg *openai.ChatCompletionAssistantMessageParam
+	var pendingThinkingBlocks []map[string]any
 	var pendingReasoningContent string
 
 	flushAssistantMessage := func() {
@@ -677,6 +775,13 @@ func (conv chatCmplConverter) itemsToMessagesWithModel(items []TResponseInputIte
 				}
 			}
 
+			if options.preserveThinkingBlocks && len(pendingThinkingBlocks) > 0 {
+				if err := applyThinkingBlocksToAssistant(newAsst, pendingThinkingBlocks); err != nil {
+					return nil, err
+				}
+				pendingThinkingBlocks = nil
+			}
+
 			currentAssistantMsg = newAsst
 		} else if fileSearch := item.OfFileSearchCall; !param.IsOmitted(fileSearch) { // 4) function/file-search calls => attach to assistant
 			asst := ensureAssistantMessage()
@@ -719,6 +824,13 @@ func (conv chatCmplConverter) itemsToMessagesWithModel(items []TResponseInputIte
 				assistantExtra["reasoning_content"] = pendingReasoningContent
 				asst.SetExtraFields(assistantExtra)
 				pendingReasoningContent = ""
+			}
+
+			if options.preserveThinkingBlocks && len(pendingThinkingBlocks) > 0 {
+				if err := applyThinkingBlocksToAssistant(asst, pendingThinkingBlocks); err != nil {
+					return nil, err
+				}
+				pendingThinkingBlocks = nil
 			}
 
 			arguments := funcCall.Arguments
@@ -778,7 +890,44 @@ func (conv chatCmplConverter) itemsToMessagesWithModel(items []TResponseInputIte
 		} else if itemRef := item.OfItemReference; !param.IsOmitted(itemRef) { // 6) item reference => handle or return error
 			return nil, UserErrorf("encountered an item_reference, which is not supported: %+v", *itemRef)
 		} else if reasoning := item.OfReasoning; !param.IsOmitted(reasoning) { // 7) reasoning message
-			if model != "" && isDeepSeekModelName(model) {
+			if options.preserveThinkingBlocks && model != "" && isAnthropicModelName(model) {
+				itemProviderData := reasoning.ExtraFields()
+				itemModel := ""
+				var providerData map[string]any
+				if providerAny, ok := itemProviderData["provider_data"]; ok {
+					if providerMap, ok := providerAny.(map[string]any); ok {
+						providerData = providerMap
+						itemModel, _ = providerMap["model"].(string)
+					}
+				}
+				if len(reasoning.Content) > 0 && (len(providerData) == 0 || strings.EqualFold(itemModel, model)) {
+					signatures := make([]string, 0)
+					if !param.IsOmitted(reasoning.EncryptedContent) && reasoning.EncryptedContent.Value != "" {
+						signatures = strings.Split(reasoning.EncryptedContent.Value, "\n")
+					}
+					reconstructed := make([]map[string]any, 0, len(reasoning.Content))
+					for _, content := range reasoning.Content {
+						if content.Type != "" && content.Type != constant.ValueOf[constant.ReasoningText]() {
+							continue
+						}
+						if content.Text == "" {
+							continue
+						}
+						block := map[string]any{
+							"type":     "thinking",
+							"thinking": content.Text,
+						}
+						if len(signatures) > 0 {
+							block["signature"] = signatures[0]
+							signatures = signatures[1:]
+						}
+						reconstructed = append(reconstructed, block)
+					}
+					if len(reconstructed) > 0 {
+						pendingThinkingBlocks = reconstructed
+					}
+				}
+			} else if model != "" && isDeepSeekModelName(model) {
 				providerData := reasoning.ExtraFields()
 				itemModel := ""
 				if providerDataAny, ok := providerData["provider_data"]; ok {
@@ -806,6 +955,60 @@ func (conv chatCmplConverter) itemsToMessagesWithModel(items []TResponseInputIte
 
 	flushAssistantMessage()
 	return result, nil
+}
+
+func applyThinkingBlocksToAssistant(asst *openai.ChatCompletionAssistantMessageParam, blocks []map[string]any) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+	existingContent, err := assistantContentAsAnySlice(asst)
+	if err != nil {
+		return err
+	}
+	merged := make([]any, 0, len(blocks)+len(existingContent))
+	for _, block := range blocks {
+		merged = append(merged, block)
+	}
+	merged = append(merged, existingContent...)
+
+	extras := copyMap(asst.ExtraFields())
+	if extras == nil {
+		extras = map[string]any{}
+	}
+	extras["content"] = merged
+	asst.SetExtraFields(extras)
+	return nil
+}
+
+func assistantContentAsAnySlice(asst *openai.ChatCompletionAssistantMessageParam) ([]any, error) {
+	if param.IsOmitted(asst.Content.OfString) && len(asst.Content.OfArrayOfContentParts) == 0 {
+		return nil, nil
+	}
+	raw, err := json.Marshal(asst.Content)
+	if err != nil {
+		return nil, err
+	}
+	if string(raw) == "null" {
+		return nil, nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, err
+	}
+	switch typed := value.(type) {
+	case string:
+		if typed == "" {
+			return nil, nil
+		}
+		return []any{map[string]any{
+			"type": "text",
+			"text": typed,
+		}}, nil
+	case []any:
+		return typed, nil
+	default:
+		return nil, nil
+	}
 }
 
 func (chatCmplConverter) ToolToOpenai(tool Tool) (*openai.ChatCompletionToolUnionParam, error) {

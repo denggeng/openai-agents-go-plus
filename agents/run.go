@@ -33,6 +33,7 @@ import (
 	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared/constant"
 )
 
 const DefaultMaxTurns = 10
@@ -137,6 +138,12 @@ type RunConfig struct {
 	// Optional ID of the previous response, if using OpenAI models via the Responses API,
 	// this allows you to skip passing in input from the previous turn.
 	PreviousResponseID string
+
+	// Optional conversation ID for server-managed conversation state.
+	ConversationID string
+
+	// Enable automatic previous response tracking for the first turn.
+	AutoPreviousResponseID bool
 
 	// Optional session for the run.
 	Session memory.Session
@@ -407,6 +414,28 @@ func (r Runner) runWithStartingTurnAndState(
 		return nil, fmt.Errorf("startingAgent must not be nil")
 	}
 
+	conversationID, previousResponseID, autoPrevious := resolveConversationSettings(r.Config, resumeState)
+	if err := validateSessionConversationSettings(r.Config.Session, conversationID, previousResponseID, autoPrevious); err != nil {
+		return nil, err
+	}
+	var serverConversationTracker *OpenAIServerConversationTracker
+	if conversationID != "" || autoPrevious {
+		serverConversationTracker = NewOpenAIServerConversationTracker(
+			conversationID,
+			previousResponseID,
+			autoPrevious,
+		)
+		if resumeState != nil {
+			sessionItems := runItemsToInputItems(resumeState.SessionItems)
+			serverConversationTracker.HydrateFromState(
+				InputItems(resumeState.OriginalInput),
+				resumeState.GeneratedRunItems,
+				resumeState.ModelResponses,
+				sessionItems,
+			)
+		}
+	}
+
 	// Prepare input with session if enabled
 	preparedInput, err := r.prepareInputWithSession(ctx, input, resumeState != nil)
 	if err != nil {
@@ -420,13 +449,32 @@ func (r Runner) runWithStartingTurnAndState(
 
 	toolUseTracker := NewAgentToolUseTracker()
 	contextWrapper := NewRunContextWrapper[any](nil)
-	if value, ok := RunContextValueFromContext(ctx); ok {
+	_, hasContextOverride := RunContextValueFromContext(ctx)
+	if hasContextOverride {
+		value, _ := RunContextValueFromContext(ctx)
 		contextWrapper.Context = value
 	}
 	if resumeState != nil {
 		// Reset persisted count for the resumed turn and restore approval decisions.
 		resumeState.CurrentTurnPersistedItemCount = 0
 		resumeState.ApplyToolApprovalsToContext(contextWrapper)
+		if resumeState.Context != nil {
+			if !hasContextOverride {
+				contextWrapper.Context = resumeState.Context.Context
+			}
+			if resumeState.Context.ToolInput != nil && contextWrapper.ToolInput == nil {
+				contextWrapper.ToolInput = resumeState.Context.ToolInput
+			}
+			if resumeState.Context.Usage != nil {
+				contextWrapper.Usage = cloneUsage(resumeState.Context.Usage)
+				if u, ok := usage.FromContext(ctx); !ok || u == nil {
+					ctx = usage.NewContext(ctx, contextWrapper.Usage)
+				}
+			}
+		}
+		if len(resumeState.ToolUseTracker) > 0 {
+			toolUseTracker.LoadSnapshot(resumeState.ToolUseTracker)
+		}
 	}
 
 	var runResult *RunResult
@@ -465,7 +513,18 @@ func (r Runner) runWithStartingTurnAndState(
 		}
 
 		if u, ok := usage.FromContext(ctx); !ok || u == nil {
-			ctx = usage.NewContext(ctx, usage.NewUsage())
+			if contextWrapper != nil && contextWrapper.Usage != nil {
+				ctx = usage.NewContext(ctx, contextWrapper.Usage)
+			} else {
+				ctx = usage.NewContext(ctx, usage.NewUsage())
+				if contextWrapper != nil {
+					if u2, ok := usage.FromContext(ctx); ok {
+						contextWrapper.Usage = u2
+					}
+				}
+			}
+		} else if contextWrapper != nil {
+			contextWrapper.Usage = u
 		}
 
 		currentAgent := startingAgent
@@ -473,7 +532,7 @@ func (r Runner) runWithStartingTurnAndState(
 
 		if resumeState != nil && len(resumeState.Interruptions) > 0 {
 			pendingInterruptions := slices.Clone(resumeState.Interruptions)
-			resolvedItems, pendingInterruptions, toolInputResults, toolOutputResults, err := r.resolveFunctionToolInterruptionsOnResume(
+			resolvedItems, pendingInterruptions, toolInputResults, toolOutputResults, functionResults, err := r.resolveFunctionToolInterruptionsOnResume(
 				ctx,
 				currentAgent,
 				resumeState,
@@ -527,6 +586,50 @@ func (r Runner) runWithStartingTurnAndState(
 					return err
 				}
 				return nil
+			}
+
+			if len(functionResults) > 0 {
+				checkToolUse, err := RunImpl().checkForFinalOutputFromTools(ctx, currentAgent, functionResults)
+				if err != nil {
+					return err
+				}
+				if checkToolUse.IsFinalOutput {
+					if !checkToolUse.FinalOutput.Valid() {
+						Logger().Error("Model returned a final output of None. Not raising an error because we assume you know what you're doing.")
+					}
+					finalOutput := checkToolUse.FinalOutput.Or(nil)
+					if currentAgent.OutputType == nil || currentAgent.OutputType.IsPlainText() {
+						if _, ok := finalOutput.(string); !ok {
+							finalOutput = fmt.Sprintf("%v", finalOutput)
+						}
+					}
+
+					outputGuardrailResults, err = r.runOutputGuardrails(
+						ctx,
+						slices.Concat(currentAgent.OutputGuardrails, r.Config.OutputGuardrails),
+						currentAgent,
+						finalOutput,
+					)
+					if err != nil {
+						return err
+					}
+					runResult = &RunResult{
+						Input:                      originalInput,
+						NewItems:                   generatedItems,
+						RawResponses:               modelResponses,
+						FinalOutput:                finalOutput,
+						InputGuardrailResults:      inputGuardrailResults,
+						OutputGuardrailResults:     outputGuardrailResults,
+						ToolInputGuardrailResults:  toolInputGuardrailResults,
+						ToolOutputGuardrailResults: toolOutputGuardrailResults,
+						Interruptions:              interruptions,
+						LastAgent:                  currentAgent,
+					}
+					if err := r.saveResultToSession(ctx, input, runResult, resumeState); err != nil {
+						return err
+					}
+					return nil
+				}
 			}
 		}
 
@@ -645,6 +748,7 @@ func (r Runner) runWithStartingTurnAndState(
 						shouldRunAgentStartHooks,
 						toolUseTracker,
 						contextWrapper,
+						serverConversationTracker,
 						r.Config.PreviousResponseID,
 					)
 					if turnError != nil {
@@ -668,6 +772,7 @@ func (r Runner) runWithStartingTurnAndState(
 					shouldRunAgentStartHooks,
 					toolUseTracker,
 					contextWrapper,
+					serverConversationTracker,
 					r.Config.PreviousResponseID,
 				)
 				if err != nil {
@@ -706,6 +811,7 @@ func (r Runner) runWithStartingTurnAndState(
 					Interruptions:              interruptions,
 					LastAgent:                  currentAgent,
 				}
+				applyConversationTracking(runResult, serverConversationTracker)
 
 				// Save the conversation to session if enabled
 				err = r.saveResultToSession(ctx, input, runResult, resumeState)
@@ -737,6 +843,7 @@ func (r Runner) runWithStartingTurnAndState(
 					Interruptions:              interruptions,
 					LastAgent:                  currentAgent,
 				}
+				applyConversationTracking(runResult, serverConversationTracker)
 
 				err = r.saveResultToSession(ctx, input, runResult, resumeState)
 				if err != nil {
@@ -832,14 +939,14 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 	hooks RunHooks,
 	runConfig RunConfig,
 	contextWrapper *RunContextWrapper[any],
-) ([]RunItem, []ToolApprovalItem, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, error) {
+) ([]RunItem, []ToolApprovalItem, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, []FunctionToolResult, error) {
 	if resumeState == nil || len(interruptions) == 0 {
-		return nil, interruptions, nil, nil, nil
+		return nil, interruptions, nil, nil, nil, nil
 	}
 
 	allTools, err := r.getAllTools(ctx, agent)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	functionToolNames := make(map[string]struct{})
@@ -849,7 +956,7 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 		}
 	}
 	if len(functionToolNames) == 0 {
-		return nil, interruptions, nil, nil, nil
+		return nil, interruptions, nil, nil, nil, nil
 	}
 
 	hasFunctionInterruptions := false
@@ -860,27 +967,27 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 		}
 	}
 	if !hasFunctionInterruptions {
-		return nil, interruptions, nil, nil, nil
+		return nil, interruptions, nil, nil, nil, nil
 	}
 
 	if len(resumeState.ModelResponses) == 0 {
-		return nil, interruptions, nil, nil, nil
+		return nil, interruptions, nil, nil, nil, nil
 	}
 
 	handoffs, err := r.getHandoffs(ctx, agent)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
 	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	functionCalls := filterFunctionCallsWithoutOutputs(processed.Functions, resumeState.GeneratedItems)
 	if len(functionCalls) == 0 {
-		return nil, interruptions, nil, nil, nil
+		return nil, interruptions, nil, nil, nil, nil
 	}
 
 	if contextWrapper == nil {
@@ -897,7 +1004,7 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 		runConfig,
 	)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	resolvedItems := make([]RunItem, 0, len(functionResults))
@@ -913,7 +1020,7 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 		pending = append(pending, pendingInterruptions...)
 	}
 
-	return resolvedItems, pending, toolInputResults, toolOutputResults, nil
+	return resolvedItems, pending, toolInputResults, toolOutputResults, functionResults, nil
 }
 
 func filterApplyPatchCallsWithoutOutputs(
@@ -1087,6 +1194,11 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 		return nil, fmt.Errorf("startingAgent must not be nil")
 	}
 
+	conversationID, previousResponseID, autoPrevious := resolveConversationSettings(r.Config, resumeState)
+	if err := validateSessionConversationSettings(r.Config.Session, conversationID, previousResponseID, autoPrevious); err != nil {
+		return nil, err
+	}
+
 	maxTurns := r.Config.MaxTurns
 	if maxTurns == 0 {
 		maxTurns = DefaultMaxTurns
@@ -1109,6 +1221,19 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 			Metadata:     r.Config.TraceMetadata,
 			Disabled:     r.Config.TracingDisabled,
 		})
+	}
+
+	if resumeState != nil && resumeState.Context != nil && resumeState.Context.Usage != nil {
+		if u, ok := usage.FromContext(ctx); !ok || u == nil {
+			ctx = usage.NewContext(ctx, cloneUsage(resumeState.Context.Usage))
+		}
+	}
+
+	if resumeState != nil {
+		Logger().Debug(
+			"Resuming from RunState in run_streaming()",
+			buildResumedStreamDebugAttrs(resumeState, !DontLogToolData)...,
+		)
 	}
 
 	if u, ok := usage.FromContext(ctx); !ok || u == nil {
@@ -1146,6 +1271,59 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 	})
 
 	return streamedResult, nil
+}
+
+func resolveConversationSettings(
+	runConfig RunConfig,
+	runState *RunState,
+) (conversationID string, previousResponseID string, autoPrevious bool) {
+	conversationID = runConfig.ConversationID
+	previousResponseID = runConfig.PreviousResponseID
+	autoPrevious = runConfig.AutoPreviousResponseID
+
+	if runState != nil {
+		if conversationID == "" && runState.ConversationID != "" {
+			conversationID = runState.ConversationID
+		}
+		if previousResponseID == "" && runState.PreviousResponseID != "" {
+			previousResponseID = runState.PreviousResponseID
+		}
+		if !autoPrevious && runState.AutoPreviousResponseID {
+			autoPrevious = true
+		}
+		runState.ConversationID = conversationID
+		runState.PreviousResponseID = previousResponseID
+		runState.AutoPreviousResponseID = autoPrevious
+	}
+
+	return conversationID, previousResponseID, autoPrevious
+}
+
+func validateSessionConversationSettings(
+	session memory.Session,
+	conversationID string,
+	previousResponseID string,
+	autoPrevious bool,
+) error {
+	if session == nil {
+		return nil
+	}
+	if conversationID == "" && previousResponseID == "" && !autoPrevious {
+		return nil
+	}
+	return NewUserError(
+		"Session persistence cannot be combined with conversation_id, " +
+			"previous_response_id, or auto_previous_response_id.",
+	)
+}
+
+func applyConversationTracking(result *RunResult, tracker *OpenAIServerConversationTracker) {
+	if result == nil || tracker == nil {
+		return
+	}
+	result.ConversationID = tracker.ConversationID
+	result.PreviousResponseID = tracker.PreviousResponseID
+	result.AutoPreviousResponseID = tracker.AutoPreviousResponseID
 }
 
 // Apply optional CallModelInputFilter to modify model input.
@@ -1207,8 +1385,12 @@ func (r Runner) runInputGuardrailsWithQueue(
 ) error {
 	queue := streamedResult.inputGuardrailQueue
 
-	guardrailResults := make([]InputGuardrailResult, len(guardrails))
-	guardrailErrors := make([]error, len(guardrails))
+	if len(guardrails) == 0 {
+		return nil
+	}
+
+	guardrailResults := make([]InputGuardrailResult, 0, len(guardrails))
+	guardrailErrors := make([]error, 0, len(guardrails))
 
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1219,18 +1401,26 @@ func (r Runner) runInputGuardrailsWithQueue(
 	wg.Add(len(guardrails))
 
 	// We'll run the guardrails and push them onto the queue as they complete
-	for i, guardrail := range guardrails {
+	for _, guardrail := range guardrails {
+		guardrail := guardrail
 		go func() {
 			defer wg.Done()
 
 			result, err := RunImpl().RunSingleInputGuardrail(childCtx, agent, guardrail, input)
 			if err != nil {
 				cancel()
-				guardrailErrors[i] = fmt.Errorf("failed to run input guardrail %s: %w", guardrail.Name, err)
+				mu.Lock()
+				guardrailErrors = append(guardrailErrors, fmt.Errorf("failed to run input guardrail %s: %w", guardrail.Name, err))
+				mu.Unlock()
 				return
 			}
 
-			guardrailResults[i] = result
+			mu.Lock()
+			guardrailResults = append(guardrailResults, result)
+			snapshot := slices.Clone(guardrailResults)
+			mu.Unlock()
+			streamedResult.setInputGuardrailResults(snapshot)
+
 			queue.Put(result)
 
 			if result.Output.TripwireTriggered {
@@ -1303,6 +1493,10 @@ func (r Runner) startStreaming(
 			streamedResult.eventQueue.Put(queueCompleteSentinel{})
 		}
 
+		if t := streamedResult.getInputGuardrailsTask(); t != nil && !t.IsDone() {
+			_ = t.Await()
+		}
+
 		if currentSpan != nil {
 			if e := currentSpan.Finish(ctx, true); e != nil {
 				err = errors.Join(err, e)
@@ -1323,18 +1517,61 @@ func (r Runner) startStreaming(
 		}
 	}
 
+	conversationID, resolvedPreviousResponseID, autoPrevious := resolveConversationSettings(runConfig, resumeState)
+	previousResponseID = resolvedPreviousResponseID
+
+	var serverConversationTracker *OpenAIServerConversationTracker
+	if conversationID != "" || autoPrevious {
+		serverConversationTracker = NewOpenAIServerConversationTracker(
+			conversationID,
+			previousResponseID,
+			autoPrevious,
+		)
+		if resumeState != nil {
+			sessionItems := runItemsToInputItems(resumeState.SessionItems)
+			serverConversationTracker.HydrateFromState(
+				InputItems(resumeState.OriginalInput),
+				resumeState.GeneratedRunItems,
+				resumeState.ModelResponses,
+				sessionItems,
+			)
+		}
+		streamedResult.setConversationID(serverConversationTracker.ConversationID)
+		streamedResult.setPreviousResponseID(serverConversationTracker.PreviousResponseID)
+		streamedResult.setAutoPreviousResponseID(serverConversationTracker.AutoPreviousResponseID)
+	}
+
 	currentTurn := startingTurn
 	shouldRunAgentStartHooks := true
 	toolUseTracker := NewAgentToolUseTracker()
 	isResumedState := resumeState != nil
 	contextWrapper := NewRunContextWrapper[any](nil)
-	if value, ok := RunContextValueFromContext(ctx); ok {
+	_, hasContextOverride := RunContextValueFromContext(ctx)
+	if hasContextOverride {
+		value, _ := RunContextValueFromContext(ctx)
 		contextWrapper.Context = value
 	}
 	if resumeState != nil {
 		// Reset persisted count for the resumed turn and restore approval decisions.
 		resumeState.CurrentTurnPersistedItemCount = 0
 		resumeState.ApplyToolApprovalsToContext(contextWrapper)
+		if resumeState.Context != nil {
+			if !hasContextOverride {
+				contextWrapper.Context = resumeState.Context.Context
+			}
+			if resumeState.Context.ToolInput != nil && contextWrapper.ToolInput == nil {
+				contextWrapper.ToolInput = resumeState.Context.ToolInput
+			}
+			if resumeState.Context.Usage != nil {
+				contextWrapper.Usage = cloneUsage(resumeState.Context.Usage)
+				if u, ok := usage.FromContext(ctx); !ok || u == nil {
+					ctx = usage.NewContext(ctx, contextWrapper.Usage)
+				}
+			}
+		}
+		if len(resumeState.ToolUseTracker) > 0 {
+			toolUseTracker.LoadSnapshot(resumeState.ToolUseTracker)
+		}
 	}
 
 	streamedResult.eventQueue.Put(AgentUpdatedStreamEvent{
@@ -1426,7 +1663,7 @@ func (r Runner) startStreaming(
 			contextWrapper,
 			allTools,
 			previousResponseID,
-			nil,
+			serverConversationTracker,
 		)
 		if err != nil {
 			return err
@@ -1592,6 +1829,78 @@ func (r Runner) runSingleTurnStreamed(
 	if err != nil {
 		return nil, fmt.Errorf("failed to get model: %w", err)
 	}
+	emittedToolCallIDs := map[string]struct{}{}
+	emittedReasoningIDs := map[string]struct{}{}
+	toolCallItemFromOutput := func(output responses.ResponseOutputItemUnion) (ToolCallItem, string, bool) {
+		if output.Type != "function_call" {
+			return ToolCallItem{}, "", false
+		}
+		callID := output.CallID
+		if callID == "" {
+			callID = output.ID
+		}
+		outputItem := responses.ResponseFunctionToolCall{
+			Arguments: output.Arguments,
+			CallID:    output.CallID,
+			Name:      output.Name,
+			Type:      constant.FunctionCall(output.Type),
+			ID:        output.ID,
+			Status:    responses.ResponseFunctionToolCallStatus(output.Status),
+		}
+		if outputItem.Type == "" {
+			outputItem.Type = constant.ValueOf[constant.FunctionCall]()
+		}
+		return ToolCallItem{
+			Agent:   agent,
+			RawItem: ResponseFunctionToolCall(outputItem),
+			Type:    "tool_call_item",
+		}, callID, callID != ""
+	}
+	reasoningItemFromOutput := func(output responses.ResponseOutputItemUnion) (ReasoningItem, string, bool) {
+		if output.Type != "reasoning" {
+			return ReasoningItem{}, "", false
+		}
+		reasoningID := output.ID
+		if reasoningID == "" {
+			return ReasoningItem{}, "", false
+		}
+		outputItem := responses.ResponseReasoningItem{
+			ID:               output.ID,
+			Summary:          output.Summary,
+			Type:             constant.Reasoning(output.Type),
+			EncryptedContent: output.EncryptedContent,
+			Status:           responses.ResponseReasoningItemStatus(output.Status),
+		}
+		if outputItem.Type == "" {
+			outputItem.Type = constant.ValueOf[constant.Reasoning]()
+		}
+		return ReasoningItem{
+			Agent:   agent,
+			RawItem: outputItem,
+			Type:    "reasoning_item",
+		}, reasoningID, true
+	}
+	toolCallIDFromItem := func(item ToolCallItemType) string {
+		switch v := item.(type) {
+		case ResponseFunctionToolCall:
+			typed := responses.ResponseFunctionToolCall(v)
+			if typed.CallID != "" {
+				return typed.CallID
+			}
+			return typed.ID
+		case *ResponseFunctionToolCall:
+			if v == nil {
+				return ""
+			}
+			typed := responses.ResponseFunctionToolCall(*v)
+			if typed.CallID != "" {
+				return typed.CallID
+			}
+			return typed.ID
+		default:
+			return ""
+		}
+	}
 	modelSettings := agent.ModelSettings.Resolve(runConfig.ModelSettings)
 	modelSettings = RunImpl().MaybeResetToolChoice(agent, toolUseTracker, modelSettings)
 
@@ -1624,6 +1933,12 @@ func (r Runner) runSingleTurnStreamed(
 		serverConversationTracker.MarkInputAsSent(filtered.Input)
 	}
 
+	conversationID := runConfig.ConversationID
+	if serverConversationTracker != nil {
+		conversationID = serverConversationTracker.ConversationID
+		previousResponseID = serverConversationTracker.PreviousResponseID
+	}
+
 	// Call hook just before the model is invoked, with the correct system prompt.
 	if agent.Hooks != nil {
 		err = agent.Hooks.OnLLMStart(ctx, agent, filtered.Instructions, filtered.Input)
@@ -1645,6 +1960,7 @@ func (r Runner) runSingleTurnStreamed(
 			runConfig.TraceIncludeSensitiveData.Or(true),
 		),
 		PreviousResponseID: previousResponseID,
+		ConversationID:     conversationID,
 		Prompt:             promptConfig,
 	}
 	err = model.StreamResponse(
@@ -1675,6 +1991,20 @@ func (r Runner) runSingleTurnStreamed(
 				Data: event,
 				Type: "raw_response_event",
 			})
+			if event.Type == "response.output_item.done" {
+				outputItem := event.Item
+				if toolItem, callID, ok := toolCallItemFromOutput(outputItem); ok {
+					if _, seen := emittedToolCallIDs[callID]; !seen {
+						emittedToolCallIDs[callID] = struct{}{}
+						streamedResult.eventQueue.Put(NewRunItemStreamEvent(StreamEventToolCalled, toolItem))
+					}
+				} else if reasoningItem, reasoningID, ok := reasoningItemFromOutput(outputItem); ok {
+					if _, seen := emittedReasoningIDs[reasoningID]; !seen {
+						emittedReasoningIDs[reasoningID] = struct{}{}
+						streamedResult.eventQueue.Put(NewRunItemStreamEvent(StreamEventReasoningItemCreated, reasoningItem))
+					}
+				}
+			}
 			return nil
 		},
 	)
@@ -1693,6 +2023,13 @@ func (r Runner) runSingleTurnStreamed(
 	// 2. At this point, the streaming is complete for this turn of the agent loop.
 	if finalResponse == nil {
 		return nil, NewModelBehaviorError("Model did not produce a final response!")
+	}
+
+	if serverConversationTracker != nil {
+		serverConversationTracker.TrackServerItems(finalResponse)
+		streamedResult.setConversationID(serverConversationTracker.ConversationID)
+		streamedResult.setPreviousResponseID(serverConversationTracker.PreviousResponseID)
+		streamedResult.setAutoPreviousResponseID(serverConversationTracker.AutoPreviousResponseID)
 	}
 
 	// 3. Now, we can process the turn as we do in the non-streaming case
@@ -1714,7 +2051,45 @@ func (r Runner) runSingleTurnStreamed(
 		return nil, err
 	}
 
-	RunImpl().StreamStepResultToQueue(*singleStepResult, streamedResult.eventQueue)
+	streamedStepResult := *singleStepResult
+	if len(emittedToolCallIDs) > 0 || len(emittedReasoningIDs) > 0 {
+		filtered := make([]RunItem, 0, len(streamedStepResult.NewStepItems))
+		for _, item := range streamedStepResult.NewStepItems {
+			switch typed := item.(type) {
+			case ToolCallItem:
+				callID := toolCallIDFromItem(typed.RawItem)
+				if callID != "" {
+					if _, seen := emittedToolCallIDs[callID]; seen {
+						continue
+					}
+				}
+			case *ToolCallItem:
+				if typed != nil {
+					callID := toolCallIDFromItem(typed.RawItem)
+					if callID != "" {
+						if _, seen := emittedToolCallIDs[callID]; seen {
+							continue
+						}
+					}
+				}
+			case ReasoningItem:
+				if typed.RawItem.ID != "" {
+					if _, seen := emittedReasoningIDs[typed.RawItem.ID]; seen {
+						continue
+					}
+				}
+			case *ReasoningItem:
+				if typed != nil && typed.RawItem.ID != "" {
+					if _, seen := emittedReasoningIDs[typed.RawItem.ID]; seen {
+						continue
+					}
+				}
+			}
+			filtered = append(filtered, item)
+		}
+		streamedStepResult.NewStepItems = filtered
+	}
+	RunImpl().StreamStepResultToQueue(streamedStepResult, streamedResult.eventQueue)
 	return singleStepResult, nil
 }
 
@@ -1729,6 +2104,7 @@ func (r Runner) runSingleTurn(
 	shouldRunAgentStartHooks bool,
 	toolUseTracker *AgentToolUseTracker,
 	contextWrapper *RunContextWrapper[any],
+	serverConversationTracker *OpenAIServerConversationTracker,
 	previousResponseID string,
 ) (*SingleStepResult, error) {
 	// Ensure we run the hooks before anything else
@@ -1778,8 +2154,12 @@ func (r Runner) runSingleTurn(
 	}
 
 	input := ItemHelpers().InputToNewInputList(originalInput)
-	for _, generatedItem := range generatedItems {
-		input = append(input, generatedItem.ToInputItem())
+	if serverConversationTracker != nil {
+		input = serverConversationTracker.PrepareInput(originalInput, generatedItems)
+	} else {
+		for _, generatedItem := range generatedItems {
+			input = append(input, generatedItem.ToInputItem())
+		}
 	}
 
 	newResponse, err := r.getNewResponse(
@@ -1792,7 +2172,7 @@ func (r Runner) runSingleTurn(
 		handoffs,
 		runConfig,
 		toolUseTracker,
-		nil,
+		serverConversationTracker,
 		previousResponseID,
 		promptConfig,
 	)
@@ -2051,6 +2431,12 @@ func (r Runner) getNewResponse(
 		serverConversationTracker.MarkInputAsSent(filtered.Input)
 	}
 
+	conversationID := runConfig.ConversationID
+	if serverConversationTracker != nil {
+		conversationID = serverConversationTracker.ConversationID
+		previousResponseID = serverConversationTracker.PreviousResponseID
+	}
+
 	model, err := r.getModel(agent, runConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get model: %w", err)
@@ -2079,6 +2465,7 @@ func (r Runner) getNewResponse(
 			runConfig.TraceIncludeSensitiveData.Or(true),
 		),
 		PreviousResponseID: previousResponseID,
+		ConversationID:     conversationID,
 		Prompt:             promptConfig,
 	})
 	if err != nil {
@@ -2101,6 +2488,10 @@ func (r Runner) getNewResponse(
 
 	if contextUsage, _ := usage.FromContext(ctx); contextUsage != nil {
 		contextUsage.Add(newResponse.Usage)
+	}
+
+	if serverConversationTracker != nil {
+		serverConversationTracker.TrackServerItems(newResponse)
 	}
 
 	return newResponse, err
@@ -2185,7 +2576,7 @@ func (r Runner) getModel(agent *Agent, runConfig RunConfig) (Model, error) {
 		return modelProvider.GetModel(agentModel.ModelName())
 	}
 
-	return modelProvider.GetModel("")
+	return modelProvider.GetModel(GetDefaultModel())
 }
 
 // prepareInputWithSession prepares input by combining it with session history if enabled.

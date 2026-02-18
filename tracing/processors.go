@@ -130,103 +130,130 @@ func (b *BackendSpanExporter) Project() string {
 	return b.project
 }
 
+type tracingAPIKeyProvider interface {
+	TracingAPIKey() string
+}
+
+type exportableItem interface {
+	Export() map[string]any
+}
+
 func (b *BackendSpanExporter) Export(ctx context.Context, items []any) error {
 	if len(items) == 0 {
 		return nil
 	}
 
-	if b.APIKey() == "" {
-		Logger().Warn("BackendSpanExporter: OpenAI API key is not set, skipping trace export")
-		return nil
-	}
-
-	data := make([]map[string]any, len(items))
-	for i, item := range items {
-		switch v := item.(type) {
-		case Trace:
-			data[i] = v.Export()
-		case Span:
-			data[i] = v.Export()
-		default:
-			return fmt.Errorf("BackendSpanExporter: unexpected item type %T", item)
-		}
-	}
-
-	payload := map[string]any{
-		"data": data,
-	}
-
-	header := make(http.Header)
-	header.Set("Authorization", "Bearer "+b.APIKey())
-	header.Set("Content-Type", "application/json")
-	header.Set("OpenAI-Beta", "traces=v1")
-	if b.Organization() != "" {
-		header.Set("OpenAI-Organization", b.Organization())
-	}
-	if b.Project() != "" {
-		header.Set("OpenAI-Project", b.Project())
-	}
-
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to JSON-marshal tracing payload: %w", err)
-	}
-
-	// Exponential backoff loop
-	attempt := 0
-	delay := b.BaseDelay
-	for {
-		attempt += 1
-
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.Endpoint, bytes.NewReader(jsonPayload))
-		if err != nil {
-			return fmt.Errorf("failed to initialize new tracing request: %w", err)
-		}
-		request.Header = header
-
-		response, err := b.client.Do(request)
-
-		if err != nil {
-			Logger().Warn("[non-fatal] Tracing: request failed", slog.String("error", err.Error()))
-		} else {
-			// If the response is successful, break out of the loop
-			if response.StatusCode < 300 {
-				_ = response.Body.Close()
-				Logger().Debug(fmt.Sprintf("Exported %d items", len(items)))
-				return nil
+	grouped := make(map[string][]map[string]any)
+	for _, item := range items {
+		exportable, ok := item.(exportableItem)
+		if !ok {
+			switch v := item.(type) {
+			case Trace:
+				exportable = v
+			case Span:
+				exportable = v
+			default:
+				return fmt.Errorf("BackendSpanExporter: unexpected item type %T", item)
 			}
+		}
+		exported := exportable.Export()
+		if exported == nil {
+			continue
+		}
+		apiKey := ""
+		if provider, ok := item.(tracingAPIKeyProvider); ok {
+			apiKey = provider.TracingAPIKey()
+		}
+		grouped[apiKey] = append(grouped[apiKey], exported)
+	}
 
-			// If the response is a client error (4xx), we won't retry
-			if response.StatusCode >= 400 && response.StatusCode < 500 {
-				body, err := io.ReadAll(response.Body)
-				if err != nil {
-					Logger().Warn("failed to read tracing response body", slog.String("error", err.Error()))
+	for itemKey, data := range grouped {
+		apiKey := itemKey
+		if apiKey == "" {
+			apiKey = b.APIKey()
+		}
+		if apiKey == "" {
+			Logger().Warn("BackendSpanExporter: OpenAI API key is not set, skipping trace export")
+			continue
+		}
+
+		payload := map[string]any{
+			"data": data,
+		}
+
+		header := make(http.Header)
+		header.Set("Authorization", "Bearer "+apiKey)
+		header.Set("Content-Type", "application/json")
+		header.Set("OpenAI-Beta", "traces=v1")
+		if b.Organization() != "" {
+			header.Set("OpenAI-Organization", b.Organization())
+		}
+		if b.Project() != "" {
+			header.Set("OpenAI-Project", b.Project())
+		}
+
+		jsonPayload, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("failed to JSON-marshal tracing payload: %w", err)
+		}
+
+		// Exponential backoff loop
+		attempt := 0
+		delay := b.BaseDelay
+		for {
+			attempt += 1
+
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.Endpoint, bytes.NewReader(jsonPayload))
+			if err != nil {
+				return fmt.Errorf("failed to initialize new tracing request: %w", err)
+			}
+			request.Header = header
+
+			response, err := b.client.Do(request)
+
+			if err != nil {
+				Logger().Warn("[non-fatal] Tracing: request failed", slog.String("error", err.Error()))
+			} else {
+				// If the response is successful, break out of the loop
+				if response.StatusCode < 300 {
+					_ = response.Body.Close()
+					Logger().Debug(fmt.Sprintf("Exported %d items", len(data)))
+					break
+				}
+
+				// If the response is a client error (4xx), we won't retry
+				if response.StatusCode >= 400 && response.StatusCode < 500 {
+					body, err := io.ReadAll(response.Body)
+					if err != nil {
+						Logger().Warn("failed to read tracing response body", slog.String("error", err.Error()))
+					}
+					_ = response.Body.Close()
+					Logger().Warn(
+						"[non-fatal] Tracing client error",
+						slog.Int("statusCode", response.StatusCode),
+						slog.String("response", string(body)),
+					)
+					break
 				}
 				_ = response.Body.Close()
-				Logger().Warn(
-					"[non-fatal] Tracing client error",
-					slog.Int("statusCode", response.StatusCode),
-					slog.String("response", string(body)),
-				)
-				return nil
+
+				// For 5xx or other unexpected codes, treat it as transient and retry
+				Logger().Warn("[non-fatal] Tracing: server error, retrying.", slog.Int("statusCode", response.StatusCode))
 			}
-			_ = response.Body.Close()
 
-			// For 5xx or other unexpected codes, treat it as transient and retry
-			Logger().Warn("[non-fatal] Tracing: server error, retrying.", slog.Int("statusCode", response.StatusCode))
+			//# If we reach here, we need to retry or give up
+			if attempt >= b.MaxRetries {
+				Logger().Error("[non-fatal] Tracing: max retries reached, giving up on this batch.")
+				break
+			}
+
+			// Exponential backoff + jitter
+			sleepTime := delay + time.Duration(rand.Int64N(int64(delay/10))) // 10% jitter
+			time.Sleep(sleepTime)
+			delay = min(delay*2, b.MaxDelay)
 		}
-
-		//# If we reach here, we need to retry or give up
-		if attempt >= b.MaxRetries {
-			Logger().Error("[non-fatal] Tracing: max retries reached, giving up on this batch.")
-			return nil
-		}
-
-		// Exponential backoff + jitter
-		sleepTime := delay + time.Duration(rand.Int64N(int64(delay/10))) // 10% jitter
-		time.Sleep(sleepTime)
-		delay = min(delay*2, b.MaxDelay)
 	}
+	return nil
 }
 
 // Close the underlying HTTP client's idle connections.

@@ -19,8 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os/exec"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -58,11 +61,21 @@ type MCPServer interface {
 	GetPrompt(ctx context.Context, name string, arguments map[string]string) (*mcp.GetPromptResult, error)
 }
 
+type mcpClientSession interface {
+	ListTools(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error)
+	CallTool(context.Context, *mcp.CallToolParams) (*mcp.CallToolResult, error)
+	ListPrompts(context.Context, *mcp.ListPromptsParams) (*mcp.ListPromptsResult, error)
+	GetPrompt(context.Context, *mcp.GetPromptParams) (*mcp.GetPromptResult, error)
+	Close() error
+}
+
+var newMCPClient = mcp.NewClient
+
 // MCPServerWithClientSession is a base type for MCP servers that uses an
 // mcp.ClientSession to communicate with the server.
 type MCPServerWithClientSession struct {
 	transport            mcp.Transport
-	session              *mcp.ClientSession
+	session              mcpClientSession
 	cleanupMu            sync.Mutex
 	cacheToolsList       bool
 	cacheDirty           bool
@@ -70,11 +83,17 @@ type MCPServerWithClientSession struct {
 	toolFilter           MCPToolFilter
 	name                 string
 	useStructuredContent bool
+	maxRetryAttempts     int
+	retryBackoffBase     time.Duration
+	clientOptions        *mcp.ClientOptions
+	cleanupHook          func()
 }
 
 type MCPServerWithClientSessionParams struct {
 	Name      string
 	Transport mcp.Transport
+	// Optional client options, including MCP message handlers.
+	ClientOptions *mcp.ClientOptions
 
 	// Whether to cache the tools list. If `true`, the tools list will be
 	// cached and only fetched from the server once. If `false`, the tools list will be
@@ -93,6 +112,12 @@ type MCPServerWithClientSessionParams struct {
 	// content. You can set this to true if you know the server will not duplicate
 	// the structured content in `Content`.
 	UseStructuredContent bool
+
+	// Maximum number of retry attempts for ListTools/CallTool. Use -1 for unlimited retries.
+	MaxRetryAttempts int
+
+	// Base delay for exponential backoff between retries.
+	RetryBackoffBase time.Duration
 }
 
 func NewMCPServerWithClientSession(params MCPServerWithClientSessionParams) *MCPServerWithClientSession {
@@ -104,6 +129,9 @@ func NewMCPServerWithClientSession(params MCPServerWithClientSessionParams) *MCP
 		toolFilter:           params.ToolFilter,
 		name:                 params.Name,
 		useStructuredContent: params.UseStructuredContent,
+		maxRetryAttempts:     params.MaxRetryAttempts,
+		retryBackoffBase:     params.RetryBackoffBase,
+		clientOptions:        params.ClientOptions,
 	}
 }
 
@@ -117,7 +145,7 @@ func (s *MCPServerWithClientSession) Connect(ctx context.Context) (err error) {
 		}
 	}()
 
-	client := mcp.NewClient(&mcp.Implementation{Name: s.name}, nil)
+	client := newMCPClient(&mcp.Implementation{Name: s.name}, s.clientOptions)
 	session, err := client.Connect(ctx, s.transport, nil)
 	if err != nil {
 		return fmt.Errorf("MCP client connection error: %w", err)
@@ -130,6 +158,9 @@ func (s *MCPServerWithClientSession) Cleanup(context.Context) error {
 	s.cleanupMu.Lock()
 	defer func() {
 		s.session = nil
+		if s.cleanupHook != nil {
+			s.cleanupHook()
+		}
 		s.cleanupMu.Unlock()
 	}()
 
@@ -162,7 +193,12 @@ func (s *MCPServerWithClientSession) ListTools(ctx context.Context, agent *Agent
 		tools = s.toolsList
 	} else {
 		s.cacheDirty = false
-		listToolsResults, err := s.session.ListTools(ctx, nil)
+		var listToolsResults *mcp.ListToolsResult
+		err := s.runWithRetries(ctx, func() error {
+			var err error
+			listToolsResults, err = s.session.ListTools(ctx, nil)
+			return err
+		})
 		if err != nil {
 			return nil, fmt.Errorf("MCP list tools error: %w", err)
 		}
@@ -188,10 +224,100 @@ func (s *MCPServerWithClientSession) CallTool(ctx context.Context, toolName stri
 	if s.session == nil {
 		return nil, NewUserError("server not initialized: make sure you call `Connect()` first")
 	}
-	return s.session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      toolName,
-		Arguments: arguments,
+	if err := s.validateCallToolArguments(toolName, arguments); err != nil {
+		return nil, err
+	}
+	var result *mcp.CallToolResult
+	err := s.runWithRetries(ctx, func() error {
+		var err error
+		result, err = s.session.CallTool(ctx, &mcp.CallToolParams{
+			Name:      toolName,
+			Arguments: arguments,
+		})
+		return err
 	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *MCPServerWithClientSession) validateCallToolArguments(toolName string, arguments map[string]any) error {
+	tool := s.findCachedTool(toolName)
+	if tool == nil || tool.InputSchema == nil {
+		return nil
+	}
+
+	required := tool.InputSchema.Required
+	if len(required) == 0 {
+		return nil
+	}
+	if arguments == nil {
+		return UserErrorf("missing required parameters: %s", strings.Join(required, ", "))
+	}
+	var missing []string
+	for _, key := range required {
+		if _, ok := arguments[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return UserErrorf("missing required parameters: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func (s *MCPServerWithClientSession) findCachedTool(toolName string) *mcp.Tool {
+	if len(s.toolsList) == 0 {
+		return nil
+	}
+	for _, tool := range s.toolsList {
+		if tool != nil && tool.Name == toolName {
+			return tool
+		}
+	}
+	return nil
+}
+
+func (s *MCPServerWithClientSession) runWithRetries(
+	ctx context.Context,
+	fn func() error,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	attempts := 0
+	for {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		attempts++
+		if s.maxRetryAttempts != -1 && attempts > s.maxRetryAttempts {
+			return err
+		}
+		if s.retryBackoffBase <= 0 {
+			continue
+		}
+		backoff := s.retryBackoffBase * time.Duration(1<<maxInt(attempts-1, 0))
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (s *MCPServerWithClientSession) ListPrompts(ctx context.Context) (*mcp.ListPromptsResult, error) {
@@ -233,6 +359,9 @@ type MCPServerStdioParams struct {
 	// The command to run to start the server.
 	Command *exec.Cmd
 
+	// Optional client options, including MCP message handlers.
+	ClientOptions *mcp.ClientOptions
+
 	// Whether to cache the tools list. If `true`, the tools list will be
 	// cached and only fetched from the server once. If `false`, the tools list will be
 	// fetched from the server on each call to `ListTools()`. The cache can be
@@ -253,6 +382,12 @@ type MCPServerStdioParams struct {
 	// content. You can set this to true if you know the server will not duplicate
 	// the structured content in `Content`.
 	UseStructuredContent bool
+
+	// Maximum number of retry attempts for ListTools/CallTool. Use -1 for unlimited retries.
+	MaxRetryAttempts int
+
+	// Base delay for exponential backoff between retries.
+	RetryBackoffBase time.Duration
 }
 
 // MCPServerStdio is an MCP server implementation that uses the stdio transport.
@@ -276,6 +411,9 @@ func NewMCPServerStdio(params MCPServerStdioParams) *MCPServerStdio {
 			CacheToolsList:       params.CacheToolsList,
 			ToolFilter:           params.ToolFilter,
 			UseStructuredContent: params.UseStructuredContent,
+			ClientOptions:        params.ClientOptions,
+			MaxRetryAttempts:     params.MaxRetryAttempts,
+			RetryBackoffBase:     params.RetryBackoffBase,
 		}),
 	}
 }
@@ -283,6 +421,9 @@ func NewMCPServerStdio(params MCPServerStdioParams) *MCPServerStdio {
 type MCPServerSSEParams struct {
 	BaseURL       string
 	TransportOpts *mcp.SSEClientTransport
+
+	// Optional client options, including MCP message handlers.
+	ClientOptions *mcp.ClientOptions
 
 	// Whether to cache the tools list. If `true`, the tools list will be
 	// cached and only fetched from the server once. If `false`, the tools list will be
@@ -304,6 +445,12 @@ type MCPServerSSEParams struct {
 	// content. You can set this to true if you know the server will not duplicate
 	// the structured content in `Content`.
 	UseStructuredContent bool
+
+	// Maximum number of retry attempts for ListTools/CallTool. Use -1 for unlimited retries.
+	MaxRetryAttempts int
+
+	// Base delay for exponential backoff between retries.
+	RetryBackoffBase time.Duration
 }
 
 // MCPServerSSE is an MCP server implementation that uses the HTTP with SSE transport.
@@ -331,7 +478,7 @@ func NewMCPServerSSE(params MCPServerSSEParams) *MCPServerSSE {
 	transport := &mcp.SSEClientTransport{
 		Endpoint: params.BaseURL,
 	}
-	if params.TransportOpts != nil && params.TransportOpts.HTTPClient != nil {
+	if params.TransportOpts != nil {
 		transport = &mcp.SSEClientTransport{
 			Endpoint:   params.BaseURL,
 			HTTPClient: params.TransportOpts.HTTPClient,
@@ -344,6 +491,9 @@ func NewMCPServerSSE(params MCPServerSSEParams) *MCPServerSSE {
 			CacheToolsList:       params.CacheToolsList,
 			ToolFilter:           params.ToolFilter,
 			UseStructuredContent: params.UseStructuredContent,
+			ClientOptions:        params.ClientOptions,
+			MaxRetryAttempts:     params.MaxRetryAttempts,
+			RetryBackoffBase:     params.RetryBackoffBase,
 		}),
 	}
 }
@@ -351,6 +501,11 @@ func NewMCPServerSSE(params MCPServerSSEParams) *MCPServerSSE {
 type MCPServerStreamableHTTPParams struct {
 	URL           string
 	TransportOpts *mcp.StreamableClientTransport
+	// Optional factory to build an HTTP client for Streamable HTTP transport.
+	HTTPClientFactory func() *http.Client
+
+	// Optional client options, including MCP message handlers.
+	ClientOptions *mcp.ClientOptions
 
 	// Whether to cache the tools list. If `true`, the tools list will be
 	// cached and only fetched from the server once. If `false`, the tools list will be
@@ -372,6 +527,12 @@ type MCPServerStreamableHTTPParams struct {
 	// content. You can set this to true if you know the server will not duplicate
 	// the structured content in `Content`.
 	UseStructuredContent bool
+
+	// Maximum number of retry attempts for ListTools/CallTool. Use -1 for unlimited retries.
+	MaxRetryAttempts int
+
+	// Base delay for exponential backoff between retries.
+	RetryBackoffBase time.Duration
 }
 
 // MCPServerStreamableHTTP is an MCP server implementation that uses the Streamable HTTP transport.
@@ -390,12 +551,15 @@ func NewMCPServerStreamableHTTP(params MCPServerStreamableHTTPParams) *MCPServer
 	transport := &mcp.StreamableClientTransport{
 		Endpoint: params.URL,
 	}
-	if params.TransportOpts != nil && params.TransportOpts.HTTPClient != nil {
+	if params.TransportOpts != nil {
 		transport = &mcp.StreamableClientTransport{
 			Endpoint:   params.URL,
 			HTTPClient: params.TransportOpts.HTTPClient,
 			MaxRetries: params.TransportOpts.MaxRetries,
 		}
+	}
+	if transport.HTTPClient == nil && params.HTTPClientFactory != nil {
+		transport.HTTPClient = params.HTTPClientFactory()
 	}
 	return &MCPServerStreamableHTTP{
 		MCPServerWithClientSession: NewMCPServerWithClientSession(MCPServerWithClientSessionParams{
@@ -404,6 +568,9 @@ func NewMCPServerStreamableHTTP(params MCPServerStreamableHTTPParams) *MCPServer
 			CacheToolsList:       params.CacheToolsList,
 			ToolFilter:           params.ToolFilter,
 			UseStructuredContent: params.UseStructuredContent,
+			ClientOptions:        params.ClientOptions,
+			MaxRetryAttempts:     params.MaxRetryAttempts,
+			RetryBackoffBase:     params.RetryBackoffBase,
 		}),
 	}
 }

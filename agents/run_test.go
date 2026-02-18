@@ -46,6 +46,19 @@ func Test_runner_getModel(t *testing.T) {
 		assert.IsType(t, OpenAIResponsesModel{}, model)
 		assert.Equal(t, "gpt-4o", model.(OpenAIResponsesModel).Model)
 	})
+
+	t.Run("LiteLLM prefix", func(t *testing.T) {
+		agent := &Agent{
+			Name:  "test",
+			Model: param.NewOpt(NewAgentModelName("litellm/foo/bar")),
+		}
+		model, err := Runner{}.getModel(agent, RunConfig{})
+		assert.NoError(t, err)
+		chatModel, ok := model.(OpenAIChatCompletionsModel)
+		assert.True(t, ok)
+		assert.Equal(t, "foo/bar", string(chatModel.Model))
+		assert.Equal(t, "litellm", chatModel.modelImpl)
+	})
 }
 
 type panicModel struct{}
@@ -87,4 +100,3 @@ func TestStreamHandlesPanicInModel(t *testing.T) {
 		t.Fatal("Stream blocked forever - panic was not properly handled")
 	}
 }
-

@@ -64,6 +64,25 @@ func (h chatCmplHelpers) GetStreamOptionsParam(
 	return options
 }
 
+func (chatCmplHelpers) GetChatCompletionsHeaders(modelSettings modelsettings.ModelSettings) map[string]string {
+	headers := map[string]string{
+		"User-Agent": DefaultUserAgent(),
+	}
+	for k, v := range modelSettings.ExtraHeaders {
+		headers[k] = v
+	}
+	if override := HeadersOverride.Get(); len(override) > 0 {
+		for k, v := range override {
+			headers[k] = v
+		}
+	}
+	return headers
+}
+
+func (h chatCmplHelpers) GetLiteLLMHeaders(modelSettings modelsettings.ModelSettings) map[string]string {
+	return h.GetChatCompletionsHeaders(modelSettings)
+}
+
 // CleanGeminiToolCallID removes LiteLLM's "__thought__" suffix from Gemini tool call IDs.
 func (chatCmplHelpers) CleanGeminiToolCallID(toolCallID string, model string) string {
 	if strings.Contains(strings.ToLower(model), "gemini") && strings.Contains(toolCallID, "__thought__") {

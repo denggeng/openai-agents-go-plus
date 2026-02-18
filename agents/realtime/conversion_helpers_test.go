@@ -187,6 +187,28 @@ func TestConvertTracingConfigMap(t *testing.T) {
 	assert.Equal(t, map[string]any{"env": "test"}, result.OfTracingConfiguration.Metadata)
 }
 
+func TestConvertTracingConfigMapPartial(t *testing.T) {
+	result := ConvertTracingConfig(map[string]any{
+		"group_id": "test-group",
+	})
+	require.NotNil(t, result)
+	require.NotNil(t, result.OfTracingConfiguration)
+
+	assert.True(t, result.OfTracingConfiguration.GroupID.Valid())
+	assert.Equal(t, "test-group", result.OfTracingConfiguration.GroupID.Value)
+	assert.Nil(t, result.OfTracingConfiguration.Metadata)
+	assert.False(t, result.OfTracingConfiguration.WorkflowName.Valid())
+}
+
+func TestConvertTracingConfigMapEmpty(t *testing.T) {
+	result := ConvertTracingConfig(map[string]any{})
+	require.NotNil(t, result)
+	require.NotNil(t, result.OfTracingConfiguration)
+	assert.False(t, result.OfTracingConfiguration.GroupID.Valid())
+	assert.Nil(t, result.OfTracingConfiguration.Metadata)
+	assert.False(t, result.OfTracingConfiguration.WorkflowName.Valid())
+}
+
 func TestConvertUserInputToConversationItemString(t *testing.T) {
 	event := RealtimeModelSendUserInput{UserInput: "Hello, world!"}
 
@@ -389,4 +411,20 @@ func TestConvertInterruptZeroTime(t *testing.T) {
 	assert.Equal(t, "item_1", result["item_id"])
 	assert.Equal(t, 0, result["content_index"])
 	assert.Equal(t, 0, result["audio_end_ms"])
+}
+
+func TestConvertInterruptLargeValues(t *testing.T) {
+	result := ConvertInterrupt("item_xyz", 99, 999999)
+	assert.Equal(t, "conversation.item.truncate", result["type"])
+	assert.Equal(t, "item_xyz", result["item_id"])
+	assert.Equal(t, 99, result["content_index"])
+	assert.Equal(t, 999999, result["audio_end_ms"])
+}
+
+func TestConvertInterruptEmptyItemID(t *testing.T) {
+	result := ConvertInterrupt("", 1, 100)
+	assert.Equal(t, "conversation.item.truncate", result["type"])
+	assert.Equal(t, "", result["item_id"])
+	assert.Equal(t, 1, result["content_index"])
+	assert.Equal(t, 100, result["audio_end_ms"])
 }

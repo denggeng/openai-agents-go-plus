@@ -67,6 +67,44 @@ func TestRunContextAlwaysApproveAndReject(t *testing.T) {
 	assert.False(t, approved)
 }
 
+func TestRunContextScopesApprovalsToCallIDs(t *testing.T) {
+	ctx := agents.NewRunContextWrapper[any](nil)
+	approvalItem := agents.ToolApprovalItem{
+		RawItem: map[string]any{
+			"type":    "tool_call",
+			"call_id": "call-1",
+		},
+	}
+
+	ctx.ApproveTool(approvalItem, false)
+	approved, known := ctx.IsToolApproved("tool_call", "call-1")
+	require.True(t, known)
+	assert.True(t, approved)
+
+	approved, known = ctx.IsToolApproved("tool_call", "call-2")
+	assert.False(t, known)
+	assert.False(t, approved)
+}
+
+func TestRunContextScopesRejectionsToCallIDs(t *testing.T) {
+	ctx := agents.NewRunContextWrapper[any](nil)
+	approvalItem := agents.ToolApprovalItem{
+		RawItem: map[string]any{
+			"type":    "tool_call",
+			"call_id": "call-1",
+		},
+	}
+
+	ctx.RejectTool(approvalItem, false)
+	approved, known := ctx.IsToolApproved("tool_call", "call-1")
+	require.True(t, known)
+	assert.False(t, approved)
+
+	approved, known = ctx.IsToolApproved("tool_call", "call-2")
+	assert.False(t, known)
+	assert.False(t, approved)
+}
+
 func TestRunContextResolveToolNameAndCallIDFromRawItem(t *testing.T) {
 	ctx := agents.NewRunContextWrapper[any](nil)
 

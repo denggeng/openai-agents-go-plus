@@ -14,7 +14,6 @@
 
 package agents
 
-// FakeResponsesID is a placeholder ID used to fill in the `id` field in Responses API related objects.
-// It's useful when you're creating Responses objects from non-Responses APIs, e.g. the OpenAI Chat
-// Completions API or other LLM providers.
+// FakeResponsesID is a placeholder ID used to fill in Responses API objects when
+// building them from non-Responses providers.
 const FakeResponsesID = "__fake_id__"

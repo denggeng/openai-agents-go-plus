@@ -22,6 +22,14 @@ import (
 	"github.com/denggeng/openai-agents-go-plus/agents"
 )
 
+var (
+	removeAll    = os.RemoveAll
+	encodeSchema = func(file *os.File, schema any) error {
+		encoder := json.NewEncoder(file)
+		return encoder.Encode(schema)
+	}
+)
+
 // OutputSchemaFile stores the optional schema file path and cleanup callback.
 type OutputSchemaFile struct {
 	SchemaPath *string
@@ -56,7 +64,7 @@ func CreateOutputSchemaFile(schema any) (OutputSchemaFile, error) {
 	schemaPath := filepath.Join(schemaDir, "schema.json")
 
 	cleanup := func() {
-		_ = os.RemoveAll(schemaDir)
+		_ = removeAll(schemaDir)
 	}
 
 	file, err := os.Create(schemaPath)
@@ -64,8 +72,7 @@ func CreateOutputSchemaFile(schema any) (OutputSchemaFile, error) {
 		cleanup()
 		return OutputSchemaFile{}, err
 	}
-	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(schemaMap); err != nil {
+	if err := encodeSchema(file, schemaMap); err != nil {
 		_ = file.Close()
 		cleanup()
 		return OutputSchemaFile{}, err

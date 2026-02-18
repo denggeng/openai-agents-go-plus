@@ -402,6 +402,7 @@ func ResponseReasoningItemToParam(
 	out := responses.ResponseReasoningItemParam{
 		ID:               input.ID,
 		Summary:          ResponseReasoningItemSummarySliceToParams(input.Summary),
+		Content:          ResponseReasoningItemContentSliceToParams(input.Content),
 		Status:           input.Status,
 		EncryptedContent: encryptedContent,
 		Type:             constant.ValueOf[constant.Reasoning](),
@@ -445,6 +446,28 @@ func ResponseReasoningItemSummaryToParam(
 	return responses.ResponseReasoningItemSummaryParam{
 		Text: input.Text,
 		Type: constant.ValueOf[constant.SummaryText](),
+	}
+}
+
+func ResponseReasoningItemContentSliceToParams(
+	input []responses.ResponseReasoningItemContent,
+) []responses.ResponseReasoningItemContentParam {
+	if input == nil {
+		return nil
+	}
+	out := make([]responses.ResponseReasoningItemContentParam, len(input))
+	for i, item := range input {
+		out[i] = ResponseReasoningItemContentToParam(item)
+	}
+	return out
+}
+
+func ResponseReasoningItemContentToParam(
+	input responses.ResponseReasoningItemContent,
+) responses.ResponseReasoningItemContentParam {
+	return responses.ResponseReasoningItemContentParam{
+		Text: input.Text,
+		Type: constant.ValueOf[constant.ReasoningText](),
 	}
 }
 
@@ -532,12 +555,19 @@ func ResponseInputItemUnionParamFromResponseOutputItemUnion(
 			ResponseInputItemApplyPatchCallOutputParamFromResponseOutputItemUnion(input),
 		)
 	case "reasoning":
-		return ResponseInputItemUnionParamFromResponseReasoningItem(responses.ResponseReasoningItem{
+		reasoning := responses.ResponseReasoningItem{
 			ID:      input.ID,
 			Summary: input.Summary,
+			Content: responseReasoningItemContentFromOutputItemUnion(input),
 			Type:    constant.ValueOf[constant.Reasoning](),
 			Status:  responses.ResponseReasoningItemStatus(input.Status),
-		})
+		}
+		if input.EncryptedContent != "" {
+			reasoning.EncryptedContent = input.EncryptedContent
+		} else if encrypted := responseReasoningItemEncryptedContentFromOutputItemUnion(input); encrypted != "" {
+			reasoning.EncryptedContent = encrypted
+		}
+		return ResponseInputItemUnionParamFromResponseReasoningItem(reasoning)
 	case "compaction":
 		return ResponseInputItemUnionParamFromResponseCompactionItem(responses.ResponseCompactionItem{
 			ID:               input.ID,
@@ -547,6 +577,38 @@ func ResponseInputItemUnionParamFromResponseOutputItemUnion(
 	default:
 		panic(fmt.Errorf("unexpected ResponseOutputItemUnion type %q", input.Type))
 	}
+}
+
+func responseReasoningItemContentFromOutputItemUnion(
+	input responses.ResponseOutputItemUnion,
+) []responses.ResponseReasoningItemContent {
+	raw := input.RawJSON()
+	if raw == "" {
+		return nil
+	}
+	var payload struct {
+		Content []responses.ResponseReasoningItemContent `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil
+	}
+	return payload.Content
+}
+
+func responseReasoningItemEncryptedContentFromOutputItemUnion(
+	input responses.ResponseOutputItemUnion,
+) string {
+	raw := input.RawJSON()
+	if raw == "" {
+		return ""
+	}
+	var payload struct {
+		EncryptedContent string `json:"encrypted_content"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+	return payload.EncryptedContent
 }
 
 func ResponseInputItemUnionParamFromResponseFileSearchToolCall(

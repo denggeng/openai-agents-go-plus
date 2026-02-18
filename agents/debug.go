@@ -19,17 +19,28 @@ import (
 	"strings"
 )
 
-func debugFlagEnabled(flag string) bool {
+func debugFlagEnabled(flag string, defaultValue bool) bool {
 	v, ok := os.LookupEnv(flag)
-	return ok && (v == "1" || strings.ToLower(v) == "true")
+	if !ok {
+		return defaultValue
+	}
+	return v == "1" || strings.ToLower(v) == "true"
+}
+
+func loadDontLogModelData() bool {
+	return debugFlagEnabled("OPENAI_AGENTS_DONT_LOG_MODEL_DATA", true)
+}
+
+func loadDontLogToolData() bool {
+	return debugFlagEnabled("OPENAI_AGENTS_DONT_LOG_TOOL_DATA", true)
 }
 
 // DontLogModelData - By default we don't log LLM inputs/outputs, to prevent
 // exposing sensitive information. Set this flag to enable logging them.
 var (
-	DontLogModelData = debugFlagEnabled("OPENAI_AGENTS_DONT_LOG_MODEL_DATA")
+	DontLogModelData = loadDontLogModelData()
 
 	// DontLogToolData - By default we don't log tool call inputs/outputs, to
 	// prevent exposing sensitive information. Set this flag to enable logging them.
-	DontLogToolData = debugFlagEnabled("OPENAI_AGENTS_DONT_LOG_TOOL_DATA")
+	DontLogToolData = loadDontLogToolData()
 )

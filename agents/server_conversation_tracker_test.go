@@ -73,7 +73,7 @@ func (m *fakeModel) StreamResponse(
 }
 
 func TestServerConversationTrackerPrepareInputFiltersItemsSeenByServerAndToolCalls(t *testing.T) {
-	tracker := NewOpenAIServerConversationTracker("conv", "")
+	tracker := NewOpenAIServerConversationTracker("conv", "", false)
 
 	originalInput := []TResponseInputItem{
 		inputItemFromMap(t, map[string]any{"id": "input-1", "type": "message"}),
@@ -115,7 +115,7 @@ func TestServerConversationTrackerPrepareInputFiltersItemsSeenByServerAndToolCal
 }
 
 func TestServerConversationTrackerMarkInputAsSentAndRewindInputRespectsRemainingInitialInput(t *testing.T) {
-	tracker := NewOpenAIServerConversationTracker("conv2", "")
+	tracker := NewOpenAIServerConversationTracker("conv2", "", false)
 
 	pending1 := inputItemFromMap(t, map[string]any{"id": "p-1", "type": "message"})
 	pending2 := inputItemFromMap(t, map[string]any{"id": "p-2", "type": "message"})
@@ -133,7 +133,7 @@ func TestServerConversationTrackerMarkInputAsSentAndRewindInputRespectsRemaining
 }
 
 func TestServerConversationTrackerTrackServerItemsFiltersRemainingInitialInputByFingerprint(t *testing.T) {
-	tracker := NewOpenAIServerConversationTracker("conv3", "")
+	tracker := NewOpenAIServerConversationTracker("conv3", "", false)
 
 	pendingKept := inputItemFromMap(t, map[string]any{"id": "keep-me", "type": "message"})
 	pendingFiltered := inputItemFromMap(t, map[string]any{
@@ -161,7 +161,7 @@ func TestServerConversationTrackerTrackServerItemsFiltersRemainingInitialInputBy
 }
 
 func TestServerConversationTrackerPrepareInputDoesNotSkipFakeResponseIDs(t *testing.T) {
-	tracker := NewOpenAIServerConversationTracker("conv5", "")
+	tracker := NewOpenAIServerConversationTracker("conv5", "", false)
 
 	modelResponse := ModelResponse{
 		Output: []TResponseOutputItem{
@@ -187,7 +187,7 @@ func TestServerConversationTrackerGetNewResponseMarksFilteredInputAsSent(t *test
 	model.SetNextOutput([]TResponseOutputItem{textOutputMessage("ok")})
 	agent := New("test").WithModelInstance(model)
 
-	tracker := NewOpenAIServerConversationTracker("conv4", "")
+	tracker := NewOpenAIServerConversationTracker("conv4", "", false)
 	item1 := textInputItem("first")
 	item2 := textInputItem("second")
 
@@ -233,7 +233,7 @@ func TestServerConversationTrackerRunSingleTurnStreamedMarksFilteredInputAsSent(
 	model.SetNextOutput([]TResponseOutputItem{textOutputMessage("ok")})
 	agent := New("test").WithModelInstance(model)
 
-	tracker := NewOpenAIServerConversationTracker("conv6", "")
+	tracker := NewOpenAIServerConversationTracker("conv6", "", false)
 	item1 := textInputItem("first")
 	item2 := textInputItem("second")
 

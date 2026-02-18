@@ -35,6 +35,8 @@ type StreamingState struct {
 	FunctionCalls                map[int64]*responses.ResponseOutputItemUnion // responses.ResponseFunctionToolCall
 	BaseProviderData             map[string]any
 	FunctionCallProviderData     map[int64]map[string]any
+	FunctionCallOutputIndex      map[int64]int64
+	FunctionCallAdded            map[int64]bool
 }
 
 func NewStreamingState() StreamingState {
@@ -45,6 +47,8 @@ func NewStreamingState() StreamingState {
 		FunctionCalls:                make(map[int64]*responses.ResponseOutputItemUnion), // responses.ResponseFunctionToolCall
 		BaseProviderData:             make(map[string]any),
 		FunctionCallProviderData:     make(map[int64]map[string]any),
+		FunctionCallOutputIndex:      make(map[int64]int64),
+		FunctionCallAdded:            make(map[int64]bool),
 	}
 }
 
@@ -75,6 +79,7 @@ func ChatCmplStreamHandler() chatCmplStreamHandler { return chatCmplStreamHandle
 func (chatCmplStreamHandler) HandleStream(
 	response responses.Response,
 	stream *ssestream.Stream[openai.ChatCompletionChunk],
+	emitToolCallDeltas bool,
 	yield func(TResponseStreamEvent) error,
 ) (err error) {
 	defer func() {
@@ -245,7 +250,7 @@ func (chatCmplStreamHandler) HandleStream(
 
 		// Handle tool calls
 		// Because we don't know the name of the function until the end of the stream, we'll
-		// save everything and yield events at the end
+		// save everything and yield events at the end (unless emitting tool call deltas).
 		for _, tcDelta := range delta.ToolCalls {
 			tc, ok := state.FunctionCalls[tcDelta.Index]
 			if !ok {
@@ -272,6 +277,56 @@ func (chatCmplStreamHandler) HandleStream(
 				}
 				providerData["thought_signature"] = thoughtSignature
 				state.FunctionCallProviderData[tcDelta.Index] = providerData
+			}
+
+			if emitToolCallDeltas {
+				if !state.FunctionCallAdded[tcDelta.Index] {
+					functionCallIndex := int64(0)
+					if state.TextContentIndexAndOutput != nil {
+						functionCallIndex += 1
+					}
+					if state.RefusalContentIndexAndOutput != nil {
+						functionCallIndex += 1
+					}
+					state.FunctionCallOutputIndex[tcDelta.Index] = functionCallIndex
+
+					functionCallItem := responses.ResponseOutputItemUnion{
+						ID:        FakeResponsesID,
+						CallID:    tc.CallID,
+						Arguments: "",
+						Name:      tc.Name,
+						Type:      "function_call",
+					}
+					if providerData := state.FunctionCallProviderData[tcDelta.Index]; len(providerData) > 0 {
+						withProviderData, providerDataErr := responseOutputItemWithProviderData(functionCallItem, providerData)
+						if providerDataErr != nil {
+							return fmt.Errorf("failed to encode function call provider_data: %w", providerDataErr)
+						}
+						functionCallItem = withProviderData
+					}
+					if err = yield(TResponseStreamEvent{
+						Item:           functionCallItem,
+						OutputIndex:    functionCallIndex,
+						Type:           "response.output_item.added",
+						SequenceNumber: sequenceNumber.GetAndIncrement(),
+					}); err != nil {
+						return err
+					}
+					state.FunctionCallAdded[tcDelta.Index] = true
+				}
+
+				if tcFunction.Arguments != "" {
+					functionCallIndex := state.FunctionCallOutputIndex[tcDelta.Index]
+					if err = yield(TResponseStreamEvent{
+						Delta:          tcFunction.Arguments,
+						ItemID:         FakeResponsesID,
+						OutputIndex:    functionCallIndex,
+						Type:           "response.function_call_arguments.delta",
+						SequenceNumber: sequenceNumber.GetAndIncrement(),
+					}); err != nil {
+						return err
+					}
+				}
 			}
 		}
 	}
@@ -327,29 +382,37 @@ func (chatCmplStreamHandler) HandleStream(
 			}
 			functionCallItem = withProviderData
 		}
-		// First, a ResponseOutputItemAdded for the function call
-		if err = yield(TResponseStreamEvent{ // responses.ResponseOutputItemAddedEvent
-			Item:           functionCallItem,
-			OutputIndex:    functionCallStartingIndex,
-			Type:           "response.output_item.added",
-			SequenceNumber: sequenceNumber.GetAndIncrement(),
-		}); err != nil {
-			return err
+
+		outputIndex := functionCallStartingIndex
+		if emitToolCallDeltas && state.FunctionCallAdded[idx] {
+			outputIndex = state.FunctionCallOutputIndex[idx]
 		}
-		// Then, yield the args
-		if err = yield(TResponseStreamEvent{ // responses.ResponseFunctionCallArgumentsDeltaEvent
-			Delta:          functionCall.Arguments,
-			ItemID:         FakeResponsesID,
-			OutputIndex:    functionCallStartingIndex,
-			Type:           "response.function_call_arguments.delta",
-			SequenceNumber: sequenceNumber.GetAndIncrement(),
-		}); err != nil {
-			return err
+
+		if !(emitToolCallDeltas && state.FunctionCallAdded[idx]) {
+			// First, a ResponseOutputItemAdded for the function call
+			if err = yield(TResponseStreamEvent{ // responses.ResponseOutputItemAddedEvent
+				Item:           functionCallItem,
+				OutputIndex:    outputIndex,
+				Type:           "response.output_item.added",
+				SequenceNumber: sequenceNumber.GetAndIncrement(),
+			}); err != nil {
+				return err
+			}
+			// Then, yield the args
+			if err = yield(TResponseStreamEvent{ // responses.ResponseFunctionCallArgumentsDeltaEvent
+				Delta:          functionCall.Arguments,
+				ItemID:         FakeResponsesID,
+				OutputIndex:    outputIndex,
+				Type:           "response.function_call_arguments.delta",
+				SequenceNumber: sequenceNumber.GetAndIncrement(),
+			}); err != nil {
+				return err
+			}
 		}
 		// Finally, the ResponseOutputItemDone
 		if err = yield(TResponseStreamEvent{ // responses.ResponseOutputItemDoneEvent
 			Item:           functionCallItem,
-			OutputIndex:    functionCallStartingIndex,
+			OutputIndex:    outputIndex,
 			Type:           "response.output_item.done",
 			SequenceNumber: sequenceNumber.GetAndIncrement(),
 		}); err != nil {

@@ -31,7 +31,9 @@ type FakeModel struct {
 	TracingEnabled bool
 	TurnOutputs    []FakeModelTurnOutput
 	LastTurnArgs   FakeModelLastTurnArgs
+	FirstTurnArgs  *FakeModelLastTurnArgs
 	HardcodedUsage *usage.Usage
+	ResponseID     string
 }
 
 type FakeModelTurnOutput struct {
@@ -47,6 +49,7 @@ type FakeModelLastTurnArgs struct {
 	OutputType         agents.OutputTypeInterface
 	// optional
 	PreviousResponseID string
+	ConversationID     string
 }
 
 func NewFakeModel(tracingEnabled bool, initialOutput *FakeModelTurnOutput) *FakeModel {
@@ -90,6 +93,11 @@ func (m *FakeModel) GetResponse(ctx context.Context, params agents.ModelResponse
 		Tools:              params.Tools,
 		OutputType:         params.OutputType,
 		PreviousResponseID: params.PreviousResponseID,
+		ConversationID:     params.ConversationID,
+	}
+	if m.FirstTurnArgs == nil {
+		first := m.LastTurnArgs
+		m.FirstTurnArgs = &first
 	}
 
 	var modelResponse *agents.ModelResponse
@@ -114,10 +122,11 @@ func (m *FakeModel) GetResponse(ctx context.Context, params agents.ModelResponse
 				u = usage.NewUsage()
 			}
 
+			responseID := m.ResponseID
 			modelResponse = &agents.ModelResponse{
 				Output:     output.Value,
 				Usage:      u,
-				ResponseID: "",
+				ResponseID: responseID,
 			}
 			return nil
 		},
@@ -140,6 +149,11 @@ func (m *FakeModel) StreamResponse(
 		Tools:              params.Tools,
 		OutputType:         params.OutputType,
 		PreviousResponseID: params.PreviousResponseID,
+		ConversationID:     params.ConversationID,
+	}
+	if m.FirstTurnArgs == nil {
+		first := m.LastTurnArgs
+		m.FirstTurnArgs = &first
 	}
 
 	return tracing.GenerationSpan(
@@ -158,8 +172,9 @@ func (m *FakeModel) StreamResponse(
 				return err
 			}
 
+			responseID := m.ResponseID
 			return yield(ctx, agents.TResponseStreamEvent{ // responses.ResponseCompletedEvent
-				Response:       GetResponseObj(output.Value, "", m.HardcodedUsage),
+				Response:       GetResponseObj(output.Value, responseID, m.HardcodedUsage),
 				Type:           "response.completed",
 				SequenceNumber: 0,
 			})

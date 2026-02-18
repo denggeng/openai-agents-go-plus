@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,15 @@ type RunResult struct {
 
 	// The LastAgent that was run.
 	LastAgent *Agent
+
+	// Conversation identifier for server-managed runs.
+	ConversationID string
+
+	// Response identifier returned by the server for the last turn.
+	PreviousResponseID string
+
+	// Whether automatic previous response tracking was enabled.
+	AutoPreviousResponseID bool
 }
 
 func (r RunResult) String() string {
@@ -73,6 +83,29 @@ func (r RunResult) ToInputList() []TResponseInputItem {
 // LastResponseID is a convenience method to get the response ID of the last model response.
 func (r RunResult) LastResponseID() string {
 	return lastResponseID(r.RawResponses)
+}
+
+// FinalOutputAs stores the final output into target if the types are compatible.
+// The target must be a non-nil pointer. When raiseIfIncorrectType is false,
+// mismatched types are ignored and target is left untouched.
+func (r RunResult) FinalOutputAs(target any, raiseIfIncorrectType bool) error {
+	return assignFinalOutput(r.FinalOutput, target, raiseIfIncorrectType)
+}
+
+// ReleaseAgents clears stored agent references on the result and its run items.
+// When releaseNewItems is false, only the last agent reference is released.
+func (r *RunResult) ReleaseAgents(releaseNewItems ...bool) {
+	if r == nil {
+		return
+	}
+	releaseItems := true
+	if len(releaseNewItems) > 0 {
+		releaseItems = releaseNewItems[0]
+	}
+	if releaseItems {
+		releaseRunItemAgents(r.NewItems)
+	}
+	r.LastAgent = nil
 }
 
 // RunResultStreaming is the result of an agent run in streaming mode.
@@ -104,6 +137,9 @@ type RunResultStreaming struct {
 	inputGuardrailsTask        *atomic.Pointer[asynctask.TaskNoValue]
 	outputGuardrailsTask       *atomic.Pointer[asynctask.Task[[]OutputGuardrailResult]]
 	storedError                *atomic.Pointer[error]
+	conversationID             *atomic.Pointer[string]
+	previousResponseID         *atomic.Pointer[string]
+	autoPreviousResponseID     *atomic.Bool
 }
 
 func newRunResultStreaming(ctx context.Context) *RunResultStreaming {
@@ -130,6 +166,9 @@ func newRunResultStreaming(ctx context.Context) *RunResultStreaming {
 		inputGuardrailsTask:        new(atomic.Pointer[asynctask.TaskNoValue]),
 		outputGuardrailsTask:       new(atomic.Pointer[asynctask.Task[[]OutputGuardrailResult]]),
 		storedError:                newZeroValAtomicPointer[error](),
+		conversationID:             newZeroValAtomicPointer[string](),
+		previousResponseID:         newZeroValAtomicPointer[string](),
+		autoPreviousResponseID:     new(atomic.Bool),
 	}
 }
 
@@ -155,6 +194,17 @@ func (r *RunResultStreaming) RawResponses() []ModelResponse     { return *r.rawR
 func (r *RunResultStreaming) setRawResponses(v []ModelResponse) { r.rawResponses.Store(&v) }
 func (r *RunResultStreaming) appendRawResponses(v ...ModelResponse) {
 	r.setRawResponses(append(r.RawResponses(), v...))
+}
+
+func (r *RunResultStreaming) ConversationID() string     { return *r.conversationID.Load() }
+func (r *RunResultStreaming) setConversationID(v string) { r.conversationID.Store(&v) }
+
+func (r *RunResultStreaming) PreviousResponseID() string     { return *r.previousResponseID.Load() }
+func (r *RunResultStreaming) setPreviousResponseID(v string) { r.previousResponseID.Store(&v) }
+
+func (r *RunResultStreaming) AutoPreviousResponseID() bool { return r.autoPreviousResponseID.Load() }
+func (r *RunResultStreaming) setAutoPreviousResponseID(v bool) {
+	r.autoPreviousResponseID.Store(v)
 }
 
 // FinalOutput returns the output of the last agent.
@@ -282,6 +332,36 @@ func (r *RunResultStreaming) ToInputList() []TResponseInputItem {
 // LastResponseID is a convenience method to get the response ID of the last model response.
 func (r *RunResultStreaming) LastResponseID() string {
 	return lastResponseID(r.RawResponses())
+}
+
+// FinalOutputAs stores the streaming final output into target if the types are compatible.
+// The target must be a non-nil pointer. When raiseIfIncorrectType is false,
+// mismatched types are ignored and target is left untouched.
+func (r *RunResultStreaming) FinalOutputAs(target any, raiseIfIncorrectType bool) error {
+	if r == nil {
+		return assignFinalOutput(nil, target, raiseIfIncorrectType)
+	}
+	return assignFinalOutput(r.FinalOutput(), target, raiseIfIncorrectType)
+}
+
+// ReleaseAgents clears stored agent references on the streaming result.
+// When releaseNewItems is false, only the current agent reference is released.
+func (r *RunResultStreaming) ReleaseAgents(releaseNewItems ...bool) {
+	if r == nil {
+		return
+	}
+	releaseItems := true
+	if len(releaseNewItems) > 0 {
+		releaseItems = releaseNewItems[0]
+	}
+	if releaseItems {
+		items := r.NewItems()
+		if len(items) > 0 {
+			releaseRunItemAgents(items)
+			r.setNewItems(items)
+		}
+	}
+	r.currentAgent.Store(nil)
 }
 
 // The LastAgent that was run.
@@ -483,4 +563,109 @@ func lastResponseID(rawResponses []ModelResponse) string {
 		return ""
 	}
 	return rawResponses[len(rawResponses)-1].ResponseID
+}
+
+func assignFinalOutput(value any, target any, raiseIfIncorrectType bool) error {
+	if target == nil {
+		return fmt.Errorf("target must be a non-nil pointer")
+	}
+	targetValue := reflect.ValueOf(target)
+	if targetValue.Kind() != reflect.Pointer || targetValue.IsNil() {
+		return fmt.Errorf("target must be a non-nil pointer")
+	}
+	if value == nil {
+		if raiseIfIncorrectType {
+			return fmt.Errorf("final output is not of type %s", targetValue.Elem().Type())
+		}
+		return nil
+	}
+	sourceValue := reflect.ValueOf(value)
+	if sourceValue.Type().AssignableTo(targetValue.Elem().Type()) {
+		targetValue.Elem().Set(sourceValue)
+		return nil
+	}
+	if raiseIfIncorrectType {
+		return fmt.Errorf("final output is not of type %s", targetValue.Elem().Type())
+	}
+	return nil
+}
+
+func releaseRunItemAgents(items []RunItem) {
+	if len(items) == 0 {
+		return
+	}
+	for i, item := range items {
+		items[i] = releaseRunItemAgent(item)
+	}
+}
+
+func releaseRunItemAgent(item RunItem) RunItem {
+	switch v := item.(type) {
+	case MessageOutputItem:
+		v.Agent = nil
+		return v
+	case *MessageOutputItem:
+		v.Agent = nil
+		return v
+	case HandoffCallItem:
+		v.Agent = nil
+		return v
+	case *HandoffCallItem:
+		v.Agent = nil
+		return v
+	case HandoffOutputItem:
+		v.Agent = nil
+		v.SourceAgent = nil
+		v.TargetAgent = nil
+		return v
+	case *HandoffOutputItem:
+		v.Agent = nil
+		v.SourceAgent = nil
+		v.TargetAgent = nil
+		return v
+	case ToolCallItem:
+		v.Agent = nil
+		return v
+	case *ToolCallItem:
+		v.Agent = nil
+		return v
+	case ToolCallOutputItem:
+		v.Agent = nil
+		return v
+	case *ToolCallOutputItem:
+		v.Agent = nil
+		return v
+	case ReasoningItem:
+		v.Agent = nil
+		return v
+	case *ReasoningItem:
+		v.Agent = nil
+		return v
+	case CompactionItem:
+		v.Agent = nil
+		return v
+	case *CompactionItem:
+		v.Agent = nil
+		return v
+	case MCPListToolsItem:
+		v.Agent = nil
+		return v
+	case *MCPListToolsItem:
+		v.Agent = nil
+		return v
+	case MCPApprovalRequestItem:
+		v.Agent = nil
+		return v
+	case *MCPApprovalRequestItem:
+		v.Agent = nil
+		return v
+	case MCPApprovalResponseItem:
+		v.Agent = nil
+		return v
+	case *MCPApprovalResponseItem:
+		v.Agent = nil
+		return v
+	default:
+		return item
+	}
 }

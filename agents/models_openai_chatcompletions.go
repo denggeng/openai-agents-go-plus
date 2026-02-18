@@ -227,7 +227,7 @@ func (m OpenAIChatCompletionsModel) StreamResponse(
 			}
 
 			var finalResponse *responses.Response
-			err = ChatCmplStreamHandler().HandleStream(response, stream, func(chunk TResponseStreamEvent) error {
+			err = ChatCmplStreamHandler().HandleStream(response, stream, m.modelImpl == "litellm", func(chunk TResponseStreamEvent) error {
 				if chunk.Type == "response.completed" {
 					finalResponse = &chunk.Response
 				}
@@ -365,6 +365,11 @@ func (m OpenAIChatCompletionsModel) prepareRequest(
 
 	streamOptions := ChatCmplHelpers().GetStreamOptionsParam(m.client, modelSettings, stream)
 
+	reasoningEffort := modelSettings.Reasoning.Effort
+	if m.modelImpl == "litellm" && litellmReasoningSummaryValue(modelSettings) != "" {
+		reasoningEffort = ""
+	}
+
 	params := &openai.ChatCompletionNewParams{
 		Model:             m.Model,
 		Messages:          convertedMessages,
@@ -379,20 +384,31 @@ func (m OpenAIChatCompletionsModel) prepareRequest(
 		ParallelToolCalls: parallelToolCalls,
 		StreamOptions:     streamOptions,
 		Store:             store,
-		ReasoningEffort:   modelSettings.Reasoning.Effort,
+		ReasoningEffort:   reasoningEffort,
 		Verbosity:         openai.ChatCompletionNewParamsVerbosity(modelSettings.Verbosity.Or("")),
 		TopLogprobs:       modelSettings.TopLogprobs,
 		Metadata:          modelSettings.Metadata,
 	}
 
 	var opts []option.RequestOption
-	for k, v := range modelSettings.ExtraHeaders {
+	var headers map[string]string
+	if m.modelImpl == "litellm" {
+		headers = ChatCmplHelpers().GetLiteLLMHeaders(modelSettings)
+	} else {
+		headers = ChatCmplHelpers().GetChatCompletionsHeaders(modelSettings)
+	}
+	for k, v := range headers {
 		opts = append(opts, option.WithHeader(k, v))
 	}
 	for k, v := range modelSettings.ExtraQuery {
 		opts = append(opts, option.WithQuery(k, v))
 	}
-	for k, v := range mergedModelExtraJSON(modelSettings) {
+	extraJSON := mergedModelExtraJSON(modelSettings)
+	if m.modelImpl == "litellm" {
+		extraJSON = litellmExtraJSON(modelSettings)
+	}
+
+	for k, v := range extraJSON {
 		opts = append(opts, option.WithJSONSet(k, v))
 	}
 

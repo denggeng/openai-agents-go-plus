@@ -15,7 +15,6 @@
 package agents
 
 import (
-	"encoding/json"
 	"fmt"
 	"slices"
 
@@ -74,22 +73,35 @@ type RunState struct {
 	CurrentAgentName              string `json:"current_agent_name,omitempty"`
 	CurrentTurnPersistedItemCount uint64 `json:"current_turn_persisted_item_count,omitempty"`
 
-	OriginalInput  []TResponseInputItem `json:"original_input,omitempty"`
-	GeneratedItems []TResponseInputItem `json:"generated_items,omitempty"`
-	ModelResponses []ModelResponse      `json:"model_responses,omitempty"`
+	OriginalInput         []TResponseInputItem `json:"original_input,omitempty"`
+	GeneratedItems        []TResponseInputItem `json:"generated_items,omitempty"`
+	ModelResponses        []ModelResponse      `json:"model_responses,omitempty"`
+	GeneratedRunItems     []RunItem            `json:"-"`
+	SessionItems          []RunItem            `json:"-"`
+	LastProcessedResponse *ProcessedResponse   `json:"-"`
 
-	PreviousResponseID string             `json:"previous_response_id,omitempty"`
-	Interruptions      []ToolApprovalItem `json:"interruptions,omitempty"`
+	PreviousResponseID string                    `json:"previous_response_id,omitempty"`
+	Interruptions      []ToolApprovalItem        `json:"interruptions,omitempty"`
+	CurrentStep        *RunStateCurrentStepState `json:"current_step,omitempty"`
 
 	InputGuardrailResults      []GuardrailResultState             `json:"input_guardrail_results,omitempty"`
 	OutputGuardrailResults     []GuardrailResultState             `json:"output_guardrail_results,omitempty"`
 	ToolInputGuardrailResults  []ToolGuardrailResultState         `json:"tool_input_guardrail_results,omitempty"`
 	ToolOutputGuardrailResults []ToolGuardrailResultState         `json:"tool_output_guardrail_results,omitempty"`
 	ToolApprovals              map[string]ToolApprovalRecordState `json:"tool_approvals,omitempty"`
+	Context                    *RunStateContextState              `json:"context,omitempty"`
+	ToolUseTracker             map[string][]string                `json:"tool_use_tracker,omitempty"`
+	ConversationID             string                             `json:"conversation_id,omitempty"`
+	AutoPreviousResponseID     bool                               `json:"auto_previous_response_id,omitempty"`
+	Trace                      *TraceState                        `json:"trace,omitempty"`
 }
 
 // NewRunStateFromResult builds a serializable RunState from a completed RunResult.
 func NewRunStateFromResult(result RunResult, currentTurn uint64, maxTurns uint64) RunState {
+	previousResponseID := result.PreviousResponseID
+	if previousResponseID == "" {
+		previousResponseID = result.LastResponseID()
+	}
 	return RunState{
 		SchemaVersion:              CurrentRunStateSchemaVersion,
 		CurrentTurn:                currentTurn,
@@ -97,8 +109,11 @@ func NewRunStateFromResult(result RunResult, currentTurn uint64, maxTurns uint64
 		CurrentAgentName:           displayAgentName(result.LastAgent),
 		OriginalInput:              slices.Clone(ItemHelpers().InputToNewInputList(result.Input)),
 		GeneratedItems:             toInputList(InputItems{}, result.NewItems),
+		GeneratedRunItems:          slices.Clone(result.NewItems),
 		ModelResponses:             slices.Clone(result.RawResponses),
-		PreviousResponseID:         result.LastResponseID(),
+		PreviousResponseID:         previousResponseID,
+		ConversationID:             result.ConversationID,
+		AutoPreviousResponseID:     result.AutoPreviousResponseID,
 		Interruptions:              slices.Clone(result.Interruptions),
 		InputGuardrailResults:      guardrailResultStatesFromInput(result.InputGuardrailResults),
 		OutputGuardrailResults:     guardrailResultStatesFromOutput(result.OutputGuardrailResults),
@@ -113,6 +128,10 @@ func NewRunStateFromStreaming(result *RunResultStreaming) RunState {
 		return RunState{SchemaVersion: CurrentRunStateSchemaVersion}
 	}
 
+	previousResponseID := result.PreviousResponseID()
+	if previousResponseID == "" {
+		previousResponseID = result.LastResponseID()
+	}
 	return RunState{
 		SchemaVersion:              CurrentRunStateSchemaVersion,
 		CurrentTurn:                result.CurrentTurn(),
@@ -120,8 +139,11 @@ func NewRunStateFromStreaming(result *RunResultStreaming) RunState {
 		CurrentAgentName:           displayAgentName(result.LastAgent()),
 		OriginalInput:              slices.Clone(ItemHelpers().InputToNewInputList(result.Input())),
 		GeneratedItems:             toInputList(InputItems{}, result.NewItems()),
+		GeneratedRunItems:          slices.Clone(result.NewItems()),
 		ModelResponses:             slices.Clone(result.RawResponses()),
-		PreviousResponseID:         result.LastResponseID(),
+		PreviousResponseID:         previousResponseID,
+		ConversationID:             result.ConversationID(),
+		AutoPreviousResponseID:     result.AutoPreviousResponseID(),
 		Interruptions:              slices.Clone(result.Interruptions()),
 		InputGuardrailResults:      guardrailResultStatesFromInput(result.InputGuardrailResults()),
 		OutputGuardrailResults:     guardrailResultStatesFromOutput(result.OutputGuardrailResults()),
@@ -146,19 +168,12 @@ func (s RunState) Validate() error {
 
 // ToJSON encodes RunState to JSON bytes.
 func (s RunState) ToJSON() ([]byte, error) {
-	if err := s.Validate(); err != nil {
-		return nil, err
-	}
-	withDefaultVersion := s
-	if withDefaultVersion.SchemaVersion == "" {
-		withDefaultVersion.SchemaVersion = CurrentRunStateSchemaVersion
-	}
-	return json.Marshal(withDefaultVersion)
+	return s.ToJSONWithOptions(RunStateSerializeOptions{})
 }
 
 // ToJSONString encodes RunState to a JSON string.
 func (s RunState) ToJSONString() (string, error) {
-	b, err := s.ToJSON()
+	b, err := s.ToJSONWithOptions(RunStateSerializeOptions{})
 	if err != nil {
 		return "", err
 	}
@@ -167,22 +182,12 @@ func (s RunState) ToJSONString() (string, error) {
 
 // RunStateFromJSON decodes RunState from JSON bytes.
 func RunStateFromJSON(data []byte) (RunState, error) {
-	var state RunState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return RunState{}, err
-	}
-	if err := state.Validate(); err != nil {
-		return RunState{}, err
-	}
-	if state.SchemaVersion == "" {
-		state.SchemaVersion = CurrentRunStateSchemaVersion
-	}
-	return state, nil
+	return RunStateFromJSONWithOptions(data, RunStateDeserializeOptions{})
 }
 
 // RunStateFromJSONString decodes RunState from a JSON string.
 func RunStateFromJSONString(data string) (RunState, error) {
-	return RunStateFromJSON([]byte(data))
+	return RunStateFromJSONWithOptions([]byte(data), RunStateDeserializeOptions{})
 }
 
 // SetToolApprovalsFromContext snapshots approval state from context into RunState.
@@ -255,6 +260,12 @@ func (s RunState) ResumeRunConfig(base RunConfig) RunConfig {
 	cfg := base
 	if cfg.PreviousResponseID == "" && s.PreviousResponseID != "" {
 		cfg.PreviousResponseID = s.PreviousResponseID
+	}
+	if cfg.ConversationID == "" && s.ConversationID != "" {
+		cfg.ConversationID = s.ConversationID
+	}
+	if !cfg.AutoPreviousResponseID && s.AutoPreviousResponseID {
+		cfg.AutoPreviousResponseID = true
 	}
 	if cfg.MaxTurns == 0 && s.MaxTurns > 0 {
 		cfg.MaxTurns = s.MaxTurns

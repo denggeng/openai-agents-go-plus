@@ -40,10 +40,13 @@ func (queueCompleteSentinel) isStreamEvent() {}
 
 type AgentToolUseTracker struct {
 	AgentToTools []AgentToToolsItem
+	NameToTools  map[string][]string
 }
 
 func NewAgentToolUseTracker() *AgentToolUseTracker {
-	return &AgentToolUseTracker{}
+	return &AgentToolUseTracker{
+		NameToTools: make(map[string][]string),
+	}
 }
 
 type AgentToToolsItem struct {
@@ -56,6 +59,12 @@ func (item *AgentToToolsItem) AppendToolNames(toolNames []string) {
 }
 
 func (t *AgentToolUseTracker) AddToolUse(agent *Agent, toolNames []string) {
+	if agent != nil && agent.Name != "" {
+		if t.NameToTools == nil {
+			t.NameToTools = make(map[string][]string)
+		}
+		t.NameToTools[agent.Name] = append(t.NameToTools[agent.Name], toolNames...)
+	}
 	index := t.agentIndex(agent)
 	if index == -1 {
 		t.AgentToTools = append(t.AgentToTools, AgentToToolsItem{
@@ -69,13 +78,61 @@ func (t *AgentToolUseTracker) AddToolUse(agent *Agent, toolNames []string) {
 
 func (t *AgentToolUseTracker) HasUsedTools(agent *Agent) bool {
 	index := t.agentIndex(agent)
-	return index != -1 && len(t.AgentToTools[index].ToolNames) > 0
+	if index != -1 && len(t.AgentToTools[index].ToolNames) > 0 {
+		return true
+	}
+	if agent == nil || agent.Name == "" {
+		return false
+	}
+	if t.NameToTools == nil {
+		return false
+	}
+	return len(t.NameToTools[agent.Name]) > 0
 }
 
 func (t *AgentToolUseTracker) agentIndex(agent *Agent) int {
 	return slices.IndexFunc(t.AgentToTools, func(item AgentToToolsItem) bool {
 		return item.Agent == agent
 	})
+}
+
+// LoadSnapshot restores tool usage from a serialized snapshot keyed by agent name.
+func (t *AgentToolUseTracker) LoadSnapshot(snapshot map[string][]string) {
+	if t == nil || len(snapshot) == 0 {
+		return
+	}
+	if t.NameToTools == nil {
+		t.NameToTools = make(map[string][]string, len(snapshot))
+	}
+	for agentName, tools := range snapshot {
+		if agentName == "" {
+			continue
+		}
+		t.NameToTools[agentName] = append([]string(nil), tools...)
+	}
+}
+
+// Snapshot returns a copy of tool usage keyed by agent name.
+func (t *AgentToolUseTracker) Snapshot() map[string][]string {
+	if t == nil {
+		return map[string][]string{}
+	}
+	out := make(map[string][]string)
+	if t.NameToTools != nil {
+		for agentName, tools := range t.NameToTools {
+			out[agentName] = append([]string(nil), tools...)
+		}
+	}
+	for _, item := range t.AgentToTools {
+		if item.Agent == nil || item.Agent.Name == "" {
+			continue
+		}
+		if _, ok := out[item.Agent.Name]; ok {
+			continue
+		}
+		out[item.Agent.Name] = append([]string(nil), item.ToolNames...)
+	}
+	return out
 }
 
 type ToolRunHandoff struct {

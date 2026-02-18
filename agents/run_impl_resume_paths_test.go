@@ -194,6 +194,50 @@ func TestResumedApprovalDoesNotDuplicateSessionItems(t *testing.T) {
 	assert.Equal(t, 1, countSessionItems(items, "function_call_output", "call-resume"))
 }
 
+func TestResumedToolFinalOutputShortCircuit(t *testing.T) {
+	session := &simpleListSession{}
+	model := agentstesting.NewFakeModel(false, nil)
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{
+			Value: []agents.TResponseOutputItem{
+				{
+					ID:        "call-1",
+					CallID:    "call-1",
+					Name:      "test_tool",
+					Type:      "function_call",
+					Arguments: "{}",
+				},
+			},
+		},
+		{
+			Value: []agents.TResponseOutputItem{
+				agentstesting.GetTextMessage("should_not_run"),
+			},
+		},
+	})
+
+	tool := agentstesting.GetFunctionTool("test_tool", "done")
+	tool.NeedsApproval = agents.FunctionToolNeedsApprovalEnabled()
+
+	agent := agents.New("resume-agent").WithModelInstance(model).WithTools(tool)
+	agent.ToolUseBehavior = agents.StopOnFirstTool()
+	runner := agents.Runner{Config: agents.RunConfig{Session: session}}
+
+	first, err := runner.Run(t.Context(), agent, "Use test_tool")
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.NotEmpty(t, first.Interruptions)
+
+	state := agents.NewRunStateFromResult(*first, 1, 2)
+	require.NoError(t, state.ApproveTool(first.Interruptions[0]))
+
+	resumed, err := runner.RunFromState(t.Context(), agent, state)
+	require.NoError(t, err)
+	require.NotNil(t, resumed)
+	assert.Equal(t, "done", resumed.FinalOutput)
+	assert.Len(t, model.TurnOutputs, 1)
+}
+
 func countSessionItems(items []agents.TResponseInputItem, itemType, callID string) int {
 	count := 0
 	for _, item := range items {

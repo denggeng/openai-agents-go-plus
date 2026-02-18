@@ -98,9 +98,12 @@ func TestMCPServerWithClientSessionSession(t *testing.T) {
 		server := NewMCPServerStdio(MCPServerStdioParams{
 			Command: createMCPServerCommand(t),
 		})
+		agent := New("test_agent").WithInstructions("Test agent")
 		require.Nil(t, server.session)
 		err := server.Run(t.Context(), func(ctx context.Context, server *MCPServerWithClientSession) error {
 			require.NotNil(t, server.session)
+			_, err := server.ListTools(ctx, agent)
+			require.NoError(t, err)
 			return nil
 		})
 		require.NoError(t, err)
@@ -111,15 +114,21 @@ func TestMCPServerWithClientSessionSession(t *testing.T) {
 		server := NewMCPServerStdio(MCPServerStdioParams{
 			Command: createMCPServerCommand(t),
 		})
+		agent := New("test_agent").WithInstructions("Test agent")
 		ctx := t.Context()
 
 		require.Nil(t, server.session)
 
 		require.NoError(t, server.Connect(ctx))
 		require.NotNil(t, server.session)
+		_, err := server.ListTools(ctx, agent)
+		require.NoError(t, err)
 
 		require.NoError(t, server.Cleanup(ctx))
 		require.Nil(t, server.session)
+
+		_, err = server.ListTools(ctx, agent)
+		assert.ErrorAs(t, err, &UserError{})
 	})
 }
 
@@ -148,6 +157,20 @@ func TestMCPServerWithClientSessionErrors(t *testing.T) {
 		})
 		require.ErrorIs(t, err, testErr)
 		require.Nil(t, server.session)
+	})
+
+	t.Run("connect error triggers cleanup", func(t *testing.T) {
+		testErr := errors.New("error")
+		server := NewMCPServerWithClientSession(MCPServerWithClientSessionParams{
+			Name:      "test",
+			Transport: failingMCPTransport{err: testErr},
+		})
+		cleanupCalled := false
+		server.cleanupHook = func() { cleanupCalled = true }
+
+		err := server.Connect(t.Context())
+		require.Error(t, err)
+		assert.True(t, cleanupCalled)
 	})
 
 	t.Run("not calling Connect", func(t *testing.T) {

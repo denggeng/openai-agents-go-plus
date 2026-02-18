@@ -371,20 +371,34 @@ func coerceStringValue(value any) (string, bool) {
 		}
 		return v, true
 	case fmt.Stringer:
-		s := v.String()
-		if s == "" {
-			return "", false
+		if s, ok := safeStringer(v); ok && s != "" {
+			return s, true
 		}
-		return s, true
+		return "", false
 	}
 
-	rv := reflect.ValueOf(value)
-	if rv.Kind() == reflect.String {
-		s := rv.String()
-		if s == "" {
-			return "", false
-		}
+	if s, ok := safeSprint(value); ok && s != "" {
 		return s, true
 	}
 	return "", false
+}
+
+func safeStringer(value fmt.Stringer) (s string, ok bool) {
+	defer func() {
+		if recover() != nil {
+			s = ""
+			ok = false
+		}
+	}()
+	return value.String(), true
+}
+
+func safeSprint(value any) (s string, ok bool) {
+	defer func() {
+		if recover() != nil {
+			s = ""
+			ok = false
+		}
+	}()
+	return fmt.Sprint(value), true
 }

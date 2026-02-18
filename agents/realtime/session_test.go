@@ -15,7 +15,9 @@
 package realtime
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -97,6 +99,135 @@ func TestRealtimeSessionModelReturnsUnderlyingModel(t *testing.T) {
 	)
 
 	assert.Equal(t, model, session.Model())
+}
+
+func TestRealtimeSessionEventsStopOnClose(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{},
+	)
+
+	done := make(chan struct{})
+	go func() {
+		for range session.Events() {
+		}
+		close(done)
+	}()
+
+	require.NoError(t, session.Close(t.Context()))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("event loop did not stop after close")
+	}
+}
+
+func TestRealtimeSessionItemUpdatedLogsOnInvalidContentPart(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{},
+	)
+
+	session.history = []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "assistant",
+			"item_id": "a1",
+			"content": []any{
+				map[string]any{"type": "audio", "transcript": "t"},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	sessionLogger.SetOutput(&buf)
+	sessionLogger.SetFlags(0)
+	t.Cleanup(func() {
+		sessionLogger.SetOutput(io.Discard)
+	})
+
+	incoming := map[string]any{
+		"type":    "message",
+		"role":    "assistant",
+		"item_id": "a1",
+		"content": []any{struct{ Bad string }{Bad: "oops"}},
+	}
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelItemUpdatedEvent{Item: incoming}))
+	assert.NotEmpty(t, buf.String())
+}
+
+func TestRealtimeSessionHandoffWithoutTargetEmitsError(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{},
+	)
+
+	handoff := agents.Handoff{
+		ToolName:        "switch",
+		ToolDescription: "",
+		InputJSONSchema: map[string]any{},
+		OnInvokeHandoff: func(context.Context, string) (*agents.Agent, error) {
+			return nil, nil
+		},
+		AgentName: "",
+		IsEnabled: agents.HandoffEnabled(),
+	}
+
+	session.handleHandoffCall(
+		t.Context(),
+		RealtimeModelToolCallEvent{Name: "switch", CallID: "c1", Arguments: "{}"},
+		&RealtimeAgent[any]{Name: "agent"},
+		handoff,
+		nil,
+	)
+
+	event := <-session.Events()
+	errorEvent, ok := event.(RealtimeErrorEvent)
+	require.True(t, ok)
+	errMap, ok := errorEvent.Error.(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, errMap["message"], "returned no target agent")
+}
+
+func TestRealtimeSessionGuardrailErrorEmitsErrorEvent(t *testing.T) {
+	model := &mockRealtimeModel{}
+	guardrail := agents.OutputGuardrail{
+		Name: "boom",
+		GuardrailFunction: func(context.Context, *agents.Agent, any) (agents.GuardrailFunctionOutput, error) {
+			return agents.GuardrailFunctionOutput{}, assert.AnError
+		},
+	}
+
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent", OutputGuardrails: []agents.OutputGuardrail{guardrail}},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{},
+	)
+
+	session.runOutputGuardrails(t.Context(), "message", "")
+
+	event := <-session.Events()
+	errorEvent, ok := event.(RealtimeErrorEvent)
+	require.True(t, ok)
+	errMap, ok := errorEvent.Error.(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, errMap["message"], "output guardrail")
 }
 
 func TestRealtimeSessionEnterConnectsWithToolsAndHandoffs(t *testing.T) {
@@ -1595,6 +1726,17 @@ func TestRealtimeSessionTranscriptDeltaGuardrailPanicDoesNotCrashSession(t *test
 
 	time.Sleep(80 * time.Millisecond)
 	assert.Empty(t, model.sentEvents)
+	for {
+		select {
+		case event := <-session.Events():
+			if _, ok := event.(RealtimeErrorEvent); ok {
+				continue
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
 
 	// Session should still process subsequent events after guardrail panic.
 	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelTurnEndedEvent{}))

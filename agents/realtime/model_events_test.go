@@ -15,15 +15,12 @@
 package realtime
 
 import (
-	"errors"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestAllRealtimeModelEventsHaveType(t *testing.T) {
-	context := "context"
-
+func TestAllModelEventsHaveType(t *testing.T) {
 	events := []RealtimeModelEvent{
 		RealtimeModelErrorEvent{},
 		RealtimeModelToolCallEvent{},
@@ -39,12 +36,12 @@ func TestAllRealtimeModelEventsHaveType(t *testing.T) {
 		RealtimeModelTurnStartedEvent{},
 		RealtimeModelTurnEndedEvent{},
 		RealtimeModelOtherEvent{},
-		RealtimeModelExceptionEvent{Exception: errors.New("x"), Context: &context},
+		RealtimeModelExceptionEvent{},
 		RealtimeModelRawServerEvent{},
 	}
 
-	assert.NotEmpty(t, events)
+	require.NotEmpty(t, events)
 	for _, event := range events {
-		assert.NotEmpty(t, event.Type())
+		require.NotEmpty(t, event.Type())
 	}
 }

@@ -301,7 +301,7 @@ func TestPrepareRequestNonStream(t *testing.T) {
 	)
 
 	require.NoError(t, err)
-	assert.Nil(t, opts)
+	assert.Len(t, opts, 1)
 	assert.NotNil(t, params)
 
 	assert.Equal(t, "gpt-4", params.Model)

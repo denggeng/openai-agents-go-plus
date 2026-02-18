@@ -403,6 +403,18 @@ func (r *StreamedAudioResult) turnDone(ctx context.Context) {
 	}
 }
 
+func (r *StreamedAudioResult) waitForTurnCompletion(ctx context.Context) error {
+	for r.startedProcessingTurn.Load() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
 func (r *StreamedAudioResult) finishTurn(ctx context.Context) error {
 	if span := r.getTracingSpan(); span != nil {
 		if r.voicePipelineConfig.TraceIncludeSensitiveData.Or(true) {

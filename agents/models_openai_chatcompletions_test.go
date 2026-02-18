@@ -69,7 +69,7 @@ func TestOpenAIChatCompletionsModel_prepareRequest(t *testing.T) {
 			}},
 			Model: "model-name",
 		}, params)
-		assert.Nil(t, opts)
+		assert.Len(t, opts, 1)
 	})
 
 	t.Run("with ModelSettings.CustomizeChatCompletionsRequest returning values", func(t *testing.T) {
@@ -105,7 +105,7 @@ func TestOpenAIChatCompletionsModel_prepareRequest(t *testing.T) {
 								}},
 								Model: "model-name",
 							}, params)
-							assert.Nil(t, opts)
+							assert.Len(t, opts, 1)
 							return customParams, customOpts, nil
 						},
 					},
@@ -148,8 +148,8 @@ func TestOpenAIChatCompletionsModel_prepareRequest(t *testing.T) {
 						},
 						CustomizeChatCompletionsRequest: func(ctx context.Context, params *openai.ChatCompletionNewParams, opts []option.RequestOption) (*openai.ChatCompletionNewParams, []option.RequestOption, error) {
 							assert.Equal(t, openai.ReasoningEffort(""), params.ReasoningEffort)
-							// header + query + cached_content + custom_param + reasoning_effort
-							assert.Len(t, opts, 5)
+							// user-agent + header + query + cached_content + custom_param + reasoning_effort
+							assert.Len(t, opts, 6)
 							return params, opts, nil
 						},
 					},
@@ -188,8 +188,8 @@ func TestOpenAIChatCompletionsModel_prepareRequest(t *testing.T) {
 						},
 						CustomizeChatCompletionsRequest: func(ctx context.Context, params *openai.ChatCompletionNewParams, opts []option.RequestOption) (*openai.ChatCompletionNewParams, []option.RequestOption, error) {
 							assert.Equal(t, openai.ReasoningEffortLow, params.ReasoningEffort)
-							// cached_content + custom_param (reasoning_effort removed from extras)
-							assert.Len(t, opts, 2)
+							// user-agent + cached_content + custom_param (reasoning_effort removed from extras)
+							assert.Len(t, opts, 3)
 							return params, opts, nil
 						},
 					},

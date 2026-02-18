@@ -535,6 +535,62 @@ func TestRunFromStateStreamedPreservesAndAppendsToolGuardrailResults(t *testing.
 	assert.Equal(t, "new_tool_output_guardrail", result.ToolOutputGuardrailResults()[1].Guardrail.GetName())
 }
 
+func TestRunFromStateUsesConversationID(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, &agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("first"),
+		},
+	})
+	agent := agents.New("resume_agent").WithModelInstance(model)
+
+	result1, err := (agents.Runner{Config: agents.RunConfig{ConversationID: "conv123"}}).
+		Run(t.Context(), agent, "First input")
+	require.NoError(t, err)
+	assert.Equal(t, "conv123", model.LastTurnArgs.ConversationID)
+
+	state := agents.NewRunStateFromResult(*result1, 1, 3)
+
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("second"),
+		},
+	})
+
+	result2, err := (agents.Runner{Config: agents.RunConfig{ConversationID: "conv123"}}).
+		RunFromState(t.Context(), agent, state)
+	require.NoError(t, err)
+	assert.Equal(t, "second", result2.FinalOutput)
+	assert.Equal(t, "conv123", model.LastTurnArgs.ConversationID)
+}
+
+func TestRunFromStateUsesAutoPreviousResponseID(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, &agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("first"),
+		},
+	})
+	model.ResponseID = "resp-123"
+	agent := agents.New("resume_agent").WithModelInstance(model)
+
+	result1, err := (agents.Runner{Config: agents.RunConfig{AutoPreviousResponseID: true}}).
+		Run(t.Context(), agent, "First input")
+	require.NoError(t, err)
+	assert.Equal(t, "resp-123", result1.PreviousResponseID)
+
+	state := agents.NewRunStateFromResult(*result1, 1, 3)
+
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("second"),
+		},
+	})
+
+	result2, err := agents.Runner{}.RunFromState(t.Context(), agent, state)
+	require.NoError(t, err)
+	assert.Equal(t, "second", result2.FinalOutput)
+	assert.Equal(t, "resp-123", model.LastTurnArgs.PreviousResponseID)
+}
+
 func countMCPApprovalResponses(items []agents.TResponseInputItem, approvalRequestID string, approve bool) int {
 	count := 0
 	for _, item := range items {

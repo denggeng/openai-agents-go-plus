@@ -73,6 +73,9 @@ type ModelResponseParams struct {
 	// except for the OpenAI Responses API.
 	PreviousResponseID string
 
+	// Optional conversation ID for server-managed conversation state.
+	ConversationID string
+
 	// Optional prompt config to use for the model.
 	Prompt responses.ResponsePromptParam
 }

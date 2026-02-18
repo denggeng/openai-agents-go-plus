@@ -197,6 +197,58 @@ func TestSendEventInterruptUsesPlaybackStateAndForceCancel(t *testing.T) {
 	assert.Equal(t, "response.cancel", model.sentClientEvents[1]["type"])
 }
 
+func TestSendEventInterruptSkippedWhenNoAudioPlaying(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})
+	model.automaticResponseCancellationEnabled = true
+
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendInterrupt{}))
+	assert.Empty(t, model.sentClientEvents)
+}
+
+func TestSendEventInterruptSkipsTruncateWhenElapsedExceedsAudioLength(t *testing.T) {
+	playbackTracker := NewRealtimePlaybackTracker()
+	playbackTracker.OnPlayMS("item_1", 0, 2000.0)
+
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{
+		PlaybackTracker: playbackTracker,
+	})
+	model.automaticResponseCancellationEnabled = true
+	model.audioStateTracker.SetAudioFormat("pcm16")
+	model.audioStateTracker.OnAudioDelta("item_1", 0, make([]byte, 48000))
+
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendInterrupt{}))
+
+	assert.Empty(t, model.sentClientEvents)
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelAudioInterruptedEvent)
+	require.True(t, ok)
+	assert.Nil(t, model.audioStateTracker.GetLastAudioItem())
+}
+
+func TestSendEventInterruptTruncatesWhenResponseOngoing(t *testing.T) {
+	playbackTracker := NewRealtimePlaybackTracker()
+	playbackTracker.OnPlayMS("item_1", 0, 2000.0)
+
+	model := NewOpenAIRealtimeWebSocketModel()
+	mustConnectRealtimeModel(t, model, RealtimeModelConfig{
+		PlaybackTracker: playbackTracker,
+	})
+	model.automaticResponseCancellationEnabled = true
+	model.ongoingResponse = true
+	model.audioStateTracker.SetAudioFormat("pcm16")
+	model.audioStateTracker.OnAudioDelta("item_1", 0, make([]byte, 48000))
+
+	require.NoError(t, model.SendEvent(t.Context(), RealtimeModelSendInterrupt{}))
+
+	require.Len(t, model.sentClientEvents, 1)
+	assert.Equal(t, "conversation.item.truncate", model.sentClientEvents[0]["type"])
+}
+
 func TestSendEventInterruptForceCancelOverridesAutoCancellation(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	mustConnectRealtimeModel(t, model, RealtimeModelConfig{})

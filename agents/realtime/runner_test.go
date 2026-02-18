@@ -65,3 +65,22 @@ func TestRealtimeRunnerRunWithoutModelConfigUsesZeroValue(t *testing.T) {
 	require.NotNil(t, session)
 	assert.Equal(t, RealtimeModelConfig{}, session.modelConfig)
 }
+
+func TestRealtimeRunnerRunWithConfigDoesNotSetModelConfig(t *testing.T) {
+	model := &mockRealtimeModel{}
+	runner := NewRealtimeRunner(
+		&RealtimeAgent[any]{Name: "agent"},
+		model,
+		RealtimeRunConfig{
+			"model_settings": RealtimeSessionModelSettings{"voice": "nova"},
+		},
+	)
+
+	session := runner.Run(nil, nil)
+	require.NotNil(t, session)
+	assert.Equal(t, RealtimeModelConfig{}, session.modelConfig)
+
+	runModelSettings, ok := session.runConfig["model_settings"].(RealtimeSessionModelSettings)
+	require.True(t, ok)
+	assert.Equal(t, "nova", runModelSettings["voice"])
+}

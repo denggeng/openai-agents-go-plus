@@ -26,6 +26,7 @@ import (
 	"github.com/denggeng/openai-agents-go-plus/agentstesting"
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/responses"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -741,6 +742,246 @@ func TestPreviousResponseIDPassedBetweenRunsStreamedMultiTurn(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "resp-stream-test", model.LastTurnArgs.PreviousResponseID)
+}
+
+func TestAutoPreviousResponseIDMultiTurn(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	model.ResponseID = "resp-789"
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{
+			agentstesting.GetFunctionTool("test_func", "tool_result"),
+		},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("a_message"),
+			agentstesting.GetFunctionToolCall("test_func", `{"arg": "foo"}`),
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	result, err := (agents.Runner{Config: agents.RunConfig{AutoPreviousResponseID: true}}).
+		Run(t.Context(), agent, "user_message")
+	require.NoError(t, err)
+	assert.Equal(t, "done", result.FinalOutput)
+
+	require.NotNil(t, model.FirstTurnArgs)
+	firstInput := model.FirstTurnArgs.Input.(agents.InputItems)
+	require.Len(t, firstInput, 1)
+	require.NotNil(t, firstInput[0].GetRole())
+	assert.Equal(t, "user", *firstInput[0].GetRole())
+	require.NotNil(t, firstInput[0].OfMessage)
+	assert.Equal(t, "user_message", firstInput[0].OfMessage.Content.OfString.Value)
+	assert.Equal(t, "", model.FirstTurnArgs.PreviousResponseID)
+
+	lastInput := model.LastTurnArgs.Input.(agents.InputItems)
+	require.Len(t, lastInput, 1)
+	require.NotNil(t, lastInput[0].GetType())
+	assert.Equal(t, "function_call_output", *lastInput[0].GetType())
+	require.NotNil(t, lastInput[0].GetCallID())
+	assert.NotEmpty(t, *lastInput[0].GetCallID())
+	assert.Equal(t, "resp-789", model.LastTurnArgs.PreviousResponseID)
+}
+
+func TestAutoPreviousResponseIDMultiTurnStreamed(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	model.ResponseID = "resp-789"
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{
+			agentstesting.GetFunctionTool("test_func", "tool_result"),
+		},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("a_message"),
+			agentstesting.GetFunctionToolCall("test_func", `{"arg": "foo"}`),
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	result, err := (agents.Runner{Config: agents.RunConfig{AutoPreviousResponseID: true}}).
+		RunStreamed(t.Context(), agent, "user_message")
+	require.NoError(t, err)
+	err = result.StreamEvents(func(agents.StreamEvent) error { return nil })
+	require.NoError(t, err)
+	assert.Equal(t, "done", result.FinalOutput())
+
+	require.NotNil(t, model.FirstTurnArgs)
+	firstInput := model.FirstTurnArgs.Input.(agents.InputItems)
+	require.Len(t, firstInput, 1)
+	require.NotNil(t, firstInput[0].GetRole())
+	assert.Equal(t, "user", *firstInput[0].GetRole())
+	require.NotNil(t, firstInput[0].OfMessage)
+	assert.Equal(t, "user_message", firstInput[0].OfMessage.Content.OfString.Value)
+	assert.Equal(t, "", model.FirstTurnArgs.PreviousResponseID)
+
+	lastInput := model.LastTurnArgs.Input.(agents.InputItems)
+	require.Len(t, lastInput, 1)
+	require.NotNil(t, lastInput[0].GetType())
+	assert.Equal(t, "function_call_output", *lastInput[0].GetType())
+	require.NotNil(t, lastInput[0].GetCallID())
+	assert.NotEmpty(t, *lastInput[0].GetCallID())
+	assert.Equal(t, "resp-789", model.LastTurnArgs.PreviousResponseID)
+}
+
+func TestConversationIDOnlySendsNewItemsMultiTurn(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{
+			agentstesting.GetFunctionTool("test_func", "tool_result"),
+		},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("a_message"),
+			responses.ResponseOutputItemUnion{
+				ID:        "1",
+				CallID:    "call-1",
+				Type:      "function_call",
+				Name:      "test_func",
+				Arguments: `{"arg": "foo"}`,
+			},
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("b_message"),
+			responses.ResponseOutputItemUnion{
+				ID:        "1",
+				CallID:    "call-2",
+				Type:      "function_call",
+				Name:      "test_func",
+				Arguments: `{"arg": "bar"}`,
+			},
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	result, err := (agents.Runner{Config: agents.RunConfig{ConversationID: "conv-test-123"}}).
+		Run(t.Context(), agent, "user_message")
+	require.NoError(t, err)
+	assert.Equal(t, "done", result.FinalOutput)
+	assert.Equal(t, "conv-test-123", model.LastTurnArgs.ConversationID)
+
+	require.NotNil(t, model.FirstTurnArgs)
+	firstInput := model.FirstTurnArgs.Input.(agents.InputItems)
+	require.Len(t, firstInput, 1)
+	require.NotNil(t, firstInput[0].GetRole())
+	assert.Equal(t, "user", *firstInput[0].GetRole())
+	require.NotNil(t, firstInput[0].OfMessage)
+	assert.Equal(t, "user_message", firstInput[0].OfMessage.Content.OfString.Value)
+
+	lastInput := model.LastTurnArgs.Input.(agents.InputItems)
+	require.Len(t, lastInput, 1)
+	require.NotNil(t, lastInput[0].GetType())
+	assert.Equal(t, "function_call_output", *lastInput[0].GetType())
+	require.NotNil(t, lastInput[0].GetCallID())
+	assert.NotEmpty(t, *lastInput[0].GetCallID())
+}
+
+func TestConversationIDOnlySendsNewItemsMultiTurnStreamed(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{
+			agentstesting.GetFunctionTool("test_func", "tool_result"),
+		},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("a_message"),
+			responses.ResponseOutputItemUnion{
+				ID:        "1",
+				CallID:    "call-1",
+				Type:      "function_call",
+				Name:      "test_func",
+				Arguments: `{"arg": "foo"}`,
+			},
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("b_message"),
+			responses.ResponseOutputItemUnion{
+				ID:        "1",
+				CallID:    "call-2",
+				Type:      "function_call",
+				Name:      "test_func",
+				Arguments: `{"arg": "bar"}`,
+			},
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	result, err := (agents.Runner{Config: agents.RunConfig{ConversationID: "conv-test-123"}}).
+		RunStreamed(t.Context(), agent, "user_message")
+	require.NoError(t, err)
+	err = result.StreamEvents(func(agents.StreamEvent) error { return nil })
+	require.NoError(t, err)
+	assert.Equal(t, "done", result.FinalOutput())
+	assert.Equal(t, "conv-test-123", model.LastTurnArgs.ConversationID)
+
+	require.NotNil(t, model.FirstTurnArgs)
+	firstInput := model.FirstTurnArgs.Input.(agents.InputItems)
+	require.Len(t, firstInput, 1)
+	require.NotNil(t, firstInput[0].GetRole())
+	assert.Equal(t, "user", *firstInput[0].GetRole())
+	require.NotNil(t, firstInput[0].OfMessage)
+	assert.Equal(t, "user_message", firstInput[0].OfMessage.Content.OfString.Value)
+
+	lastInput := model.LastTurnArgs.Input.(agents.InputItems)
+	require.Len(t, lastInput, 1)
+	require.NotNil(t, lastInput[0].GetType())
+	assert.Equal(t, "function_call_output", *lastInput[0].GetType())
+	require.NotNil(t, lastInput[0].GetCallID())
+	assert.NotEmpty(t, *lastInput[0].GetCallID())
+}
+
+func TestWithoutAutoPreviousResponseIDNoChaining(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{
+			agentstesting.GetFunctionTool("test_func", "tool_result"),
+		},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("a_message"),
+			agentstesting.GetFunctionToolCall("test_func", `{"arg": "foo"}`),
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	result, err := agents.Runner{}.Run(t.Context(), agent, "user_message")
+	require.NoError(t, err)
+	assert.Equal(t, "done", result.FinalOutput)
+
+	require.NotNil(t, model.FirstTurnArgs)
+	assert.Equal(t, "", model.FirstTurnArgs.PreviousResponseID)
+	assert.Equal(t, "", model.LastTurnArgs.PreviousResponseID)
+
+	lastInput := model.LastTurnArgs.Input.(agents.InputItems)
+	assert.Len(t, lastInput, 4)
 }
 
 func TestDynamicToolAdditionRun(t *testing.T) {

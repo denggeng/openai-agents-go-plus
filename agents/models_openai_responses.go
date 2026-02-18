@@ -80,6 +80,7 @@ func (m OpenAIResponsesModel) GetResponse(
 				params.OutputType,
 				params.Handoffs,
 				params.PreviousResponseID,
+				params.ConversationID,
 				false,
 				params.Prompt,
 			)
@@ -165,6 +166,7 @@ func (m OpenAIResponsesModel) StreamResponse(
 				params.OutputType,
 				params.Handoffs,
 				params.PreviousResponseID,
+				params.ConversationID,
 				true,
 				params.Prompt,
 			)
@@ -212,6 +214,7 @@ func (m OpenAIResponsesModel) prepareRequest(
 	outputType OutputTypeInterface,
 	handoffs []Handoff,
 	previousResponseID string,
+	conversationID string,
 	stream bool,
 	prompt responses.ResponsePromptParam,
 ) (*responses.ResponseNewParams, []option.RequestOption, error) {
@@ -260,6 +263,7 @@ func (m OpenAIResponsesModel) prepareRequest(
 			slog.String("Tool choice", SimplePrettyJSONMarshal(toolChoice)),
 			slog.String("Response format", SimplePrettyJSONMarshal(responseFormat)),
 			slog.String("Previous response ID", previousResponseID),
+			slog.String("Conversation ID", conversationID),
 		)
 	}
 
@@ -267,9 +271,16 @@ func (m OpenAIResponsesModel) prepareRequest(
 	if previousResponseID != "" {
 		prevRespIDParam = param.NewOpt(previousResponseID)
 	}
+	var conversationParam responses.ResponseNewParamsConversationUnion
+	if conversationID != "" {
+		conversationParam = responses.ResponseNewParamsConversationUnion{
+			OfString: param.NewOpt(conversationID),
+		}
+	}
 
 	params := &responses.ResponseNewParams{
 		PreviousResponseID: prevRespIDParam,
+		Conversation:       conversationParam,
 		Instructions:       systemInstructions,
 		Model:              m.Model,
 		Input:              responses.ResponseNewParamsInputUnion{OfInputItemList: listInput},
@@ -289,8 +300,20 @@ func (m OpenAIResponsesModel) prepareRequest(
 		Metadata:           modelSettings.Metadata,
 	}
 
-	var opts []option.RequestOption
+	headers := map[string]string{
+		"User-Agent": DefaultUserAgent(),
+	}
 	for k, v := range modelSettings.ExtraHeaders {
+		headers[k] = v
+	}
+	if override := ResponsesHeadersOverride.Get(); len(override) > 0 {
+		for k, v := range override {
+			headers[k] = v
+		}
+	}
+
+	var opts []option.RequestOption
+	for k, v := range headers {
 		opts = append(opts, option.WithHeader(k, v))
 	}
 	for k, v := range modelSettings.ExtraQuery {
@@ -305,6 +328,68 @@ func (m OpenAIResponsesModel) prepareRequest(
 	}
 
 	return params, opts, nil
+}
+
+func (m OpenAIResponsesModel) removeOpenAIResponsesAPIIncompatibleFields(listInput []map[string]any) []map[string]any {
+	hasProviderData := false
+	for _, item := range listInput {
+		if hasTruthyProviderData(item) {
+			hasProviderData = true
+			break
+		}
+	}
+	if !hasProviderData {
+		return listInput
+	}
+
+	result := make([]map[string]any, 0, len(listInput))
+	for _, item := range listInput {
+		cleaned := m.cleanItemForOpenAI(item)
+		if cleaned != nil {
+			result = append(result, cleaned)
+		}
+	}
+	return result
+}
+
+func (m OpenAIResponsesModel) cleanItemForOpenAI(item map[string]any) map[string]any {
+	if item == nil {
+		return item
+	}
+	if itemType, _ := item["type"].(string); itemType == "reasoning" && hasTruthyProviderData(item) {
+		return nil
+	}
+	if id, ok := item["id"].(string); ok && id == FakeResponsesID {
+		delete(item, "id")
+	}
+	if _, ok := item["provider_data"]; ok {
+		delete(item, "provider_data")
+	}
+	return item
+}
+
+func hasTruthyProviderData(item map[string]any) bool {
+	if item == nil {
+		return false
+	}
+	providerData, ok := item["provider_data"]
+	if !ok {
+		return false
+	}
+	switch v := providerData.(type) {
+	case nil:
+		return false
+	case map[string]any:
+		return len(v) > 0
+	case []any:
+		return len(v) > 0
+	case string:
+		return v != ""
+	case bool:
+		return v
+	default:
+		return true
+	}
 }
 
 type ConvertedTools struct {

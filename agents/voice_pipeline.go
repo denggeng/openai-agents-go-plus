@@ -242,6 +242,9 @@ func (p *VoicePipeline) runMultiTurn(ctx context.Context, audioInput StreamedAud
 					}
 
 					output.turnDone(ctx)
+					if err = output.waitForTurnCompletion(ctx); err != nil {
+						return fmt.Errorf("error waiting for turn completion: %w", err)
+					}
 				}
 				if err = tt.Error(); err != nil {
 					return fmt.Errorf("error transcribing turns: %w", err)

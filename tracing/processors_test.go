@@ -16,8 +16,11 @@ package tracing
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +53,19 @@ func TestBackendSpanExporter_APIKey(t *testing.T) {
 		// If we set it afterward, it should be the new value
 		t.Setenv("OPENAI_API_KEY", "foo_bar_123")
 		assert.Equal(t, "foo_bar_123", processor.APIKey())
+	})
+
+	t.Run("cleared falls back to env", func(t *testing.T) {
+		t.Setenv("OPENAI_API_KEY", "env-key")
+
+		processor := NewBackendSpanExporter(BackendSpanExporterParams{})
+		assert.Equal(t, "env-key", processor.APIKey())
+
+		processor.SetAPIKey("explicit-key")
+		assert.Equal(t, "explicit-key", processor.APIKey())
+
+		processor.SetAPIKey("")
+		assert.Equal(t, "env-key", processor.APIKey())
 	})
 }
 
@@ -394,4 +410,71 @@ func TestBackendSpanExporterClose(t *testing.T) {
 
 	// Ensure underlying http client is closed
 	assert.True(t, rt.closed)
+}
+
+type apiKeyItem struct {
+	key     string
+	payload map[string]any
+}
+
+func (a apiKeyItem) Export() map[string]any {
+	return a.payload
+}
+
+func (a apiKeyItem) TracingAPIKey() string {
+	return a.key
+}
+
+type capturingTransport struct {
+	requests []*http.Request
+	bodies   []string
+}
+
+func (c *capturingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	body := ""
+	if request.Body != nil {
+		raw, err := io.ReadAll(request.Body)
+		if err == nil {
+			body = string(raw)
+		}
+	}
+	c.requests = append(c.requests, request)
+	c.bodies = append(c.bodies, body)
+	return &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader("ok")),
+	}, nil
+}
+
+func TestBackendSpanExporterUsesItemAPIKeys(t *testing.T) {
+	rt := &capturingTransport{}
+	exporter := NewBackendSpanExporter(BackendSpanExporterParams{
+		APIKey:     "global-key",
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	t.Cleanup(func() { exporter.Close() })
+
+	items := []any{
+		apiKeyItem{key: "key-a", payload: map[string]any{"id": "a"}},
+		apiKeyItem{key: "", payload: map[string]any{"id": "b"}},
+		apiKeyItem{key: "key-b", payload: map[string]any{"id": "c"}},
+	}
+
+	require.NoError(t, exporter.Export(t.Context(), items))
+	require.Len(t, rt.requests, 3)
+
+	authByID := make(map[string]string)
+	for i, req := range rt.requests {
+		var payload struct {
+			Data []map[string]any `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(rt.bodies[i]), &payload))
+		require.Len(t, payload.Data, 1)
+		id, _ := payload.Data[0]["id"].(string)
+		authByID[id] = req.Header.Get("Authorization")
+	}
+
+	assert.Equal(t, "Bearer key-a", authByID["a"])
+	assert.Equal(t, "Bearer global-key", authByID["b"])
+	assert.Equal(t, "Bearer key-b", authByID["c"])
 }

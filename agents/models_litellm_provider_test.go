@@ -121,3 +121,19 @@ func TestLiteLLMProvider_LiteLLMSerializerPatchEnvLogsNoopMessage(t *testing.T) 
 	assert.Contains(t, logOutput, "LiteLLM serializer patch env is ignored in Go runtime")
 	assert.Contains(t, logOutput, "OPENAI_AGENTS_ENABLE_LITELLM_SERIALIZER_PATCH")
 }
+
+func TestLiteLLMProvider_LiteLLMSerializerPatchEnvSilentWhenUnset(t *testing.T) {
+	t.Setenv("OPENAI_AGENTS_ENABLE_LITELLM_SERIALIZER_PATCH", "")
+
+	var sb strings.Builder
+	prevLogger := Logger()
+	SetLogger(slog.New(slog.NewTextHandler(&sb, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() {
+		SetLogger(prevLogger)
+	})
+
+	_ = NewLiteLLMProvider(LiteLLMProviderParams{})
+	logOutput := sb.String()
+	assert.NotContains(t, logOutput, "LiteLLM serializer patch env is ignored in Go runtime")
+	assert.NotContains(t, logOutput, "OPENAI_AGENTS_ENABLE_LITELLM_SERIALIZER_PATCH")
+}

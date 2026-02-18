@@ -23,7 +23,10 @@ import (
 //
 // The returned Agent can be further configured using the builder methods.
 func New(name string) *Agent {
-	return &Agent{Name: name}
+	return &Agent{
+		Name:          name,
+		ModelSettings: GetDefaultModelSettings(),
+	}
 }
 
 // WithInstructions sets the Agent instructions.
@@ -71,18 +74,28 @@ func (a *Agent) WithAgentHandoffs(agents ...*Agent) *Agent {
 // WithModel sets the model to use by name.
 func (a *Agent) WithModel(name string) *Agent {
 	a.Model = param.NewOpt(NewAgentModelName(name))
+	maybeResetModelSettingsForNonGPT5(a, name, false)
 	return a
 }
 
 // WithModelInstance sets the model using a Model implementation.
 func (a *Agent) WithModelInstance(m Model) *Agent {
 	a.Model = param.NewOpt(NewAgentModel(m))
+	maybeResetModelSettingsForNonGPT5(a, "", true)
 	return a
 }
 
 // WithModelOpt sets the model using an AgentModel wrapped in param.Opt.
 func (a *Agent) WithModelOpt(model param.Opt[AgentModel]) *Agent {
 	a.Model = model
+	if model.Valid() {
+		agentModel := model.Value
+		if name, ok := agentModel.SafeModelName(); ok {
+			maybeResetModelSettingsForNonGPT5(a, name, false)
+		} else {
+			maybeResetModelSettingsForNonGPT5(a, "", true)
+		}
+	}
 	return a
 }
 

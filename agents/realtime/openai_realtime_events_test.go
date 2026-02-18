@@ -254,6 +254,54 @@ func TestHandleWSEventResponseDoneMissingResponseEmitsError(t *testing.T) {
 	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field response")
 }
 
+func TestHandleWSEventResponseStatusEventsAreNoop(t *testing.T) {
+	types := []string{
+		"response.queued",
+		"response.in_progress",
+		"response.completed",
+		"response.failed",
+		"response.incomplete",
+	}
+	for _, eventType := range types {
+		t.Run(eventType, func(t *testing.T) {
+			model := NewOpenAIRealtimeWebSocketModel()
+			listener := &captureRealtimeListener{}
+			model.AddListener(listener)
+
+			require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+				"type":            eventType,
+				"sequence_number": 1,
+				"response": map[string]any{
+					"id": "resp_123",
+				},
+			}))
+
+			require.Len(t, listener.events, 1)
+			_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+			require.True(t, ok)
+		})
+	}
+}
+
+func TestHandleWSEventResponseStatusMissingSequenceEmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type": "response.completed",
+		"response": map[string]any{
+			"id": "resp_123",
+		},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	_, ok = listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+}
+
 func TestHandleWSEventSessionCreatedSendsTracingUpdateByDefault(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	mustConnectRealtimeModel(t, model, RealtimeModelConfig{
@@ -320,6 +368,28 @@ func TestHandleWSEventAudioDelta(t *testing.T) {
 	audioState := model.audioStateTracker.GetState("item_1", 0)
 	require.NotNil(t, audioState)
 	assert.Greater(t, audioState.AudioLengthMS, 0.0)
+}
+
+func TestHandleWSEventAudioDeltaInvalidBase64EmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":          "response.output_audio.delta",
+		"response_id":   "resp_1",
+		"item_id":       "item_1",
+		"content_index": 0,
+		"output_index":  0,
+		"delta":         "###not-base64###",
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+	assert.Contains(t, errorEvent.Error.(error).Error(), "illegal base64")
 }
 
 func TestHandleWSEventAudioDeltaAccumulatesTimingAndTracksCurrentItem(t *testing.T) {
@@ -479,6 +549,70 @@ func TestHandleWSEventOutputItemAddedAndDoneEmitsItemUpdated(t *testing.T) {
 	assert.Equal(t, "completed", *item.Status)
 }
 
+func TestHandleWSEventOutputItemMissingOutputIndexAllowedForMessage(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type": "response.output_item.added",
+		"item": map[string]any{
+			"id":   "msg_1",
+			"type": "message",
+			"role": "assistant",
+			"content": []map[string]any{
+				{"type": "text", "text": "hello"},
+			},
+		},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	itemUpdated, ok := listener.events[1].(RealtimeModelItemUpdatedEvent)
+	require.True(t, ok)
+	item, ok := itemUpdated.Item.(RealtimeMessageItem)
+	require.True(t, ok)
+	assert.Equal(t, "msg_1", item.ItemID)
+}
+
+func TestHandleWSEventOutputItemMessageAudioAndTextContent(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":         "response.output_item.added",
+		"output_index": 0,
+		"item": map[string]any{
+			"id":   "msg_audio",
+			"type": "message",
+			"role": "assistant",
+			"content": []map[string]any{
+				{"type": "text", "text": "hello"},
+				{"type": "audio", "audio": "blob", "transcript": "hi"},
+			},
+		},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	itemUpdated, ok := listener.events[1].(RealtimeModelItemUpdatedEvent)
+	require.True(t, ok)
+	item, ok := itemUpdated.Item.(RealtimeMessageItem)
+	require.True(t, ok)
+	require.Len(t, item.Content, 2)
+	assert.Equal(t, "text", item.Content[0].Type)
+	assert.Equal(t, "audio", item.Content[1].Type)
+	if assert.NotNil(t, item.Content[1].Audio) {
+		assert.Equal(t, "blob", *item.Content[1].Audio)
+	}
+	if assert.NotNil(t, item.Content[1].Transcript) {
+		assert.Equal(t, "hi", *item.Content[1].Transcript)
+	}
+}
+
 func TestHandleWSEventOutputItemMissingItemEmitsError(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	listener := &captureRealtimeListener{}
@@ -542,6 +676,50 @@ func TestHandleWSEventOutputAudioDoneMissingOutputIndexEmitsError(t *testing.T) 
 	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
 	require.True(t, ok)
 	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field output_index")
+}
+
+func TestHandleWSEventOutputAudioDoneEmitsEvent(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":          "response.output_audio.done",
+		"response_id":   "resp_1",
+		"item_id":       "item_1",
+		"content_index": 0,
+		"output_index":  0,
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	audioDone, ok := listener.events[1].(RealtimeModelAudioDoneEvent)
+	require.True(t, ok)
+	assert.Equal(t, "item_1", audioDone.ItemID)
+	assert.Equal(t, 0, audioDone.ContentIndex)
+}
+
+func TestHandleWSEventLegacyResponseAudioDoneAliasEmitsEvent(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":          "response.audio.done",
+		"response_id":   "resp_1",
+		"item_id":       "item_1",
+		"content_index": 0,
+		"output_index":  0,
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	audioDone, ok := listener.events[1].(RealtimeModelAudioDoneEvent)
+	require.True(t, ok)
+	assert.Equal(t, "item_1", audioDone.ItemID)
+	assert.Equal(t, 0, audioDone.ContentIndex)
 }
 
 func TestHandleWSEventLegacyResponseAudioTranscriptDeltaAlias(t *testing.T) {
@@ -808,6 +986,20 @@ func TestHandleWSEventInputAudioBufferCommittedInvalidPreviousItemIDTypeEmitsErr
 	assert.Contains(t, errorEvent.Error.(error).Error(), "invalid field previous_item_id")
 }
 
+func TestHandleWSEventInputAudioBufferClearedNoopEmitsOnlyRaw(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type": "input_audio_buffer.cleared",
+	}))
+
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+}
+
 func TestHandleWSEventInputAudioBufferSpeechStoppedMissingAudioEndMSEmitsError(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	listener := &captureRealtimeListener{}
@@ -843,6 +1035,24 @@ func TestHandleWSEventConversationCreatedMissingConversationEmitsError(t *testin
 	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field conversation")
 }
 
+func TestHandleWSEventConversationItemDeletedEmitsEvent(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":    "conversation.item.deleted",
+		"item_id": "item_1",
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	deletedEvent, ok := listener.events[1].(RealtimeModelItemDeletedEvent)
+	require.True(t, ok)
+	assert.Equal(t, "item_1", deletedEvent.ItemID)
+}
+
 func TestHandleWSEventInputAudioTranscriptionFailedInvalidErrorTypeEmitsError(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	listener := &captureRealtimeListener{}
@@ -860,6 +1070,44 @@ func TestHandleWSEventInputAudioTranscriptionFailedInvalidErrorTypeEmitsError(t 
 	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
 	require.True(t, ok)
 	assert.Contains(t, errorEvent.Error.(error).Error(), "invalid field error")
+}
+
+func TestHandleWSEventInputAudioTranscriptionCompletedMissingTranscriptEmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":    "conversation.item.input_audio_transcription.completed",
+		"item_id": "item_1",
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field transcript")
+}
+
+func TestHandleWSEventInputAudioTranscriptionCompletedEmitsEvent(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":       "conversation.item.input_audio_transcription.completed",
+		"item_id":    "item_1",
+		"transcript": "hello",
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	completedEvent, ok := listener.events[1].(RealtimeModelInputAudioTranscriptionCompletedEvent)
+	require.True(t, ok)
+	assert.Equal(t, "item_1", completedEvent.ItemID)
+	assert.Equal(t, "hello", completedEvent.Transcript)
 }
 
 func TestHandleWSEventResponseContentPartAddedMissingPartEmitsError(t *testing.T) {
@@ -884,6 +1132,28 @@ func TestHandleWSEventResponseContentPartAddedMissingPartEmitsError(t *testing.T
 	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field part")
 }
 
+func TestHandleWSEventResponseContentPartAddedMissingPartTypeEmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":          "response.content_part.added",
+		"response_id":   "resp_1",
+		"item_id":       "item_1",
+		"output_index":  0,
+		"content_index": 0,
+		"part":          map[string]any{"text": "hello"},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field part.type")
+}
+
 func TestHandleWSEventResponseContentPartAddedValidNoopEmitsOnlyRaw(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	listener := &captureRealtimeListener{}
@@ -899,6 +1169,489 @@ func TestHandleWSEventResponseContentPartAddedValidNoopEmitsOnlyRaw(t *testing.T
 			"type": "output_text",
 			"text": "hello",
 		},
+	}))
+
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventOutputTextAnnotationAddedValidNoopEmitsOnlyRaw(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":             "response.output_text.annotation.added",
+		"item_id":          "item_1",
+		"output_index":     0,
+		"content_index":    1,
+		"annotation_index": 0,
+		"sequence_number":  1,
+		"annotation":       map[string]any{"type": "citation"},
+	}))
+
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventOutputTextAnnotationAddedMissingAnnotationEmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":             "response.output_text.annotation.added",
+		"item_id":          "item_1",
+		"output_index":     0,
+		"content_index":    1,
+		"annotation_index": 0,
+		"sequence_number":  1,
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	_, ok = listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventRefusalDeltaValidNoopEmitsOnlyRaw(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":            "response.refusal.delta",
+		"item_id":         "item_1",
+		"output_index":    0,
+		"content_index":   0,
+		"sequence_number": 1,
+		"delta":           "no",
+	}))
+
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventReasoningTextDoneMissingTextEmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":            "response.reasoning_text.done",
+		"item_id":         "item_1",
+		"output_index":    0,
+		"content_index":   0,
+		"sequence_number": 1,
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	_, ok = listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventReasoningSummaryPartAddedMissingTypeEmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":            "response.reasoning_summary_part.added",
+		"item_id":         "item_1",
+		"output_index":    0,
+		"summary_index":   0,
+		"sequence_number": 1,
+		"part":            map[string]any{"text": "summary"},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	_, ok = listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventCodeInterpreterDeltaValidNoopEmitsOnlyRaw(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":            "response.code_interpreter_call_code.delta",
+		"item_id":         "item_1",
+		"output_index":    0,
+		"sequence_number": 1,
+		"delta":           "print(1)",
+	}))
+
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventImageGenerationPartialImageMissingB64EmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":                "response.image_generation_call.partial_image",
+		"item_id":             "item_1",
+		"output_index":        0,
+		"sequence_number":     1,
+		"partial_image_index": 0,
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	_, ok = listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventMcpCallArgumentsDoneMissingArgumentsEmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":            "response.mcp_call_arguments.done",
+		"item_id":         "item_1",
+		"output_index":    0,
+		"sequence_number": 1,
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	_, ok = listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventCustomToolCallInputDoneValidNoopEmitsOnlyRaw(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":            "response.custom_tool_call_input.done",
+		"item_id":         "item_1",
+		"output_index":    0,
+		"sequence_number": 1,
+		"input":           "{\"foo\": \"bar\"}",
+	}))
+
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventResponseNoopEventsEmitOnlyRaw(t *testing.T) {
+	cases := []struct {
+		name  string
+		event map[string]any
+	}{
+		{
+			name: "refusal_done",
+			event: map[string]any{
+				"type":            "response.refusal.done",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"content_index":   0,
+				"sequence_number": 1,
+				"refusal":         "no",
+			},
+		},
+		{
+			name: "reasoning_text_delta",
+			event: map[string]any{
+				"type":            "response.reasoning_text.delta",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"content_index":   0,
+				"sequence_number": 1,
+				"delta":           "think",
+			},
+		},
+		{
+			name: "reasoning_summary_text_delta",
+			event: map[string]any{
+				"type":            "response.reasoning_summary_text.delta",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"summary_index":   0,
+				"sequence_number": 1,
+				"delta":           "summary",
+			},
+		},
+		{
+			name: "reasoning_summary_text_done",
+			event: map[string]any{
+				"type":            "response.reasoning_summary_text.done",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"summary_index":   0,
+				"sequence_number": 1,
+				"text":            "summary",
+			},
+		},
+		{
+			name: "reasoning_summary_part_done",
+			event: map[string]any{
+				"type":            "response.reasoning_summary_part.done",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"summary_index":   0,
+				"sequence_number": 1,
+				"part":            map[string]any{"type": "summary_text", "text": "summary"},
+			},
+		},
+		{
+			name: "mcp_call_arguments_delta",
+			event: map[string]any{
+				"type":            "response.mcp_call_arguments.delta",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+				"delta":           "{}",
+			},
+		},
+		{
+			name: "custom_tool_call_input_delta",
+			event: map[string]any{
+				"type":            "response.custom_tool_call_input.delta",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+				"delta":           "{}",
+			},
+		},
+		{
+			name: "code_interpreter_call_code_done",
+			event: map[string]any{
+				"type":            "response.code_interpreter_call_code.done",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+				"code":            "print(1)",
+			},
+		},
+		{
+			name: "content_part_done",
+			event: map[string]any{
+				"type":          "response.content_part.done",
+				"response_id":   "resp_1",
+				"item_id":       "item_1",
+				"output_index":  0,
+				"content_index": 0,
+				"part":          map[string]any{"type": "output_text"},
+			},
+		},
+		{
+			name: "image_generation_in_progress",
+			event: map[string]any{
+				"type":            "response.image_generation_call.in_progress",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "image_generation_completed",
+			event: map[string]any{
+				"type":            "response.image_generation_call.completed",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "image_generation_generating",
+			event: map[string]any{
+				"type":            "response.image_generation_call.generating",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "file_search_searching",
+			event: map[string]any{
+				"type":            "response.file_search_call.searching",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "file_search_in_progress",
+			event: map[string]any{
+				"type":            "response.file_search_call.in_progress",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "file_search_completed",
+			event: map[string]any{
+				"type":            "response.file_search_call.completed",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "web_search_searching",
+			event: map[string]any{
+				"type":            "response.web_search_call.searching",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "web_search_in_progress",
+			event: map[string]any{
+				"type":            "response.web_search_call.in_progress",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "code_interpreter_in_progress",
+			event: map[string]any{
+				"type":            "response.code_interpreter_call.in_progress",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "code_interpreter_interpreting",
+			event: map[string]any{
+				"type":            "response.code_interpreter_call.interpreting",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "code_interpreter_completed",
+			event: map[string]any{
+				"type":            "response.code_interpreter_call.completed",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "mcp_call_completed",
+			event: map[string]any{
+				"type":            "response.mcp_call.completed",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "mcp_call_in_progress",
+			event: map[string]any{
+				"type":            "response.mcp_call.in_progress",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "mcp_call_failed",
+			event: map[string]any{
+				"type":            "response.mcp_call.failed",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "mcp_list_tools_failed",
+			event: map[string]any{
+				"type":            "response.mcp_list_tools.failed",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "mcp_list_tools_in_progress",
+			event: map[string]any{
+				"type":            "response.mcp_list_tools.in_progress",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+		{
+			name: "mcp_list_tools_completed",
+			event: map[string]any{
+				"type":            "response.mcp_list_tools.completed",
+				"item_id":         "item_1",
+				"output_index":    0,
+				"sequence_number": 1,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			model := NewOpenAIRealtimeWebSocketModel()
+			listener := &captureRealtimeListener{}
+			model.AddListener(listener)
+
+			require.NoError(t, model.handleWSEvent(t.Context(), tc.event))
+
+			require.Len(t, listener.events, 1)
+			_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+			require.True(t, ok)
+		})
+	}
+}
+
+func TestHandleWSEventWebSearchCallCompletedValidNoopEmitsOnlyRaw(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":            "response.web_search_call.completed",
+		"item_id":         "item_1",
+		"output_index":    0,
+		"sequence_number": 1,
+	}))
+
+	require.Len(t, listener.events, 1)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+}
+
+func TestHandleWSEventLegacyResponseAudioTranscriptDoneAliasNoopEmitsOnlyRaw(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":          "response.audio.transcript.done",
+		"item_id":       "item_1",
+		"response_id":   "resp_1",
+		"output_index":  0,
+		"content_index": 0,
+		"transcript":    "hello",
 	}))
 
 	require.Len(t, listener.events, 1)
@@ -924,7 +1677,7 @@ func TestHandleWSEventRateLimitsUpdatedInvalidRateLimitsTypeEmitsError(t *testin
 	assert.Contains(t, errorEvent.Error.(error).Error(), "invalid field rate_limits")
 }
 
-func TestHandleWSEventUnknownTypeEmitsOnlyRaw(t *testing.T) {
+func TestHandleWSEventUnknownTypeEmitsError(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	listener := &captureRealtimeListener{}
 	model.AddListener(listener)
@@ -933,9 +1686,12 @@ func TestHandleWSEventUnknownTypeEmitsOnlyRaw(t *testing.T) {
 		"type": "unknown.event.type",
 	}))
 
-	require.Len(t, listener.events, 1)
+	require.Len(t, listener.events, 2)
 	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
 	require.True(t, ok)
+	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+	assert.Contains(t, errorEvent.Error.(error).Error(), "unsupported realtime server event type")
 }
 
 func TestHandleWSEventMissingTypeEmitsError(t *testing.T) {
@@ -1153,6 +1909,34 @@ func TestHandleWSEventConversationItemMessageMissingIDEmitsError(t *testing.T) {
 	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field item.id")
 }
 
+func TestHandleWSEventConversationItemRetrievedEmitsItemUpdated(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type": "conversation.item.retrieved",
+		"item": map[string]any{
+			"id":      "item_1",
+			"type":    "message",
+			"role":    "assistant",
+			"content": []map[string]any{{"type": "output_text", "text": "hello"}},
+		},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	itemUpdated, ok := listener.events[1].(RealtimeModelItemUpdatedEvent)
+	require.True(t, ok)
+	item, ok := itemUpdated.Item.(RealtimeMessageItem)
+	require.True(t, ok)
+	assert.Equal(t, "item_1", item.ItemID)
+	assert.Equal(t, "assistant", item.Role)
+	require.Len(t, item.Content, 1)
+	assert.Equal(t, "text", item.Content[0].Type)
+}
+
 func TestHandleWSEventConversationItemCreatedInvalidPreviousItemIDTypeEmitsError(t *testing.T) {
 	model := NewOpenAIRealtimeWebSocketModel()
 	listener := &captureRealtimeListener{}
@@ -1221,6 +2005,28 @@ func TestHandleWSEventOutputItemMessageMissingIDEmitsError(t *testing.T) {
 	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
 	require.True(t, ok)
 	assert.Contains(t, errorEvent.Error.(error).Error(), "missing required field item.id")
+}
+
+func TestHandleWSEventOutputItemUnknownTypeEmitsError(t *testing.T) {
+	model := NewOpenAIRealtimeWebSocketModel()
+	listener := &captureRealtimeListener{}
+	model.AddListener(listener)
+
+	require.NoError(t, model.handleWSEvent(t.Context(), map[string]any{
+		"type":         "response.output_item.done",
+		"output_index": 0,
+		"item": map[string]any{
+			"id":   "item_1",
+			"type": "reasoning",
+		},
+	}))
+
+	require.Len(t, listener.events, 2)
+	_, ok := listener.events[0].(RealtimeModelRawServerEvent)
+	require.True(t, ok)
+	errorEvent, ok := listener.events[1].(RealtimeModelErrorEvent)
+	require.True(t, ok)
+	assert.Contains(t, errorEvent.Error.(error).Error(), "unsupported output item type")
 }
 
 func TestConnectWithTransportDialerStartsListenerAndWritesSessionUpdate(t *testing.T) {

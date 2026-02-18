@@ -73,6 +73,10 @@ func TestConnectUsesCustomURLAndHeaders(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "wss://example.test/realtime", model.lastConnectURL)
 	assert.Equal(t, map[string]string{"X-Test": "yes"}, model.lastConnectHeads)
+	_, hasAuth := model.lastConnectHeads["Authorization"]
+	assert.False(t, hasAuth)
+	_, hasBeta := model.lastConnectHeads["OpenAI-Beta"]
+	assert.False(t, hasBeta)
 }
 
 func TestConnectWithTransportDialerFailurePropagates(t *testing.T) {

@@ -42,6 +42,7 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 			nil,
 			nil,
 			"",
+			"",
 			false,
 			responses.ResponsePromptParam{},
 		)
@@ -60,7 +61,7 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 			},
 			Model: "model-name",
 		}, params)
-		assert.Nil(t, opts)
+		assert.Len(t, opts, 1)
 	})
 
 	t.Run("with ModelSettings.CustomizeResponsesRequest returning values", func(t *testing.T) {
@@ -92,13 +93,14 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 						},
 						Model: "model-name",
 					}, params)
-					assert.Nil(t, opts)
+					assert.Len(t, opts, 1)
 					return customParams, customOpts, nil
 				},
 			},
 			nil,
 			nil,
 			nil,
+			"",
 			"",
 			false,
 			responses.ResponsePromptParam{},
@@ -126,14 +128,15 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 					"reasoning_effort": "low",
 				},
 				CustomizeResponsesRequest: func(ctx context.Context, params *responses.ResponseNewParams, opts []option.RequestOption) (*responses.ResponseNewParams, []option.RequestOption, error) {
-					// header + query + cached_content + custom_param + reasoning_effort
-					assert.Len(t, opts, 5)
+					// user-agent + header + query + cached_content + custom_param + reasoning_effort
+					assert.Len(t, opts, 6)
 					return params, opts, nil
 				},
 			},
 			nil,
 			nil,
 			nil,
+			"",
 			"",
 			false,
 			responses.ResponsePromptParam{},
@@ -159,14 +162,15 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 				},
 				CustomizeResponsesRequest: func(ctx context.Context, params *responses.ResponseNewParams, opts []option.RequestOption) (*responses.ResponseNewParams, []option.RequestOption, error) {
 					assert.Equal(t, openai.ReasoningEffortLow, params.Reasoning.Effort)
-					// cached_content + custom_param (reasoning_effort removed from extras)
-					assert.Len(t, opts, 2)
+					// user-agent + cached_content + custom_param (reasoning_effort removed from extras)
+					assert.Len(t, opts, 3)
 					return params, opts, nil
 				},
 			},
 			nil,
 			nil,
 			nil,
+			"",
 			"",
 			false,
 			responses.ResponsePromptParam{},
@@ -190,9 +194,33 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 			nil,
 			nil,
 			"",
+			"",
 			false,
 			responses.ResponsePromptParam{},
 		)
 		require.ErrorIs(t, err, customError)
+	})
+
+	t.Run("with top_logprobs includes logprobs in include list", func(t *testing.T) {
+		m := NewOpenAIResponsesModel("model-name", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))
+		params, _, err := m.prepareRequest(
+			t.Context(),
+			param.Opt[string]{},
+			InputString("hi"),
+			modelsettings.ModelSettings{
+				TopLogprobs: param.NewOpt(int64(2)),
+			},
+			nil,
+			nil,
+			nil,
+			"",
+			"",
+			false,
+			responses.ResponsePromptParam{},
+		)
+		require.NoError(t, err)
+		require.True(t, params.TopLogprobs.Valid())
+		assert.Equal(t, int64(2), params.TopLogprobs.Value)
+		assert.Contains(t, params.Include, responses.ResponseIncludableMessageOutputTextLogprobs)
 	})
 }

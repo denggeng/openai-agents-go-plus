@@ -16,6 +16,7 @@ package codex
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -119,6 +120,47 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0
 		`{"type":"turn.started"}`,
 		`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}`,
 	}, lines)
+}
+
+func TestCodexExecRunJSONLHandlesLargeSingleLine(t *testing.T) {
+	payload := strings.Repeat("x", (1<<16)+1)
+	dir := t.TempDir()
+	payloadPath := filepath.Join(dir, "payload.txt")
+	require.NoError(t, os.WriteFile(payloadPath, []byte(payload+"\n"), 0o644))
+
+	script := writeExecutableScript(t, fmt.Sprintf("#!/bin/sh\ncat %q\n", payloadPath))
+
+	client, err := NewCodexExec(&script, nil, nil)
+	require.NoError(t, err)
+
+	linesCh, errsCh := client.RunJSONL(t.Context(), CodexExecArgs{Input: "hello"})
+	lines, err := collectJSONLResult(linesCh, errsCh)
+	require.NoError(t, err)
+	require.Len(t, lines, 1)
+	assert.Equal(t, payload, lines[0])
+}
+
+func TestResolveCodexPathUsesEnvOverride(t *testing.T) {
+	t.Setenv("CODEX_PATH", "/custom/codex")
+	assert.Equal(t, "/custom/codex", resolveCodexPath(nil))
+}
+
+func TestResolveCodexPathUsesLookPath(t *testing.T) {
+	dir := t.TempDir()
+	codexPath := filepath.Join(dir, "codex")
+	require.NoError(t, os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	t.Setenv("CODEX_PATH", "")
+	t.Setenv("PATH", dir)
+
+	resolved := resolveCodexPath(nil)
+	assert.Equal(t, codexPath, resolved)
+}
+
+func TestResolveCodexPathFallbackWhenNotFound(t *testing.T) {
+	t.Setenv("CODEX_PATH", "")
+	t.Setenv("PATH", "")
+	assert.Equal(t, "codex", resolveCodexPath(nil))
 }
 
 func TestCodexExecRunJSONLReturnsExitCodeError(t *testing.T) {

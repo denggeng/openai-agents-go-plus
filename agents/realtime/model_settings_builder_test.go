@@ -40,6 +40,29 @@ func TestCollectEnabledHandoffsFiltersDisabled(t *testing.T) {
 	assert.Equal(t, "child_enabled", enabled[0].AgentName)
 }
 
+func TestCollectEnabledHandoffsHonorsEnablerFunc(t *testing.T) {
+	target := &RealtimeAgent[any]{Name: "target"}
+	other := &RealtimeAgent[any]{Name: "other"}
+
+	direct := agents.Handoff{
+		ToolName:        "to_target",
+		ToolDescription: "",
+		InputJSONSchema: map[string]any{},
+		OnInvokeHandoff: func(context.Context, string) (*agents.Agent, error) {
+			return &agents.Agent{Name: target.Name}, nil
+		},
+		AgentName: target.Name,
+		IsEnabled: agents.HandoffEnablerFunc(func(context.Context, *agents.Agent) (bool, error) {
+			return true, nil
+		}),
+	}
+
+	parent := &RealtimeAgent[any]{Name: "parent", Handoffs: []any{direct, other}}
+	enabled, err := CollectEnabledHandoffs(parent, agents.NewRunContextWrapper[any](nil))
+	require.NoError(t, err)
+	require.Len(t, enabled, 2)
+}
+
 func TestBuildModelSettingsFromAgentMergesAgentFields(t *testing.T) {
 	agent := &RealtimeAgent[any]{
 		Name:   "root",

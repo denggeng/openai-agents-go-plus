@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/openai/openai-go/v3/responses"
 )
@@ -42,10 +43,11 @@ type OpenAIServerConversationTracker struct {
 }
 
 // NewOpenAIServerConversationTracker creates a tracker with initialized state.
-func NewOpenAIServerConversationTracker(conversationID, previousResponseID string) *OpenAIServerConversationTracker {
+func NewOpenAIServerConversationTracker(conversationID, previousResponseID string, autoPreviousResponseID bool) *OpenAIServerConversationTracker {
 	tracker := &OpenAIServerConversationTracker{
-		ConversationID:     conversationID,
-		PreviousResponseID: previousResponseID,
+		ConversationID:         conversationID,
+		PreviousResponseID:     previousResponseID,
+		AutoPreviousResponseID: autoPreviousResponseID,
 	}
 	tracker.ensureMaps()
 	Logger().Debug(
@@ -253,6 +255,9 @@ func (t *OpenAIServerConversationTracker) MarkInputAsSent(items []TResponseInput
 			t.sentItemFingerprints[fp] = struct{}{}
 			deliveredFingerprints[fp] = struct{}{}
 		}
+		if callID := callIDFromRaw(item); callID != "" && hasOutputPayload(item) {
+			t.serverToolCallIDs[callID] = struct{}{}
+		}
 	}
 
 	if len(t.remainingInitialInput) == 0 {
@@ -296,6 +301,9 @@ func (t *OpenAIServerConversationTracker) RewindInput(items []TResponseInputItem
 		}
 		if fp, ok := fingerprintForTracker(item); ok {
 			delete(t.sentItemFingerprints, fp)
+		}
+		if callID := callIDFromRaw(item); callID != "" && hasOutputPayload(item) {
+			delete(t.serverToolCallIDs, callID)
 		}
 	}
 
@@ -372,9 +380,11 @@ func (t *OpenAIServerConversationTracker) PrepareInput(
 		}
 
 		inputItem := generatedItems[i].ToInputItem()
-		if fp, ok := fingerprintForTracker(inputItem); ok && t.primedFromState {
+		if fp, ok := fingerprintForTracker(inputItem); ok {
 			if _, exists := t.sentItemFingerprints[fp]; exists {
-				continue
+				if t.primedFromState || isOutputInputItem(inputItem) {
+					continue
+				}
 			}
 		}
 
@@ -385,6 +395,20 @@ func (t *OpenAIServerConversationTracker) PrepareInput(
 	}
 
 	return inputItems
+}
+
+func isOutputInputItem(raw any) bool {
+	if callID := callIDFromRaw(raw); callID != "" && hasOutputPayload(raw) {
+		return true
+	}
+	itemType := stringFieldFromRaw(raw, "type")
+	if itemType == "" {
+		return false
+	}
+	if itemType == "function_call_output" {
+		return true
+	}
+	return strings.HasSuffix(itemType, "_output")
 }
 
 func runItemRawAndType(item RunItem) (any, string) {
@@ -503,6 +527,15 @@ func hasOutputPayload(raw any) bool {
 			return exists
 		}
 	}
+	switch v := raw.(type) {
+	case responses.ResponseOutputItemUnion:
+		return responseOutputUnionHasOutput(v)
+	case *responses.ResponseOutputItemUnion:
+		if v == nil {
+			return false
+		}
+		return responseOutputUnionHasOutput(*v)
+	}
 	v := reflect.ValueOf(raw)
 	if v.Kind() == reflect.Ptr {
 		if v.IsNil() {
@@ -514,6 +547,18 @@ func hasOutputPayload(raw any) bool {
 		return false
 	}
 	return v.FieldByName("Output").IsValid()
+}
+
+func responseOutputUnionHasOutput(item responses.ResponseOutputItemUnion) bool {
+	if item.JSON.Output.Valid() {
+		return true
+	}
+	if item.Type != "" {
+		if strings.HasSuffix(item.Type, "_output") || item.Type == "function_call_output" {
+			return true
+		}
+	}
+	return !reflect.ValueOf(item.Output).IsZero()
 }
 
 func coerceToMap(raw any) (map[string]any, bool) {

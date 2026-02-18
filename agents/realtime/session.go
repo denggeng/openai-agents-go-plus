@@ -35,6 +35,36 @@ type pendingRealtimeToolCall struct {
 	approvalItem agents.ToolApprovalItem
 }
 
+type guardrailTask interface {
+	Cancel()
+	Done() bool
+}
+
+type realtimeGuardrailTask struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func newRealtimeGuardrailTask(cancel context.CancelFunc) *realtimeGuardrailTask {
+	return &realtimeGuardrailTask{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+}
+
+func (t *realtimeGuardrailTask) Cancel() { t.cancel() }
+
+func (t *realtimeGuardrailTask) Done() bool {
+	select {
+	case <-t.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *realtimeGuardrailTask) Finish() { close(t.done) }
+
 // RealtimeSession is a basic runtime session over a realtime model transport.
 type RealtimeSession struct {
 	model                  RealtimeModel
@@ -51,6 +81,8 @@ type RealtimeSession struct {
 	itemGuardrailRunCounts map[string]int
 	interruptedResponseIDs map[string]struct{}
 	pendingToolCalls       map[string]pendingRealtimeToolCall
+	guardrailTasks         map[guardrailTask]struct{}
+	storedException        error
 	eventQueue             chan RealtimeSessionEvent
 	closed                 bool
 	mutex                  sync.Mutex
@@ -94,6 +126,7 @@ func NewRealtimeSession(
 		itemGuardrailRunCounts: make(map[string]int),
 		interruptedResponseIDs: make(map[string]struct{}),
 		pendingToolCalls:       make(map[string]pendingRealtimeToolCall),
+		guardrailTasks:         make(map[guardrailTask]struct{}),
 		eventQueue:             make(chan RealtimeSessionEvent, 128),
 	}
 }
@@ -133,6 +166,7 @@ func (s *RealtimeSession) Enter(ctx context.Context) error {
 
 // Close shuts down the session and underlying model transport.
 func (s *RealtimeSession) Close(ctx context.Context) error {
+	var tasks []guardrailTask
 	s.mutex.Lock()
 	if s.closed {
 		s.mutex.Unlock()
@@ -140,7 +174,17 @@ func (s *RealtimeSession) Close(ctx context.Context) error {
 	}
 	s.closed = true
 	clear(s.pendingToolCalls)
+	for task := range s.guardrailTasks {
+		tasks = append(tasks, task)
+	}
+	clear(s.guardrailTasks)
 	s.mutex.Unlock()
+
+	for _, task := range tasks {
+		if !task.Done() {
+			task.Cancel()
+		}
+	}
 
 	s.model.RemoveListener(s)
 	err := s.model.Close(ctx)
@@ -239,6 +283,8 @@ func (s *RealtimeSession) OnEvent(_ context.Context, event RealtimeModelEvent) e
 			},
 			Info: s.eventInfo,
 		})
+		s.storeException(e.Exception)
+		_ = s.Close(context.Background())
 	case RealtimeModelToolCallEvent:
 		agentSnapshot := s.currentAgent
 		if s.asyncToolCalls {
@@ -294,6 +340,17 @@ func (s *RealtimeSession) OnEvent(_ context.Context, event RealtimeModelEvent) e
 	}
 
 	return nil
+}
+
+func (s *RealtimeSession) storeException(err error) {
+	if err == nil {
+		return
+	}
+	s.mutex.Lock()
+	if s.storedException == nil {
+		s.storedException = err
+	}
+	s.mutex.Unlock()
 }
 
 func (s *RealtimeSession) handleToolCall(
@@ -1016,6 +1073,16 @@ func (s *RealtimeSession) runOutputGuardrails(
 	message string,
 	responseID string,
 ) {
+	ctx, cancel := context.WithCancel(ctx)
+	task := newRealtimeGuardrailTask(cancel)
+	if !s.addGuardrailTask(task) {
+		cancel()
+		return
+	}
+	defer func() {
+		task.Finish()
+		s.removeGuardrailTask(task)
+	}()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			s.putEvent(RealtimeErrorEvent{
@@ -1045,6 +1112,16 @@ func (s *RealtimeSession) runOutputGuardrails(
 	for _, guardrail := range guardrails {
 		result, err := runOutputGuardrailSafely(ctx, guardrail, agentSnapshot, message)
 		if err != nil {
+			name := strings.TrimSpace(guardrail.Name)
+			if name == "" {
+				name = "unnamed_guardrail"
+			}
+			s.putEvent(RealtimeErrorEvent{
+				Error: map[string]any{
+					"message": fmt.Sprintf("output guardrail %s failed: %v", name, err),
+				},
+				Info: s.eventInfo,
+			})
 			continue
 		}
 		if result.Output.TripwireTriggered {
@@ -1078,6 +1155,25 @@ func (s *RealtimeSession) runOutputGuardrails(
 	_ = s.model.SendEvent(ctx, RealtimeModelSendUserInput{
 		UserInput: fmt.Sprintf("guardrail triggered: %s", strings.Join(names, ", ")),
 	})
+}
+
+func (s *RealtimeSession) addGuardrailTask(task guardrailTask) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.closed {
+		return false
+	}
+	if s.guardrailTasks == nil {
+		s.guardrailTasks = make(map[guardrailTask]struct{})
+	}
+	s.guardrailTasks[task] = struct{}{}
+	return true
+}
+
+func (s *RealtimeSession) removeGuardrailTask(task guardrailTask) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	delete(s.guardrailTasks, task)
 }
 
 func runOutputGuardrailSafely(
@@ -1438,6 +1534,7 @@ func mergeAssistantTranscriptOnHistoryUpdate(
 	for idx, incomingRaw := range incomingParts {
 		incomingPart, ok := toStringAnyMap(incomingRaw)
 		if !ok {
+			sessionLogger.Printf("realtime: unexpected content part type during merge: %T", incomingRaw)
 			mergedParts = append(mergedParts, incomingRaw)
 			continue
 		}

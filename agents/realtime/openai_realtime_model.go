@@ -489,10 +489,15 @@ func (m *OpenAIRealtimeWebSocketModel) sendInterrupt(
 		}
 
 		truncateMS := int(math.Max(0, elapsedMS))
-		if err := m.dispatchClientEvent(ctx, ConvertInterrupt(itemID, contentIndex, truncateMS)); err != nil {
-			return err
+		_, maxAudioMS, hasAudioLimit := m.audioLengthLimit(itemID, contentIndex)
+		if m.ongoingResponse || !hasAudioLimit || truncateMS < maxAudioMS {
+			if err := m.dispatchClientEvent(ctx, ConvertInterrupt(itemID, contentIndex, truncateMS)); err != nil {
+				return err
+			}
 		}
+	}
 
+	if ok {
 		if m.audioStateTracker != nil {
 			m.audioStateTracker.OnInterrupted()
 		}
@@ -671,6 +676,11 @@ func (m *OpenAIRealtimeWebSocketModel) handleWSEvent(
 			Error: errors.New("missing required field type in server event"),
 		})
 	}
+	missingField := func(field string) error {
+		return m.emitEvent(ctx, RealtimeModelErrorEvent{
+			Error: fmt.Errorf("missing required field %s in %s", field, eventType),
+		})
+	}
 
 	switch eventType {
 	case "response.output_audio.delta", "response.audio.delta":
@@ -824,6 +834,25 @@ func (m *OpenAIRealtimeWebSocketModel) handleWSEvent(
 		}
 		m.ongoingResponse = false
 		return m.emitEvent(ctx, RealtimeModelTurnEndedEvent{})
+
+	case "response.queued", "response.in_progress", "response.completed", "response.failed", "response.incomplete":
+		responsePayload, ok := toStringAnyMap(event["response"])
+		if !ok {
+			return m.emitEvent(ctx, RealtimeModelErrorEvent{
+				Error: fmt.Errorf("missing required field response in %s", eventType),
+			})
+		}
+		if _, ok := requiredStringField(responsePayload, "id"); !ok {
+			return m.emitEvent(ctx, RealtimeModelErrorEvent{
+				Error: fmt.Errorf("missing required field response.id in %s", eventType),
+			})
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return m.emitEvent(ctx, RealtimeModelErrorEvent{
+				Error: fmt.Errorf("missing required field sequence_number in %s", eventType),
+			})
+		}
+		return nil
 
 	case "session.created", "session.updated":
 		sessionPayload, ok := event["session"]
@@ -1148,9 +1177,18 @@ func (m *OpenAIRealtimeWebSocketModel) handleWSEvent(
 
 	case "response.output_item.added", "response.output_item.done":
 		if _, ok := requiredIntField(event, "output_index"); !ok {
-			return m.emitEvent(ctx, RealtimeModelErrorEvent{
-				Error: fmt.Errorf("missing required field output_index in %s", eventType),
-			})
+			itemMap, ok := toStringAnyMap(event["item"])
+			if !ok {
+				return m.emitEvent(ctx, RealtimeModelErrorEvent{
+					Error: fmt.Errorf("missing required field item in %s", eventType),
+				})
+			}
+			itemType, _ := itemMap["type"].(string)
+			if itemType != "message" {
+				return m.emitEvent(ctx, RealtimeModelErrorEvent{
+					Error: fmt.Errorf("missing required field output_index in %s", eventType),
+				})
+			}
 		}
 		return m.handleOutputItemEvent(ctx, event, eventType, eventType == "response.output_item.done")
 
@@ -1181,10 +1219,268 @@ func (m *OpenAIRealtimeWebSocketModel) handleWSEvent(
 				Error: fmt.Errorf("missing required field part in %s", eventType),
 			})
 		}
-		if _, ok := toStringAnyMap(partPayload); !ok {
+		partMap, ok := toStringAnyMap(partPayload)
+		if !ok {
 			return m.emitEvent(ctx, RealtimeModelErrorEvent{
 				Error: fmt.Errorf("invalid field part in %s: expected object", eventType),
 			})
+		}
+		if _, ok := requiredStringField(partMap, "type"); !ok {
+			return m.emitEvent(ctx, RealtimeModelErrorEvent{
+				Error: fmt.Errorf("missing required field part.type in %s", eventType),
+			})
+		}
+		return nil
+
+	case "response.output_text.annotation.added":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "content_index"); !ok {
+			return missingField("content_index")
+		}
+		if _, ok := requiredIntField(event, "annotation_index"); !ok {
+			return missingField("annotation_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := event["annotation"]; !ok {
+			return missingField("annotation")
+		}
+		return nil
+
+	case "response.refusal.delta", "response.reasoning_text.delta":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "content_index"); !ok {
+			return missingField("content_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "delta"); !ok {
+			return missingField("delta")
+		}
+		return nil
+
+	case "response.refusal.done":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "content_index"); !ok {
+			return missingField("content_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "refusal"); !ok {
+			return missingField("refusal")
+		}
+		return nil
+
+	case "response.reasoning_text.done":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "content_index"); !ok {
+			return missingField("content_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "text"); !ok {
+			return missingField("text")
+		}
+		return nil
+
+	case "response.reasoning_summary_text.delta":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "summary_index"); !ok {
+			return missingField("summary_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "delta"); !ok {
+			return missingField("delta")
+		}
+		return nil
+
+	case "response.reasoning_summary_text.done":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "summary_index"); !ok {
+			return missingField("summary_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "text"); !ok {
+			return missingField("text")
+		}
+		return nil
+
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "summary_index"); !ok {
+			return missingField("summary_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		partRaw, ok := event["part"]
+		if !ok || partRaw == nil {
+			return missingField("part")
+		}
+		partMap, ok := toStringAnyMap(partRaw)
+		if !ok {
+			return m.emitEvent(ctx, RealtimeModelErrorEvent{
+				Error: fmt.Errorf("invalid field part in %s: expected object", eventType),
+			})
+		}
+		if _, ok := requiredStringField(partMap, "type"); !ok {
+			return missingField("part.type")
+		}
+		if _, ok := stringField(partMap, "text"); !ok {
+			return missingField("part.text")
+		}
+		return nil
+
+	case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed",
+		"response.file_search_call.in_progress", "response.file_search_call.searching", "response.file_search_call.completed",
+		"response.image_generation_call.in_progress", "response.image_generation_call.generating", "response.image_generation_call.completed",
+		"response.code_interpreter_call.in_progress", "response.code_interpreter_call.interpreting", "response.code_interpreter_call.completed",
+		"response.mcp_call.in_progress", "response.mcp_call.completed", "response.mcp_call.failed",
+		"response.mcp_list_tools.in_progress", "response.mcp_list_tools.completed", "response.mcp_list_tools.failed":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		return nil
+
+	case "response.image_generation_call.partial_image":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "partial_image_b64"); !ok {
+			return missingField("partial_image_b64")
+		}
+		if _, ok := requiredIntField(event, "partial_image_index"); !ok {
+			return missingField("partial_image_index")
+		}
+		return nil
+
+	case "response.code_interpreter_call_code.delta":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "delta"); !ok {
+			return missingField("delta")
+		}
+		return nil
+
+	case "response.code_interpreter_call_code.done":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "code"); !ok {
+			return missingField("code")
+		}
+		return nil
+
+	case "response.mcp_call_arguments.delta", "response.custom_tool_call_input.delta":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "delta"); !ok {
+			return missingField("delta")
+		}
+		return nil
+
+	case "response.mcp_call_arguments.done":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "arguments"); !ok {
+			return missingField("arguments")
+		}
+		return nil
+
+	case "response.custom_tool_call_input.done":
+		if _, ok := requiredStringField(event, "item_id"); !ok {
+			return missingField("item_id")
+		}
+		if _, ok := requiredIntField(event, "output_index"); !ok {
+			return missingField("output_index")
+		}
+		if _, ok := requiredIntField(event, "sequence_number"); !ok {
+			return missingField("sequence_number")
+		}
+		if _, ok := stringField(event, "input"); !ok {
+			return missingField("input")
 		}
 		return nil
 
@@ -1226,6 +1522,10 @@ func (m *OpenAIRealtimeWebSocketModel) handleWSEvent(
 			})
 		}
 		return nil
+	default:
+		return m.emitEvent(ctx, RealtimeModelErrorEvent{
+			Error: fmt.Errorf("unsupported realtime server event type %s", eventType),
+		})
 	}
 
 	return nil
@@ -1405,6 +1705,10 @@ func (m *OpenAIRealtimeWebSocketModel) handleOutputItemEvent(
 				Content: content,
 				Status:  &status,
 			},
+		})
+	default:
+		return m.emitEvent(ctx, RealtimeModelErrorEvent{
+			Error: fmt.Errorf("unsupported output item type %s in %s", itemType, eventType),
 		})
 	}
 

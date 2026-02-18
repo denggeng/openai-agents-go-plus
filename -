@@ -1,0 +1,10 @@
+{
+  "sessionId": "019c5bff-d94c-7b61-837a-49790cee4b2c",
+  "lastTaskCompleteTurnId": null,
+  "lastPrompt": "",
+  "lastRoundExitCode": null,
+  "lastJsonlMtime": null,
+  "lastTuiMtime": null,
+  "needUserDecision": false,
+  "pendingQuestion": ""
+}

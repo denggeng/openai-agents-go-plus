@@ -17,6 +17,8 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -72,6 +74,59 @@ func (r *recordingExec) Args() []CodexExecArgs {
 	out := make([]CodexExecArgs, len(r.args))
 	copy(out, r.args)
 	return out
+}
+
+type schemaCaptureExec struct {
+	mu     sync.Mutex
+	events []any
+	args   []CodexExecArgs
+	schema map[string]any
+}
+
+func (s *schemaCaptureExec) RunJSONL(ctx context.Context, args CodexExecArgs) (<-chan string, <-chan error) {
+	s.mu.Lock()
+	s.args = append(s.args, args)
+	events := append([]any(nil), s.events...)
+	if args.OutputSchemaFile != nil {
+		raw, err := os.ReadFile(*args.OutputSchemaFile)
+		if err == nil {
+			var decoded map[string]any
+			if jsonErr := json.Unmarshal(raw, &decoded); jsonErr == nil {
+				s.schema = decoded
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	lines := make(chan string)
+	errs := make(chan error, 1)
+
+	go func() {
+		defer close(lines)
+		defer close(errs)
+
+		for _, event := range events {
+			raw, err := json.Marshal(event)
+			if err != nil {
+				errs <- err
+				return
+			}
+			select {
+			case <-ctx.Done():
+				errs <- ctx.Err()
+				return
+			case lines <- string(raw):
+			}
+		}
+	}()
+
+	return lines, errs
+}
+
+func (s *schemaCaptureExec) Schema() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneStringAnyMap(s.schema)
 }
 
 func TestCoerceCodexToolOptionsRejectsUnknownFields(t *testing.T) {
@@ -158,6 +213,238 @@ func TestResolveOutputSchemaRejectsInvalid(t *testing.T) {
 	_, err := resolveOutputSchema(map[string]any{"type": "string"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `type "object"`)
+}
+
+func TestNewCodexToolAcceptsOutputSchemaDescriptor(t *testing.T) {
+	execClient := &schemaCaptureExec{
+		events: []any{
+			map[string]any{"type": "thread.started", "thread_id": "thread-1"},
+			map[string]any{
+				"type": "item.completed",
+				"item": map[string]any{"id": "agent-1", "type": "agent_message", "text": "Codex done."},
+			},
+			map[string]any{
+				"type": "turn.completed",
+				"usage": map[string]any{
+					"input_tokens":        1,
+					"cached_input_tokens": 0,
+					"output_tokens":       1,
+				},
+			},
+		},
+	}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	descriptor := map[string]any{
+		"title": "Summary",
+		"properties": []any{
+			map[string]any{
+				"name":        "summary",
+				"description": "Short summary",
+				"schema": map[string]any{
+					"type":        "string",
+					"description": "Summary field",
+				},
+			},
+		},
+	}
+
+	tool, err := NewCodexTool(CodexToolOptions{
+		Codex:        codexClient,
+		OutputSchema: descriptor,
+	})
+	require.NoError(t, err)
+
+	_, err = tool.OnInvokeTool(t.Context(), `{"inputs":[{"type":"text","text":"Check schema"}]}`)
+	require.NoError(t, err)
+
+	schema := execClient.Schema()
+	require.NotNil(t, schema)
+	assert.Equal(t, "object", schema["type"])
+	assert.Equal(t, false, schema["additionalProperties"])
+	properties, ok := schema["properties"].(map[string]any)
+	require.True(t, ok)
+	summary, ok := properties["summary"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "string", summary["type"])
+	assert.Equal(t, "Short summary", summary["description"])
+}
+
+func TestBuildDefaultCodexToolResponse(t *testing.T) {
+	assert.Equal(t, "Codex task completed with no inputs.", buildDefaultCodexToolResponse(codexToolCallArguments{}))
+	assert.Equal(t, "Codex task completed with inputs.", buildDefaultCodexToolResponse(codexToolCallArguments{
+		Inputs: []map[string]any{{"type": "text", "text": "hello"}},
+	}))
+}
+
+func TestConsumeCodexToolEventsDefaultResponse(t *testing.T) {
+	events := make(chan ThreadEvent, 1)
+	errs := make(chan error, 1)
+	events <- TurnCompletedEvent{
+		Usage: &Usage{InputTokens: 1, CachedInputTokens: 0, OutputTokens: 1},
+	}
+	close(events)
+	close(errs)
+
+	threadID := "thread-1"
+	thread := &Thread{id: &threadID}
+	streamed := &StreamedTurn{Events: events, Errors: errs}
+
+	response, usage, resolvedThreadID, err := consumeCodexToolEvents(
+		t.Context(),
+		streamed,
+		codexToolCallArguments{Inputs: []map[string]any{{"type": "text", "text": "hello"}}},
+		thread,
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "Codex task completed with inputs.", response)
+	require.NotNil(t, usage)
+	assert.Equal(t, 1, usage.InputTokens)
+	require.NotNil(t, resolvedThreadID)
+	assert.Equal(t, "thread-1", *resolvedThreadID)
+}
+
+func TestConsumeCodexToolEventsDefaultResponseNoInputs(t *testing.T) {
+	events := make(chan ThreadEvent, 1)
+	errs := make(chan error, 1)
+	events <- TurnCompletedEvent{
+		Usage: &Usage{InputTokens: 1, CachedInputTokens: 0, OutputTokens: 1},
+	}
+	close(events)
+	close(errs)
+
+	threadID := "thread-1"
+	thread := &Thread{id: &threadID}
+	streamed := &StreamedTurn{Events: events, Errors: errs}
+
+	response, usage, resolvedThreadID, err := consumeCodexToolEvents(
+		t.Context(),
+		streamed,
+		codexToolCallArguments{},
+		thread,
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "Codex task completed with no inputs.", response)
+	require.NotNil(t, usage)
+	assert.Equal(t, 1, usage.InputTokens)
+	require.NotNil(t, resolvedThreadID)
+	assert.Equal(t, "thread-1", *resolvedThreadID)
+}
+
+func TestConsumeCodexToolEventsThreadStartedUpdatesThreadID(t *testing.T) {
+	events := make(chan ThreadEvent, 2)
+	errs := make(chan error, 1)
+	events <- ThreadStartedEvent{ThreadID: "thread-2"}
+	events <- TurnCompletedEvent{}
+	close(events)
+	close(errs)
+
+	threadID := "thread-1"
+	thread := &Thread{id: &threadID}
+	streamed := &StreamedTurn{Events: events, Errors: errs}
+
+	response, _, resolvedThreadID, err := consumeCodexToolEvents(
+		t.Context(),
+		streamed,
+		codexToolCallArguments{Inputs: []map[string]any{{"type": "text", "text": "hello"}}},
+		thread,
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "Codex task completed with inputs.", response)
+	require.NotNil(t, resolvedThreadID)
+	assert.Equal(t, "thread-2", *resolvedThreadID)
+}
+
+func TestConsumeCodexToolEventsThreadErrorFails(t *testing.T) {
+	events := make(chan ThreadEvent, 1)
+	errs := make(chan error, 1)
+	events <- ThreadErrorEvent{Message: "boom"}
+	close(events)
+	close(errs)
+
+	threadID := "thread-1"
+	thread := &Thread{id: &threadID}
+	streamed := &StreamedTurn{Events: events, Errors: errs}
+
+	_, _, _, err := consumeCodexToolEvents(
+		t.Context(),
+		streamed,
+		codexToolCallArguments{},
+		thread,
+		nil,
+		nil,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Codex stream error: boom")
+}
+
+func TestCodexToolDefaultsToOpenAIAPIKey(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "codex-capture.sh")
+	scriptBody := `#!/bin/sh
+if [ -n "$CAPTURE_PATH" ]; then
+  echo "$CODEX_API_KEY" > "$CAPTURE_PATH"
+fi
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"thread-1"}'
+echo '{"type":"item.completed","item":{"id":"agent-1","type":"agent_message","text":"Codex done."}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'
+`
+	require.NoError(t, os.WriteFile(script, []byte(scriptBody), 0o755))
+
+	capturePath := filepath.Join(t.TempDir(), "api_key.txt")
+	t.Setenv("CAPTURE_PATH", capturePath)
+	t.Setenv("CODEX_PATH", script)
+	t.Setenv("OPENAI_API_KEY", "openai-key")
+	t.Setenv("CODEX_API_KEY", "")
+
+	tool, err := NewCodexTool(nil)
+	require.NoError(t, err)
+
+	_, err = tool.OnInvokeTool(t.Context(), `{"inputs":[{"type":"text","text":"hello"}]}`)
+	require.NoError(t, err)
+
+	raw, err := os.ReadFile(capturePath)
+	require.NoError(t, err)
+	assert.Equal(t, "openai-key", strings.TrimSpace(string(raw)))
+}
+
+func TestCodexToolDefaultsToOpenAIAPIKeyFromDefaultKey(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "codex-capture.sh")
+	scriptBody := `#!/bin/sh
+if [ -n "$CAPTURE_PATH" ]; then
+  echo "$CODEX_API_KEY" > "$CAPTURE_PATH"
+fi
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"thread-1"}'
+echo '{"type":"item.completed","item":{"id":"agent-1","type":"agent_message","text":"Codex done."}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'
+`
+	require.NoError(t, os.WriteFile(script, []byte(scriptBody), 0o755))
+
+	capturePath := filepath.Join(t.TempDir(), "api_key.txt")
+	t.Setenv("CAPTURE_PATH", capturePath)
+	t.Setenv("CODEX_PATH", script)
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("CODEX_API_KEY", "")
+
+	agents.ClearOpenaiSettings()
+	agents.SetDefaultOpenaiKey("default-openai-key", false)
+	defer agents.ClearOpenaiSettings()
+
+	tool, err := NewCodexTool(nil)
+	require.NoError(t, err)
+
+	_, err = tool.OnInvokeTool(t.Context(), `{"inputs":[{"type":"text","text":"hello"}]}`)
+	require.NoError(t, err)
+
+	raw, err := os.ReadFile(capturePath)
+	require.NoError(t, err)
+	assert.Equal(t, "default-openai-key", strings.TrimSpace(string(raw)))
 }
 
 func TestNewCodexToolInvokesAndAggregates(t *testing.T) {
@@ -727,6 +1014,192 @@ func TestCodexToolNameCollisionWithOtherToolFailsFast(t *testing.T) {
 	_, err := agent.GetAllTools(t.Context())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Duplicate Codex tool names found")
+}
+
+func TestResolveCodexOptionsReadsEnvOverride(t *testing.T) {
+	options := CodexOptions{
+		CodexPathOverride: ptr(" /bin/codex "),
+		Env:              map[any]any{"CODEX_API_KEY": "env-key"},
+	}
+
+	resolved, err := resolveCodexOptions(options)
+	require.NoError(t, err)
+	require.NotNil(t, resolved.APIKey)
+	assert.Equal(t, "env-key", *resolved.APIKey)
+	require.NotNil(t, resolved.CodexPathOverride)
+	assert.Equal(t, " /bin/codex ", *resolved.CodexPathOverride)
+}
+
+func TestCoerceCodexToolOptionsAcceptsCodexOptionsMap(t *testing.T) {
+	options, err := CoerceCodexToolOptions(map[string]any{
+		"codex_options": map[string]any{"api_key": "from-options"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, options)
+
+	resolved, err := resolveCodexOptions(options.CodexOptions)
+	require.NoError(t, err)
+	require.NotNil(t, resolved.APIKey)
+	assert.Equal(t, "from-options", *resolved.APIKey)
+}
+
+func TestNewCodexToolAcceptsMapOptions(t *testing.T) {
+	execClient := &recordingExec{
+		events: []any{
+			map[string]any{"type": "thread.started", "thread_id": "thread-1"},
+			map[string]any{
+				"type": "item.completed",
+				"item": map[string]any{"id": "agent-1", "type": "agent_message", "text": "Codex done."},
+			},
+			map[string]any{
+				"type": "turn.completed",
+				"usage": map[string]any{
+					"input_tokens":        1,
+					"cached_input_tokens": 0,
+					"output_tokens":       1,
+				},
+			},
+		},
+	}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	tool, err := NewCodexTool(map[string]any{
+		"codex":        codexClient,
+		"sandbox_mode": "read-only",
+		"name":         "codex_dict",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "codex_dict", tool.Name)
+
+	result, err := tool.OnInvokeTool(t.Context(), `{"inputs":[{"type":"text","text":"hello"}]}`)
+	require.NoError(t, err)
+	response, ok := result.(CodexToolResult)
+	require.True(t, ok)
+	assert.Equal(t, "Codex done.", response.Response)
+}
+
+func TestNewCodexToolAcceptsKeywordOverrides(t *testing.T) {
+	name := "codex_overrides"
+	description := "desc"
+	parameters := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"inputs": map[string]any{"type": "array"},
+		},
+	}
+	tool, err := NewCodexTool(CodexToolOptions{
+		Name:                  &name,
+		Description:           &description,
+		Parameters:            parameters,
+		OutputSchema:          map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false},
+		SpanDataMaxChars:      ptrInt(10),
+		PersistSession:        true,
+		IsEnabled:             agents.NewFunctionToolEnabledFlag(false),
+		UseRunContextThreadID: true,
+		RunContextThreadIDKey: ptr("thread_key"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "codex_overrides", tool.Name)
+	assert.Equal(t, "desc", tool.Description)
+	properties, ok := tool.ParamsJSONSchema["properties"].(map[string]any)
+	require.True(t, ok)
+	_, hasInputs := properties["inputs"]
+	assert.True(t, hasInputs)
+	require.NotNil(t, tool.IsEnabled)
+	enabled, err := tool.IsEnabled.IsEnabled(t.Context(), &agents.Agent{Name: "a"})
+	require.NoError(t, err)
+	assert.False(t, enabled)
+}
+
+func TestResolveCodexOptionsEnvOverrideWins(t *testing.T) {
+	t.Setenv("CODEX_API_KEY", "env-codex")
+	t.Setenv("OPENAI_API_KEY", "env-openai")
+	options := CodexOptions{
+		Env: map[any]any{"CODEX_API_KEY": "override-key"},
+	}
+
+	resolved, err := resolveCodexOptions(options)
+	require.NoError(t, err)
+	require.NotNil(t, resolved.APIKey)
+	assert.Equal(t, "override-key", *resolved.APIKey)
+}
+
+func TestResolveCodexOptionsReadsEnv(t *testing.T) {
+	t.Setenv("CODEX_API_KEY", "env-key")
+	t.Setenv("OPENAI_API_KEY", "")
+
+	resolved, err := resolveCodexOptions(nil)
+	require.NoError(t, err)
+	require.NotNil(t, resolved.APIKey)
+	assert.Equal(t, "env-key", *resolved.APIKey)
+}
+
+func TestResolveThreadOptionsMergesValues(t *testing.T) {
+	defaults := map[string]any{
+		"model":                  "gpt",
+		"sandbox_mode":           "read-only",
+		"additional_directories": []any{"/extra"},
+	}
+	sandbox := " sandbox "
+	working := " /work "
+	skip := true
+
+	resolved, err := resolveThreadOptions(defaults, &sandbox, &working, &skip)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	require.NotNil(t, resolved.Model)
+	assert.Equal(t, "gpt", *resolved.Model)
+	require.NotNil(t, resolved.SandboxMode)
+	assert.Equal(t, "sandbox", *resolved.SandboxMode)
+	require.NotNil(t, resolved.WorkingDirectory)
+	assert.Equal(t, "/work", *resolved.WorkingDirectory)
+	require.NotNil(t, resolved.SkipGitRepoCheck)
+	assert.True(t, *resolved.SkipGitRepoCheck)
+	assert.Equal(t, []string{"/extra"}, resolved.AdditionalDirectories)
+}
+
+func TestResolveThreadOptionsEmptyIsNone(t *testing.T) {
+	resolved, err := resolveThreadOptions(nil, nil, nil, nil)
+	require.NoError(t, err)
+	assert.Nil(t, resolved)
+
+	resolved, err = resolveThreadOptions(map[string]any{}, nil, nil, nil)
+	require.NoError(t, err)
+	assert.Nil(t, resolved)
+}
+
+func TestBuildTurnOptionsOverridesSchema(t *testing.T) {
+	outputSchema := map[string]any{"type": "object", "properties": map[string]any{}}
+	defaults := &TurnOptions{
+		OutputSchema:       map[string]any{"type": "object", "properties": map[string]any{"x": map[string]any{"type": "string"}}},
+		IdleTimeoutSeconds: ptr(1.0),
+	}
+	turn := buildTurnOptions(defaults, outputSchema)
+	assert.Equal(t, outputSchema, turn.OutputSchema)
+	require.NotNil(t, turn.IdleTimeoutSeconds)
+	assert.Equal(t, 1.0, *turn.IdleTimeoutSeconds)
+}
+
+func TestResolveCodexOptionsReadsOpenAIAPIKey(t *testing.T) {
+	t.Setenv("CODEX_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "openai-env-key")
+
+	resolved, err := resolveCodexOptions(nil)
+	require.NoError(t, err)
+	require.NotNil(t, resolved.APIKey)
+	assert.Equal(t, "openai-env-key", *resolved.APIKey)
+}
+
+func TestResolveCodexOptionsUsesDefaultOpenaiKey(t *testing.T) {
+	t.Setenv("CODEX_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	agents.ClearOpenaiSettings()
+	agents.SetDefaultOpenaiKey("default-openai-key", false)
+	defer agents.ClearOpenaiSettings()
+
+	resolved, err := resolveCodexOptions(nil)
+	require.NoError(t, err)
+	require.NotNil(t, resolved.APIKey)
+	assert.Equal(t, "default-openai-key", *resolved.APIKey)
 }
 
 func TestNewCodexToolRunContextModeHidesThreadIDInDefaultSchema(t *testing.T) {
