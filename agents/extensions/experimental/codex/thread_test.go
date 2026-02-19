@@ -76,6 +76,34 @@ func (f *fakeExec) RunJSONL(ctx context.Context, args CodexExecArgs) (<-chan str
 	return lines, errs
 }
 
+type blockingExec struct {
+	lastArgs CodexExecArgs
+}
+
+func (b *blockingExec) RunJSONL(ctx context.Context, args CodexExecArgs) (<-chan string, <-chan error) {
+	b.lastArgs = args
+	lines := make(chan string)
+	errs := make(chan error, 1)
+
+	go func() {
+		defer close(lines)
+		defer close(errs)
+		if args.Signal != nil {
+			select {
+			case <-args.Signal:
+				return
+			case <-ctx.Done():
+				errs <- ctx.Err()
+				return
+			}
+		}
+		<-ctx.Done()
+		errs <- ctx.Err()
+	}()
+
+	return lines, errs
+}
+
 func TestThreadRunStreamedPassesOptionsAndUpdatesID(t *testing.T) {
 	exec := &fakeExec{
 		events: []any{
@@ -227,6 +255,28 @@ func TestThreadRunStreamedIdleTimeoutForNonNativeExec(t *testing.T) {
 	_, err = collectStreamedEvents(streamed)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Codex stream idle for")
+}
+
+func TestThreadRunStreamedIdleTimeoutSetsSignal(t *testing.T) {
+	exec := &blockingExec{}
+	thread := newThread(exec, CodexOptions{}, ThreadOptions{}, nil)
+	signal := make(chan struct{})
+
+	streamed, err := thread.RunStreamed(t.Context(), "hello", TurnOptions{
+		Signal:             signal,
+		IdleTimeoutSeconds: ptr(0.01),
+	})
+	require.NoError(t, err)
+
+	_, err = collectStreamedEvents(streamed)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Codex stream idle for")
+
+	select {
+	case <-signal:
+	default:
+		t.Fatal("expected signal to be closed")
+	}
 }
 
 func collectStreamedEvents(streamed *StreamedTurn) ([]ThreadEvent, error) {

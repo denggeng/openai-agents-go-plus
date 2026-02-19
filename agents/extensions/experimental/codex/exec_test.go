@@ -18,10 +18,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -158,9 +160,31 @@ func TestResolveCodexPathUsesLookPath(t *testing.T) {
 }
 
 func TestResolveCodexPathFallbackWhenNotFound(t *testing.T) {
+	oldLookPath := lookPath
+	oldRuntimeOS := runtimeOS
+	oldRuntimeArch := runtimeArch
+	oldExecFilePath := execFilePath
+	t.Cleanup(func() {
+		lookPath = oldLookPath
+		runtimeOS = oldRuntimeOS
+		runtimeArch = oldRuntimeArch
+		execFilePath = oldExecFilePath
+	})
+
+	lookPath = func(string) (string, error) { return "", fmt.Errorf("not found") }
+	runtimeOS = func() string { return "linux" }
+	runtimeArch = func() string { return "amd64" }
+
+	tmp := t.TempDir()
+	execFilePath = func() string {
+		return filepath.Join(tmp, "agents", "extensions", "experimental", "codex", "exec.go")
+	}
+
 	t.Setenv("CODEX_PATH", "")
 	t.Setenv("PATH", "")
-	assert.Equal(t, "codex", resolveCodexPath(nil))
+	expectedRoot := filepath.Join(tmp, "agents", "extensions")
+	expected := filepath.Join(expectedRoot, "vendor", "x86_64-unknown-linux-musl", "codex", "codex")
+	assert.Equal(t, expected, resolveCodexPath(nil))
 }
 
 func TestCodexExecRunJSONLReturnsExitCodeError(t *testing.T) {
@@ -198,6 +222,62 @@ echo '{"type":"turn.started"}'
 	assert.Empty(t, lines)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Codex stream idle for")
+}
+
+func TestStartSignalWatcherTerminatesProcess(t *testing.T) {
+	script := writeExecutableScript(t, `#!/bin/sh
+sleep 5
+`)
+
+	cmd := exec.Command(script)
+	require.NoError(t, cmd.Start())
+
+	signal := make(chan struct{})
+	stop := startSignalWatcher(signal, cmd)
+	defer stop()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	close(signal)
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for process termination")
+	}
+}
+
+func TestPlatformTargetTripleMapping(t *testing.T) {
+	tests := []struct {
+		system   string
+		arch     string
+		expected string
+	}{
+		{system: "linux", arch: "x86_64", expected: "x86_64-unknown-linux-musl"},
+		{system: "linux", arch: "amd64", expected: "x86_64-unknown-linux-musl"},
+		{system: "linux", arch: "aarch64", expected: "aarch64-unknown-linux-musl"},
+		{system: "linux", arch: "arm64", expected: "aarch64-unknown-linux-musl"},
+		{system: "darwin", arch: "x86_64", expected: "x86_64-apple-darwin"},
+		{system: "darwin", arch: "arm64", expected: "aarch64-apple-darwin"},
+		{system: "win32", arch: "x86_64", expected: "x86_64-pc-windows-msvc"},
+		{system: "win32", arch: "arm64", expected: "aarch64-pc-windows-msvc"},
+	}
+
+	for _, test := range tests {
+		triple, err := platformTargetTriple(test.system, test.arch)
+		require.NoError(t, err)
+		assert.Equal(t, test.expected, triple)
+	}
+}
+
+func TestPlatformTargetTripleUnsupported(t *testing.T) {
+	_, err := platformTargetTriple("solaris", "sparc")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Unsupported platform")
 }
 
 func collectJSONLResult(linesCh <-chan string, errsCh <-chan error) ([]string, error) {

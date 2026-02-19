@@ -18,84 +18,79 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-type stubTask struct {
+type fakeCallTask struct {
 	done bool
 }
 
-func (t *stubTask) Done() bool {
-	return t.done
-}
+func (t *fakeCallTask) Done() bool { return t.done }
 
-func setupCallTaskTest(t *testing.T) {
+func TestTrackCallTaskIgnoresDuplicateWebhooks(t *testing.T) {
+	originalStartObserver := startObserver
 	activeCallTasksMu.Lock()
-	oldTasks := activeCallTasks
+	originalTasks := activeCallTasks
 	activeCallTasks = map[string]callTask{}
 	activeCallTasksMu.Unlock()
 
-	oldStartObserver := startObserver
-
 	t.Cleanup(func() {
+		startObserver = originalStartObserver
 		activeCallTasksMu.Lock()
-		activeCallTasks = oldTasks
+		activeCallTasks = originalTasks
 		activeCallTasksMu.Unlock()
-		startObserver = oldStartObserver
 	})
-}
 
-func TestTrackCallTaskIgnoresDuplicateWebhooks(t *testing.T) {
-	setupCallTaskTest(t)
-
-	existing := &stubTask{done: false}
+	existing := &fakeCallTask{done: false}
 	activeCallTasksMu.Lock()
 	activeCallTasks["call-123"] = existing
 	activeCallTasksMu.Unlock()
 
-	called := 0
+	startCalled := false
 	startObserver = func(callID string) callTask {
-		called++
-		return &stubTask{done: false}
+		startCalled = true
+		return &fakeCallTask{done: false}
 	}
 
 	trackCallTask("call-123")
 
-	assert.Equal(t, 0, called)
-
+	assert.False(t, startCalled)
 	activeCallTasksMu.Lock()
-	got := activeCallTasks["call-123"]
+	current := activeCallTasks["call-123"]
 	activeCallTasksMu.Unlock()
-
-	gotTask, ok := got.(*stubTask)
-	require.True(t, ok)
-	assert.Same(t, existing, gotTask)
+	assert.Same(t, existing, current)
 }
 
 func TestTrackCallTaskRestartsAfterCompletion(t *testing.T) {
-	setupCallTaskTest(t)
+	originalStartObserver := startObserver
+	activeCallTasksMu.Lock()
+	originalTasks := activeCallTasks
+	activeCallTasks = map[string]callTask{}
+	activeCallTasksMu.Unlock()
 
-	existing := &stubTask{done: true}
+	t.Cleanup(func() {
+		startObserver = originalStartObserver
+		activeCallTasksMu.Lock()
+		activeCallTasks = originalTasks
+		activeCallTasksMu.Unlock()
+	})
+
+	existing := &fakeCallTask{done: true}
 	activeCallTasksMu.Lock()
 	activeCallTasks["call-456"] = existing
 	activeCallTasksMu.Unlock()
 
-	newTask := &stubTask{done: false}
-	called := 0
+	newTask := &fakeCallTask{done: false}
+	startCalled := false
 	startObserver = func(callID string) callTask {
-		called++
+		startCalled = true
 		return newTask
 	}
 
 	trackCallTask("call-456")
 
-	assert.Equal(t, 1, called)
-
+	assert.True(t, startCalled)
 	activeCallTasksMu.Lock()
-	got := activeCallTasks["call-456"]
+	current := activeCallTasks["call-456"]
 	activeCallTasksMu.Unlock()
-
-	gotTask, ok := got.(*stubTask)
-	require.True(t, ok)
-	assert.Same(t, newTask, gotTask)
+	assert.Same(t, newTask, current)
 }

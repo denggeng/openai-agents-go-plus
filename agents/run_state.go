@@ -102,14 +102,19 @@ func NewRunStateFromResult(result RunResult, currentTurn uint64, maxTurns uint64
 	if previousResponseID == "" {
 		previousResponseID = result.LastResponseID()
 	}
+	modelItems := result.NewItems
+	if len(result.ModelInputItems) > 0 {
+		modelItems = result.ModelInputItems
+	}
 	return RunState{
 		SchemaVersion:              CurrentRunStateSchemaVersion,
 		CurrentTurn:                currentTurn,
 		MaxTurns:                   maxTurns,
 		CurrentAgentName:           displayAgentName(result.LastAgent),
 		OriginalInput:              slices.Clone(ItemHelpers().InputToNewInputList(result.Input)),
-		GeneratedItems:             toInputList(InputItems{}, result.NewItems),
-		GeneratedRunItems:          slices.Clone(result.NewItems),
+		GeneratedItems:             toInputList(InputItems{}, modelItems),
+		GeneratedRunItems:          slices.Clone(modelItems),
+		SessionItems:               slices.Clone(result.NewItems),
 		ModelResponses:             slices.Clone(result.RawResponses),
 		PreviousResponseID:         previousResponseID,
 		ConversationID:             result.ConversationID,
@@ -132,14 +137,19 @@ func NewRunStateFromStreaming(result *RunResultStreaming) RunState {
 	if previousResponseID == "" {
 		previousResponseID = result.LastResponseID()
 	}
+	modelItems := result.NewItems()
+	if len(result.ModelInputItems()) > 0 {
+		modelItems = result.ModelInputItems()
+	}
 	return RunState{
 		SchemaVersion:              CurrentRunStateSchemaVersion,
 		CurrentTurn:                result.CurrentTurn(),
 		MaxTurns:                   result.MaxTurns(),
 		CurrentAgentName:           displayAgentName(result.LastAgent()),
 		OriginalInput:              slices.Clone(ItemHelpers().InputToNewInputList(result.Input())),
-		GeneratedItems:             toInputList(InputItems{}, result.NewItems()),
-		GeneratedRunItems:          slices.Clone(result.NewItems()),
+		GeneratedItems:             toInputList(InputItems{}, modelItems),
+		GeneratedRunItems:          slices.Clone(modelItems),
+		SessionItems:               slices.Clone(result.NewItems()),
 		ModelResponses:             slices.Clone(result.RawResponses()),
 		PreviousResponseID:         previousResponseID,
 		ConversationID:             result.ConversationID(),
@@ -215,15 +225,12 @@ func (s *RunState) ApproveTool(approvalItem ToolApprovalItem) error {
 	if s == nil {
 		return nil
 	}
-	if isMCPApprovalItem(approvalItem) {
-		item, err := buildMCPApprovalResponseInputItem(approvalItem, true, "")
-		if err != nil {
-			return err
+	if parentSig, ok := agentToolParentSignatureFromRaw(approvalItem.RawItem); ok {
+		if nestedState := peekAgentToolRunState(parentSig); nestedState != nil && nestedState != s {
+			return nestedState.applyToolDecision(approvalItem, true, "")
 		}
-		s.GeneratedItems = append(s.GeneratedItems, item)
 	}
-	s.applyDecisionToToolApprovals(approvalItem, true)
-	return nil
+	return s.applyToolDecision(approvalItem, true, "")
 }
 
 // RejectTool appends a rejection response input item for the given interruption.
@@ -231,14 +238,26 @@ func (s *RunState) RejectTool(approvalItem ToolApprovalItem, reason string) erro
 	if s == nil {
 		return nil
 	}
+	if parentSig, ok := agentToolParentSignatureFromRaw(approvalItem.RawItem); ok {
+		if nestedState := peekAgentToolRunState(parentSig); nestedState != nil && nestedState != s {
+			return nestedState.applyToolDecision(approvalItem, false, reason)
+		}
+	}
+	return s.applyToolDecision(approvalItem, false, reason)
+}
+
+func (s *RunState) applyToolDecision(approvalItem ToolApprovalItem, approve bool, reason string) error {
+	if s == nil {
+		return nil
+	}
 	if isMCPApprovalItem(approvalItem) {
-		item, err := buildMCPApprovalResponseInputItem(approvalItem, false, reason)
+		item, err := buildMCPApprovalResponseInputItem(approvalItem, approve, reason)
 		if err != nil {
 			return err
 		}
 		s.GeneratedItems = append(s.GeneratedItems, item)
 	}
-	s.applyDecisionToToolApprovals(approvalItem, false)
+	s.applyDecisionToToolApprovals(approvalItem, approve)
 	return nil
 }
 

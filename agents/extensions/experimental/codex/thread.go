@@ -329,7 +329,13 @@ func durationFromIdleTimeout(idleTimeoutSeconds *float64) time.Duration {
 
 func resolveSignal(turnOptions TurnOptions) (<-chan struct{}, func()) {
 	if turnOptions.Signal != nil {
-		return turnOptions.Signal, func() {}
+		signal := turnOptions.Signal
+		var once sync.Once
+		return signal, func() {
+			once.Do(func() {
+				close(signal)
+			})
+		}
 	}
 	if turnOptions.IdleTimeoutSeconds == nil {
 		return nil, func() {}

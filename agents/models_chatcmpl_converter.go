@@ -1026,7 +1026,7 @@ func (chatCmplConverter) ToolToOpenai(tool Tool) (*openai.ChatCompletionToolUnio
 		openai.FunctionDefinitionParam{
 			Name:        functionTool.Name,
 			Description: description,
-			Parameters:  functionTool.ParamsJSONSchema,
+			Parameters:  materializeJSONMap(functionTool.ParamsJSONSchema),
 		},
 	)
 	return &funcTool, nil
@@ -1041,7 +1041,7 @@ func (chatCmplConverter) ConvertHandoffTool(handoff Handoff) openai.ChatCompleti
 		openai.FunctionDefinitionParam{
 			Name:        handoff.ToolName,
 			Description: description,
-			Parameters:  handoff.InputJSONSchema,
+			Parameters:  materializeJSONMap(handoff.InputJSONSchema),
 		},
 	)
 }

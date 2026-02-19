@@ -23,6 +23,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -95,13 +97,80 @@ func resolveCodexPath(executablePath *string) string {
 	if executablePath != nil && strings.TrimSpace(*executablePath) != "" {
 		return *executablePath
 	}
+	return findCodexPath()
+}
+
+var (
+	lookPath     = exec.LookPath
+	runtimeOS    = func() string { return runtime.GOOS }
+	runtimeArch  = func() string { return runtime.GOARCH }
+	execFilePath = func() string {
+		_, file, _, ok := runtime.Caller(0)
+		if !ok {
+			return ""
+		}
+		return file
+	}
+)
+
+func findCodexPath() string {
 	if fromEnv := strings.TrimSpace(os.Getenv("CODEX_PATH")); fromEnv != "" {
 		return fromEnv
 	}
-	if lookedUp, err := exec.LookPath("codex"); err == nil && strings.TrimSpace(lookedUp) != "" {
+	if lookedUp, err := lookPath("codex"); err == nil && strings.TrimSpace(lookedUp) != "" {
 		return lookedUp
 	}
-	return "codex"
+	triple, err := platformTargetTriple(runtimeOS(), runtimeArch())
+	if err != nil {
+		return "codex"
+	}
+	root := codexVendorRoot()
+	if root == "" {
+		return "codex"
+	}
+	return filepath.Join(root, "vendor", triple, "codex", "codex")
+}
+
+func codexVendorRoot() string {
+	file := execFilePath()
+	if strings.TrimSpace(file) == "" {
+		return ""
+	}
+	dir := filepath.Dir(file)
+	for i := 0; i < 2; i++ {
+		dir = filepath.Dir(dir)
+	}
+	if strings.TrimSpace(dir) == "" || dir == "." {
+		return ""
+	}
+	return dir
+}
+
+func platformTargetTriple(system, arch string) (string, error) {
+	switch system {
+	case "linux":
+		switch arch {
+		case "amd64", "x86_64":
+			return "x86_64-unknown-linux-musl", nil
+		case "arm64", "aarch64":
+			return "aarch64-unknown-linux-musl", nil
+		}
+	case "darwin":
+		switch arch {
+		case "amd64", "x86_64":
+			return "x86_64-apple-darwin", nil
+		case "arm64", "aarch64":
+			return "aarch64-apple-darwin", nil
+		}
+	case "windows", "win32":
+		switch arch {
+		case "amd64", "x86_64":
+			return "x86_64-pc-windows-msvc", nil
+		case "arm64", "aarch64":
+			return "aarch64-pc-windows-msvc", nil
+		}
+	}
+	return "", fmt.Errorf("Unsupported platform: %s/%s", system, arch)
 }
 
 func resolveSubprocessStreamLimitBytes(explicitValue *int) (int, error) {

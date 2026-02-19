@@ -152,9 +152,19 @@ type AgentAsToolParams struct {
 	// If not provided, the last message from the agent will be used.
 	CustomOutputExtractor func(context.Context, RunResult) (string, error)
 
+	// Optional approval policy for this agent tool.
+	NeedsApproval FunctionToolNeedsApproval
+
 	// Optional static or dynamic flag reporting whether the tool is enabled.
 	// If omitted, the tool is enabled by default.
 	IsEnabled FunctionToolEnabler
+}
+
+// AgentToolRunResult wraps the result of running an agent as a tool.
+// When Interruptions are present, Output may be empty and Result should be inspected.
+type AgentToolRunResult struct {
+	Result *RunResult
+	Output string
 }
 
 // AsTool transforms this agent into a tool, callable by other agents.
@@ -174,20 +184,58 @@ func (a *Agent) AsTool(params AgentAsToolParams) Tool {
 		Input string `json:"input"`
 	}
 
-	runAgent := func(ctx context.Context, args argsType) (string, error) {
-		output, err := DefaultRunner.Run(ctx, a, args.Input)
-		if err != nil {
-			return "", fmt.Errorf("failed to run agent %s as tool: %w", a.Name, err)
+	runAgent := func(ctx context.Context, args argsType) (AgentToolRunResult, error) {
+		toolData := ToolDataFromContext(ctx)
+		signature := agentToolSignatureFromToolData(toolData)
+
+		var output *RunResult
+		var err error
+		if signature != (agentToolSignature{}) {
+			if resumeState := consumeAgentToolRunState(signature); resumeState != nil {
+				output, err = DefaultRunner.RunFromState(ctx, a, *resumeState)
+			} else {
+				output, err = DefaultRunner.Run(ctx, a, args.Input)
+			}
+		} else {
+			output, err = DefaultRunner.Run(ctx, a, args.Input)
 		}
-		if params.CustomOutputExtractor != nil {
-			return params.CustomOutputExtractor(ctx, *output)
+		if err != nil {
+			return AgentToolRunResult{}, fmt.Errorf("failed to run agent %s as tool: %w", a.Name, err)
 		}
 
-		return ItemHelpers().TextMessageOutputs(output.NewItems), nil
+		if len(output.Interruptions) > 0 {
+			if signature != (agentToolSignature{}) {
+				maxTurns := DefaultRunner.Config.MaxTurns
+				if maxTurns == 0 {
+					maxTurns = DefaultMaxTurns
+				}
+				currentTurn := uint64(len(output.RawResponses))
+				runState := NewRunStateFromResult(*output, currentTurn, maxTurns)
+				recordAgentToolRunState(signature, &runState)
+			}
+			return AgentToolRunResult{Result: output}, nil
+		}
+
+		var result string
+		if params.CustomOutputExtractor != nil {
+			result, err = params.CustomOutputExtractor(ctx, *output)
+			if err != nil {
+				return AgentToolRunResult{}, err
+			}
+		} else {
+			result = ItemHelpers().TextMessageOutputs(output.NewItems)
+		}
+
+		return AgentToolRunResult{
+			Result: output,
+			Output: result,
+		}, nil
 	}
 
 	tool := NewFunctionTool(name, params.ToolDescription, runAgent)
 	tool.IsEnabled = params.IsEnabled
+	tool.NeedsApproval = params.NeedsApproval
+	tool.AgentTool = a
 	return tool
 }
 

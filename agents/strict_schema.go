@@ -94,6 +94,17 @@ func ensureStrictJSONSchema(rawJSONSchema any, path []string, root map[string]an
 	}
 
 	// unions
+	if oneOf, ok := jsonSchema["oneOf"].([]any); ok {
+		if anyOf, okAny := jsonSchema["anyOf"].([]any); okAny {
+			merged := make([]any, 0, len(anyOf)+len(oneOf))
+			merged = append(merged, anyOf...)
+			merged = append(merged, oneOf...)
+			jsonSchema["anyOf"] = merged
+		} else {
+			jsonSchema["anyOf"] = oneOf
+		}
+		delete(jsonSchema, "oneOf")
+	}
 	if anyOf, ok := jsonSchema["anyOf"].([]any); ok {
 		newAnyOf := make([]any, len(anyOf))
 		for i, variant := range anyOf {

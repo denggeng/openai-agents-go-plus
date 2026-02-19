@@ -68,6 +68,10 @@ type Handoff struct {
 	// items generated before will already have been streamed.
 	InputFilter HandoffInputFilter
 
+	// Optional override for the run-level NestHandoffHistory behavior.
+	// If omitted, the RunConfig-level setting is used.
+	NestHandoffHistory param.Opt[bool]
+
 	// Whether the input JSON schema is in strict mode. We **strongly** recommend setting this to
 	// true, as it increases the likelihood of correct JSON input.
 	// Defaults to true if omitted.
@@ -138,6 +142,9 @@ func DefaultHandoffToolDescription(agent *Agent) string {
 // HandoffInputFilter is a function that filters the input data passed to the next agent.
 type HandoffInputFilter = func(context.Context, HandoffInputData) (HandoffInputData, error)
 
+// HandoffHistoryMapper maps a transcript to a nested summary payload.
+type HandoffHistoryMapper = func([]TResponseInputItem) []TResponseInputItem
+
 type HandoffInputData struct {
 	// The input history before `Runner.Run()` was called.
 	InputHistory Input
@@ -148,6 +155,14 @@ type HandoffInputData struct {
 	// The new items generated during the current agent turn, including the item that triggered the
 	// handoff and the tool output message representing the response from the handoff output.
 	NewItems []RunItem
+
+	// Items to include in the next agent's input. When set, these items are used instead of
+	// NewItems for building the input to the next agent. This allows filtering duplicates
+	// from model input while preserving all items in NewItems for session history.
+	InputItems []RunItem
+
+	// The run context at the time the handoff was invoked (optional).
+	RunContext *RunContextWrapper[any]
 }
 
 type OnHandoff interface {
@@ -182,6 +197,9 @@ type HandoffFromAgentParams struct {
 
 	// Optional function that filters the inputs that are passed to the next agent.
 	InputFilter HandoffInputFilter
+
+	// Optional override for the run-level NestHandoffHistory behavior.
+	NestHandoffHistory param.Opt[bool]
 
 	// Optional flag reporting whether the tool is enabled.
 	// It can be either a boolean or a function which allows you to dynamically
@@ -291,6 +309,7 @@ func SafeHandoffFromAgent(params HandoffFromAgentParams) (*Handoff, error) {
 		OnInvokeHandoff:  invokeHandoff,
 		AgentName:        params.Agent.Name,
 		InputFilter:      params.InputFilter,
+		NestHandoffHistory: params.NestHandoffHistory,
 		StrictJSONSchema: param.NewOpt(true),
 		IsEnabled:        isEnabled,
 	}, nil

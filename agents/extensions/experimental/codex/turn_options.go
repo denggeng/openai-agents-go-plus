@@ -23,7 +23,7 @@ import (
 // TurnOptions stores run-specific options for a Codex thread turn.
 type TurnOptions struct {
 	OutputSchema       map[string]any
-	Signal             <-chan struct{}
+	Signal             chan struct{}
 	IdleTimeoutSeconds *float64
 }
 
@@ -102,15 +102,15 @@ func cloneTurnOptions(options *TurnOptions) *TurnOptions {
 	return &clone
 }
 
-func optionalSignal(value any, fieldName string) (<-chan struct{}, error) {
+func optionalSignal(value any, fieldName string) (chan struct{}, error) {
 	if value == nil {
 		return nil, nil
 	}
 	switch typed := value.(type) {
-	case <-chan struct{}:
-		return typed, nil
 	case chan struct{}:
 		return typed, nil
+	case <-chan struct{}:
+		return nil, agents.UserErrorf("%s must be a bidirectional channel", fieldName)
 	default:
 		return nil, agents.UserErrorf("%s must be a channel or nil", fieldName)
 	}

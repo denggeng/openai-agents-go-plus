@@ -518,7 +518,7 @@ func (conv responsesConverter) convertTool(
 		convertedTool = &responses.ToolUnionParam{
 			OfFunction: &responses.FunctionToolParam{
 				Name:        t.Name,
-				Parameters:  t.ParamsJSONSchema,
+				Parameters:  materializeJSONMap(t.ParamsJSONSchema),
 				Strict:      param.NewOpt(t.StrictJSONSchema.Or(true)),
 				Description: param.NewOpt(t.Description),
 				Type:        constant.ValueOf[constant.Function](),
@@ -629,7 +629,7 @@ func (responsesConverter) convertHandoffTool(handoff Handoff) responses.ToolUnio
 	return responses.ToolUnionParam{
 		OfFunction: &responses.FunctionToolParam{
 			Name:        handoff.ToolName,
-			Parameters:  handoff.InputJSONSchema,
+			Parameters:  materializeJSONMap(handoff.InputJSONSchema),
 			Strict:      param.NewOpt(handoff.StrictJSONSchema.Or(true)),
 			Description: param.NewOpt(handoff.ToolDescription),
 			Type:        constant.ValueOf[constant.Function](),

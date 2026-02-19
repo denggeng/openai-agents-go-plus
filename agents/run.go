@@ -84,6 +84,13 @@ type RunConfig struct {
 	// agent. See the documentation in `Handoff.InputFilter` for more details.
 	HandoffInputFilter HandoffInputFilter
 
+	// Whether to nest handoff history into a single summary message for the next agent.
+	// Defaults to false when left unset.
+	NestHandoffHistory bool
+
+	// Optional mapper used to build the nested handoff history summary.
+	HandoffHistoryMapper HandoffHistoryMapper
+
 	// A list of input guardrails to run on the initial run input.
 	InputGuardrails []InputGuardrail
 
@@ -455,8 +462,10 @@ func (r Runner) runWithStartingTurnAndState(
 		contextWrapper.Context = value
 	}
 	if resumeState != nil {
-		// Reset persisted count for the resumed turn and restore approval decisions.
-		resumeState.CurrentTurnPersistedItemCount = 0
+		if resumeState.CurrentTurn == 0 {
+			resumeState.CurrentTurnPersistedItemCount = 0
+		}
+		// Restore approval decisions from the prior run state.
 		resumeState.ApplyToolApprovalsToContext(contextWrapper)
 		if resumeState.Context != nil {
 			if !hasContextOverride {
@@ -496,7 +505,8 @@ func (r Runner) runWithStartingTurnAndState(
 		}
 
 		var (
-			generatedItems             []RunItem
+			modelInputItems            []RunItem
+			sessionItems               []RunItem
 			modelResponses             []ModelResponse
 			inputGuardrailResults      []InputGuardrailResult
 			outputGuardrailResults     []OutputGuardrailResult
@@ -506,6 +516,7 @@ func (r Runner) runWithStartingTurnAndState(
 			currentSpan                tracing.Span
 		)
 		if resumeState != nil {
+			modelResponses = slices.Clone(resumeState.ModelResponses)
 			inputGuardrailResults = resumeState.ResumeInputGuardrailResults()
 			outputGuardrailResults = resumeState.ResumeOutputGuardrailResults()
 			toolInputGuardrailResults = resumeState.ResumeToolInputGuardrailResults()
@@ -530,7 +541,7 @@ func (r Runner) runWithStartingTurnAndState(
 		currentAgent := startingAgent
 		shouldRunAgentStartHooks := true
 
-		if resumeState != nil && len(resumeState.Interruptions) > 0 {
+		if resumeState != nil {
 			pendingInterruptions := slices.Clone(resumeState.Interruptions)
 			resolvedItems, pendingInterruptions, toolInputResults, toolOutputResults, functionResults, err := r.resolveFunctionToolInterruptionsOnResume(
 				ctx,
@@ -545,7 +556,8 @@ func (r Runner) runWithStartingTurnAndState(
 				return err
 			}
 			if len(resolvedItems) > 0 {
-				generatedItems = append(generatedItems, resolvedItems...)
+				modelInputItems = append(modelInputItems, resolvedItems...)
+				sessionItems = append(sessionItems, resolvedItems...)
 			}
 			if len(toolInputResults) > 0 {
 				toolInputGuardrailResults = append(toolInputGuardrailResults, toolInputResults...)
@@ -566,14 +578,49 @@ func (r Runner) runWithStartingTurnAndState(
 				return err
 			}
 			if len(resolvedItems) > 0 {
-				generatedItems = append(generatedItems, resolvedItems...)
+				modelInputItems = append(modelInputItems, resolvedItems...)
+				sessionItems = append(sessionItems, resolvedItems...)
 			}
+
+			resolvedItems, pendingInterruptions, err = r.resolveShellInterruptionsOnResume(
+				ctx,
+				currentAgent,
+				resumeState,
+				pendingInterruptions,
+				hooks,
+				r.Config,
+				contextWrapper,
+			)
+			if err != nil {
+				return err
+			}
+			if len(resolvedItems) > 0 {
+				modelInputItems = append(modelInputItems, resolvedItems...)
+				sessionItems = append(sessionItems, resolvedItems...)
+			}
+
+			resolvedItems, pendingInterruptions, err = r.resolveComputerActionsOnResume(
+				ctx,
+				currentAgent,
+				resumeState,
+				pendingInterruptions,
+				hooks,
+			)
+			if err != nil {
+				return err
+			}
+			if len(resolvedItems) > 0 {
+				modelInputItems = append(modelInputItems, resolvedItems...)
+				sessionItems = append(sessionItems, resolvedItems...)
+			}
+
 			pendingInterruptions = filterPendingMCPInterruptions(pendingInterruptions, contextWrapper)
 			if len(pendingInterruptions) > 0 {
 				interruptions = slices.Clone(pendingInterruptions)
 				runResult = &RunResult{
 					Input:                      originalInput,
-					NewItems:                   generatedItems,
+					NewItems:                   sessionItems,
+					ModelInputItems:            modelInputItems,
 					RawResponses:               modelResponses,
 					InputGuardrailResults:      inputGuardrailResults,
 					OutputGuardrailResults:     outputGuardrailResults,
@@ -615,7 +662,8 @@ func (r Runner) runWithStartingTurnAndState(
 					}
 					runResult = &RunResult{
 						Input:                      originalInput,
-						NewItems:                   generatedItems,
+						NewItems:                   sessionItems,
+						ModelInputItems:            modelInputItems,
 						RawResponses:               modelResponses,
 						FinalOutput:                finalOutput,
 						InputGuardrailResults:      inputGuardrailResults,
@@ -640,7 +688,8 @@ func (r Runner) runWithStartingTurnAndState(
 					agentsErr.RunData = &RunErrorDetails{
 						Context:                    ctx,
 						Input:                      originalInput,
-						NewItems:                   generatedItems,
+						NewItems:                   sessionItems,
+						ModelInputItems:            modelInputItems,
 						RawResponses:               modelResponses,
 						LastAgent:                  currentAgent,
 						InputGuardrailResults:      inputGuardrailResults,
@@ -742,7 +791,7 @@ func (r Runner) runWithStartingTurnAndState(
 						currentAgent,
 						allTools,
 						originalInput,
-						generatedItems,
+						modelInputItems,
 						hooks,
 						r.Config,
 						shouldRunAgentStartHooks,
@@ -766,7 +815,7 @@ func (r Runner) runWithStartingTurnAndState(
 					currentAgent,
 					allTools,
 					originalInput,
-					generatedItems,
+					modelInputItems,
 					hooks,
 					r.Config,
 					shouldRunAgentStartHooks,
@@ -784,7 +833,8 @@ func (r Runner) runWithStartingTurnAndState(
 
 			modelResponses = append(modelResponses, turnResult.ModelResponse)
 			originalInput = turnResult.OriginalInput
-			generatedItems = turnResult.GeneratedItems()
+			modelInputItems = turnResult.GeneratedItems()
+			sessionItems = append(sessionItems, turnResult.StepSessionItems()...)
 			toolInputGuardrailResults = append(toolInputGuardrailResults, turnResult.ToolInputGuardrailResults...)
 			toolOutputGuardrailResults = append(toolOutputGuardrailResults, turnResult.ToolOutputGuardrailResults...)
 
@@ -801,7 +851,8 @@ func (r Runner) runWithStartingTurnAndState(
 				}
 				runResult = &RunResult{
 					Input:                      originalInput,
-					NewItems:                   generatedItems,
+					NewItems:                   sessionItems,
+					ModelInputItems:            modelInputItems,
 					RawResponses:               modelResponses,
 					FinalOutput:                nextStep.Output,
 					InputGuardrailResults:      inputGuardrailResults,
@@ -834,7 +885,8 @@ func (r Runner) runWithStartingTurnAndState(
 				interruptions = slices.Clone(nextStep.Interruptions)
 				runResult = &RunResult{
 					Input:                      originalInput,
-					NewItems:                   generatedItems,
+					NewItems:                   sessionItems,
+					ModelInputItems:            modelInputItems,
 					RawResponses:               modelResponses,
 					InputGuardrailResults:      inputGuardrailResults,
 					OutputGuardrailResults:     outputGuardrailResults,
@@ -868,7 +920,7 @@ func (r Runner) resolveApplyPatchInterruptionsOnResume(
 	hooks RunHooks,
 	runConfig RunConfig,
 ) ([]RunItem, []ToolApprovalItem, error) {
-	if resumeState == nil || len(interruptions) == 0 {
+	if resumeState == nil {
 		return nil, interruptions, nil
 	}
 
@@ -884,7 +936,7 @@ func (r Runner) resolveApplyPatchInterruptionsOnResume(
 			break
 		}
 	}
-	if applyPatchTool == nil || !hasApplyPatchInterruptions(interruptions, applyPatchTool) {
+	if applyPatchTool == nil {
 		return nil, interruptions, nil
 	}
 
@@ -911,7 +963,7 @@ func (r Runner) resolveApplyPatchInterruptionsOnResume(
 	contextWrapper := NewRunContextWrapper[any](nil)
 	resumeState.ApplyToolApprovalsToContext(contextWrapper)
 
-	results, interruptions, err := RunImpl().ExecuteApplyPatchCalls(
+	results, applyPatchInterruptions, err := RunImpl().ExecuteApplyPatchCalls(
 		ctx,
 		agent,
 		applyPatchCalls,
@@ -924,8 +976,8 @@ func (r Runner) resolveApplyPatchInterruptionsOnResume(
 	}
 
 	pending := filterNonApplyPatchInterruptions(interruptions, applyPatchTool)
-	if len(interruptions) > 0 {
-		pending = append(pending, interruptions...)
+	if len(applyPatchInterruptions) > 0 {
+		pending = append(pending, applyPatchInterruptions...)
 	}
 
 	return results, pending, nil
@@ -940,7 +992,7 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 	runConfig RunConfig,
 	contextWrapper *RunContextWrapper[any],
 ) ([]RunItem, []ToolApprovalItem, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, []FunctionToolResult, error) {
-	if resumeState == nil || len(interruptions) == 0 {
+	if resumeState == nil {
 		return nil, interruptions, nil, nil, nil, nil
 	}
 
@@ -956,17 +1008,6 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 		}
 	}
 	if len(functionToolNames) == 0 {
-		return nil, interruptions, nil, nil, nil, nil
-	}
-
-	hasFunctionInterruptions := false
-	for _, interruption := range interruptions {
-		if _, ok := functionToolNames[resolveApprovalToolName(interruption)]; ok {
-			hasFunctionInterruptions = true
-			break
-		}
-	}
-	if !hasFunctionInterruptions {
 		return nil, interruptions, nil, nil, nil, nil
 	}
 
@@ -1015,12 +1056,161 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 		resolvedItems = append(resolvedItems, result.RunItem)
 	}
 
-	pending := filterNonFunctionToolInterruptions(interruptions, functionToolNames)
+	pending := filterUnmatchedFunctionInterruptions(interruptions, functionCalls)
+	pending = filterNestedAgentToolInterruptions(pending, functionCalls)
 	if len(pendingInterruptions) > 0 {
 		pending = append(pending, pendingInterruptions...)
 	}
 
 	return resolvedItems, pending, toolInputResults, toolOutputResults, functionResults, nil
+}
+
+func (r Runner) resolveShellInterruptionsOnResume(
+	ctx context.Context,
+	agent *Agent,
+	resumeState *RunState,
+	interruptions []ToolApprovalItem,
+	hooks RunHooks,
+	runConfig RunConfig,
+	contextWrapper *RunContextWrapper[any],
+) ([]RunItem, []ToolApprovalItem, error) {
+	if resumeState == nil {
+		return nil, interruptions, nil
+	}
+
+	allTools, err := r.getAllTools(ctx, agent)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var shellTool *ShellTool
+	var localShellTool *LocalShellTool
+	for _, tool := range allTools {
+		switch t := tool.(type) {
+		case ShellTool:
+			shellTool = &t
+		case LocalShellTool:
+			localShellTool = &t
+		}
+	}
+	if shellTool == nil && localShellTool == nil {
+		return nil, interruptions, nil
+	}
+
+	if len(resumeState.ModelResponses) == 0 {
+		return nil, interruptions, nil
+	}
+
+	handoffs, err := r.getHandoffs(ctx, agent)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
+	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	results := make([]RunItem, 0)
+	localShellCalls := filterLocalShellCallsWithoutOutputs(processed.LocalShellCalls, resumeState.GeneratedItems)
+	if len(localShellCalls) > 0 {
+		localResults, err := RunImpl().ExecuteLocalShellCalls(ctx, agent, localShellCalls, hooks)
+		if err != nil {
+			return nil, nil, err
+		}
+		results = append(results, localResults...)
+	}
+
+	shellCalls, err := filterShellCallsWithoutOutputs(processed.ShellCalls, resumeState.GeneratedItems)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(shellCalls) == 0 {
+		return results, interruptions, nil
+	}
+
+	if contextWrapper == nil {
+		contextWrapper = NewRunContextWrapper[any](nil)
+	}
+	resumeState.ApplyToolApprovalsToContext(contextWrapper)
+
+	shellResults, shellInterruptions, err := RunImpl().ExecuteShellCalls(
+		ctx,
+		agent,
+		shellCalls,
+		hooks,
+		contextWrapper,
+		runConfig,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(shellResults) > 0 {
+		results = append(results, shellResults...)
+	}
+
+	pending := filterNonShellInterruptions(interruptions, shellTool)
+	if len(shellInterruptions) > 0 {
+		pending = append(pending, shellInterruptions...)
+	}
+
+	return results, pending, nil
+}
+
+func (r Runner) resolveComputerActionsOnResume(
+	ctx context.Context,
+	agent *Agent,
+	resumeState *RunState,
+	interruptions []ToolApprovalItem,
+	hooks RunHooks,
+) ([]RunItem, []ToolApprovalItem, error) {
+	if resumeState == nil {
+		return nil, interruptions, nil
+	}
+
+	allTools, err := r.getAllTools(ctx, agent)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var computerTool *ComputerTool
+	for _, tool := range allTools {
+		if t, ok := tool.(ComputerTool); ok {
+			computerTool = &t
+			break
+		}
+	}
+	if computerTool == nil {
+		return nil, interruptions, nil
+	}
+
+	if len(resumeState.ModelResponses) == 0 {
+		return nil, interruptions, nil
+	}
+
+	handoffs, err := r.getHandoffs(ctx, agent)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
+	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	computerCalls := filterComputerCallsWithoutOutputs(processed.ComputerActions, resumeState.GeneratedItems)
+	if len(computerCalls) == 0 {
+		return nil, interruptions, nil
+	}
+
+	results, err := RunImpl().ExecuteComputerActions(ctx, agent, computerCalls, hooks)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return results, interruptions, nil
 }
 
 func filterApplyPatchCallsWithoutOutputs(
@@ -1065,6 +1255,69 @@ func filterFunctionCallsWithoutOutputs(
 	return out
 }
 
+func filterShellCallsWithoutOutputs(
+	calls []ToolRunShellCall,
+	generatedItems []TResponseInputItem,
+) ([]ToolRunShellCall, error) {
+	if len(calls) == 0 {
+		return nil, nil
+	}
+	out := make([]ToolRunShellCall, 0, len(calls))
+	for _, call := range calls {
+		callID, err := extractShellCallID(call.ToolCall)
+		if err != nil || callID == "" {
+			return nil, err
+		}
+		if shellCallOutputExists(callID, generatedItems) {
+			continue
+		}
+		out = append(out, call)
+	}
+	return out, nil
+}
+
+func filterLocalShellCallsWithoutOutputs(
+	calls []ToolRunLocalShellCall,
+	generatedItems []TResponseInputItem,
+) []ToolRunLocalShellCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]ToolRunLocalShellCall, 0, len(calls))
+	for _, call := range calls {
+		callID := call.ToolCall.CallID
+		if callID == "" {
+			callID = call.ToolCall.ID
+		}
+		if callID == "" || localShellCallOutputExists(callID, generatedItems) {
+			continue
+		}
+		out = append(out, call)
+	}
+	return out
+}
+
+func filterComputerCallsWithoutOutputs(
+	calls []ToolRunComputerAction,
+	generatedItems []TResponseInputItem,
+) []ToolRunComputerAction {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]ToolRunComputerAction, 0, len(calls))
+	for _, call := range calls {
+		callID := call.ToolCall.CallID
+		if callID == "" {
+			callID = call.ToolCall.ID
+		}
+		if callID == "" || computerCallOutputExists(callID, generatedItems) {
+			continue
+		}
+		out = append(out, call)
+	}
+	return out
+}
+
 func applyPatchOutputExists(callID string, items []TResponseInputItem) bool {
 	for _, item := range items {
 		itemType := item.GetType()
@@ -1083,6 +1336,48 @@ func functionCallOutputExists(callID string, items []TResponseInputItem) bool {
 	for _, item := range items {
 		itemType := item.GetType()
 		if itemType == nil || *itemType != "function_call_output" {
+			continue
+		}
+		existingID := item.GetCallID()
+		if existingID != nil && *existingID == callID {
+			return true
+		}
+	}
+	return false
+}
+
+func shellCallOutputExists(callID string, items []TResponseInputItem) bool {
+	for _, item := range items {
+		itemType := item.GetType()
+		if itemType == nil || *itemType != "shell_call_output" {
+			continue
+		}
+		existingID := item.GetCallID()
+		if existingID != nil && *existingID == callID {
+			return true
+		}
+	}
+	return false
+}
+
+func localShellCallOutputExists(callID string, items []TResponseInputItem) bool {
+	for _, item := range items {
+		itemType := item.GetType()
+		if itemType == nil || *itemType != "local_shell_call_output" {
+			continue
+		}
+		existingID := item.GetCallID()
+		if existingID != nil && *existingID == callID {
+			return true
+		}
+	}
+	return false
+}
+
+func computerCallOutputExists(callID string, items []TResponseInputItem) bool {
+	for _, item := range items {
+		itemType := item.GetType()
+		if itemType == nil || *itemType != "computer_call_output" {
 			continue
 		}
 		existingID := item.GetCallID()
@@ -1113,6 +1408,74 @@ func filterNonFunctionToolInterruptions(
 	for _, interruption := range interruptions {
 		if _, ok := functionToolNames[resolveApprovalToolName(interruption)]; ok {
 			continue
+		}
+		out = append(out, interruption)
+	}
+	return out
+}
+
+func filterUnmatchedFunctionInterruptions(
+	interruptions []ToolApprovalItem,
+	functionCalls []ToolRunFunction,
+) []ToolApprovalItem {
+	if len(interruptions) == 0 {
+		return nil
+	}
+	if len(functionCalls) == 0 {
+		return interruptions
+	}
+	callIDs := make(map[string]struct{}, len(functionCalls))
+	toolNames := make(map[string]struct{}, len(functionCalls))
+	for _, call := range functionCalls {
+		if call.ToolCall.CallID != "" {
+			callIDs[call.ToolCall.CallID] = struct{}{}
+		}
+		if call.ToolCall.Name != "" {
+			toolNames[call.ToolCall.Name] = struct{}{}
+		}
+	}
+	out := make([]ToolApprovalItem, 0, len(interruptions))
+	for _, interruption := range interruptions {
+		callID := resolveApprovalCallID(interruption)
+		if callID != "" {
+			if _, ok := callIDs[callID]; ok {
+				continue
+			}
+		} else if toolName := resolveApprovalToolName(interruption); toolName != "" {
+			if _, ok := toolNames[toolName]; ok {
+				continue
+			}
+		}
+		out = append(out, interruption)
+	}
+	return out
+}
+
+func filterNestedAgentToolInterruptions(
+	interruptions []ToolApprovalItem,
+	functionCalls []ToolRunFunction,
+) []ToolApprovalItem {
+	if len(interruptions) == 0 || len(functionCalls) == 0 {
+		return interruptions
+	}
+	parentSignatures := make(map[agentToolSignature]struct{}, len(functionCalls))
+	for _, call := range functionCalls {
+		signature := agentToolSignatureFromResponseToolCall(&call.ToolCall)
+		if signature == (agentToolSignature{}) {
+			continue
+		}
+		parentSignatures[signature] = struct{}{}
+	}
+	if len(parentSignatures) == 0 {
+		return interruptions
+	}
+	out := make([]ToolApprovalItem, 0, len(interruptions))
+	for _, interruption := range interruptions {
+		parentSignature, ok := agentToolParentSignatureFromRaw(interruption.RawItem)
+		if ok {
+			if _, matched := parentSignatures[parentSignature]; matched {
+				continue
+			}
 		}
 		out = append(out, interruption)
 	}
@@ -1163,6 +1526,27 @@ func filterNonApplyPatchInterruptions(
 	out := make([]ToolApprovalItem, 0, len(interruptions))
 	for _, interruption := range interruptions {
 		if isApplyPatchName(resolveApprovalToolName(interruption), tool) {
+			continue
+		}
+		out = append(out, interruption)
+	}
+	return out
+}
+
+func filterNonShellInterruptions(
+	interruptions []ToolApprovalItem,
+	tool *ShellTool,
+) []ToolApprovalItem {
+	if len(interruptions) == 0 {
+		return nil
+	}
+	if tool == nil {
+		return interruptions
+	}
+	toolName := tool.ToolName()
+	out := make([]ToolApprovalItem, 0, len(interruptions))
+	for _, interruption := range interruptions {
+		if resolveApprovalToolName(interruption) == toolName {
 			continue
 		}
 		out = append(out, interruption)
@@ -1474,6 +1858,7 @@ func (r Runner) startStreaming(
 					Context:                    ctx,
 					Input:                      streamedResult.Input(),
 					NewItems:                   streamedResult.NewItems(),
+					ModelInputItems:            streamedResult.ModelInputItems(),
 					RawResponses:               streamedResult.RawResponses(),
 					LastAgent:                  currentAgent,
 					InputGuardrailResults:      streamedResult.InputGuardrailResults(),
@@ -1552,8 +1937,10 @@ func (r Runner) startStreaming(
 		contextWrapper.Context = value
 	}
 	if resumeState != nil {
-		// Reset persisted count for the resumed turn and restore approval decisions.
-		resumeState.CurrentTurnPersistedItemCount = 0
+		if resumeState.CurrentTurn == 0 {
+			resumeState.CurrentTurnPersistedItemCount = 0
+		}
+		// Restore approval decisions from the prior run state.
 		resumeState.ApplyToolApprovalsToContext(contextWrapper)
 		if resumeState.Context != nil {
 			if !hasContextOverride {
@@ -1672,7 +2059,9 @@ func (r Runner) startStreaming(
 
 		streamedResult.appendRawResponses(turnResult.ModelResponse)
 		streamedResult.setInput(turnResult.OriginalInput)
-		streamedResult.setNewItems(turnResult.GeneratedItems())
+		streamedResult.setModelInputItems(turnResult.GeneratedItems())
+		updatedSessionItems := append(streamedResult.NewItems(), turnResult.StepSessionItems()...)
+		streamedResult.setNewItems(updatedSessionItems)
 		streamedResult.appendToolInputGuardrailResults(turnResult.ToolInputGuardrailResults...)
 		streamedResult.appendToolOutputGuardrailResults(turnResult.ToolOutputGuardrailResults...)
 
@@ -1704,6 +2093,7 @@ func (r Runner) startStreaming(
 			tempResult := &RunResult{
 				Input:                      streamedResult.Input(),
 				NewItems:                   streamedResult.NewItems(),
+				ModelInputItems:            streamedResult.ModelInputItems(),
 				RawResponses:               streamedResult.RawResponses(),
 				FinalOutput:                streamedResult.FinalOutput(),
 				InputGuardrailResults:      streamedResult.InputGuardrailResults(),
@@ -1740,6 +2130,7 @@ func (r Runner) startStreaming(
 			tempResult := &RunResult{
 				Input:                      streamedResult.Input(),
 				NewItems:                   streamedResult.NewItems(),
+				ModelInputItems:            streamedResult.ModelInputItems(),
 				RawResponses:               streamedResult.RawResponses(),
 				InputGuardrailResults:      streamedResult.InputGuardrailResults(),
 				OutputGuardrailResults:     streamedResult.OutputGuardrailResults(),
@@ -1910,11 +2301,11 @@ func (r Runner) runSingleTurnStreamed(
 	if serverConversationTracker != nil {
 		input = serverConversationTracker.PrepareInput(
 			streamedResult.Input(),
-			streamedResult.NewItems(),
+			streamedResult.ModelInputItems(),
 		)
 	} else {
 		input = ItemHelpers().InputToNewInputList(streamedResult.Input())
-		for _, item := range streamedResult.NewItems() {
+		for _, item := range streamedResult.ModelInputItems() {
 			input = append(input, item.ToInputItem())
 		}
 	}
@@ -2038,7 +2429,7 @@ func (r Runner) runSingleTurnStreamed(
 		agent,
 		allTools,
 		streamedResult.Input(),
-		streamedResult.NewItems(),
+		streamedResult.ModelInputItems(),
 		*finalResponse,
 		agent.OutputType,
 		handoffs,
@@ -2053,8 +2444,12 @@ func (r Runner) runSingleTurnStreamed(
 
 	streamedStepResult := *singleStepResult
 	if len(emittedToolCallIDs) > 0 || len(emittedReasoningIDs) > 0 {
-		filtered := make([]RunItem, 0, len(streamedStepResult.NewStepItems))
-		for _, item := range streamedStepResult.NewStepItems {
+		itemsToFilter := streamedStepResult.NewStepItems
+		if streamedStepResult.SessionStepItems != nil {
+			itemsToFilter = streamedStepResult.SessionStepItems
+		}
+		filtered := make([]RunItem, 0, len(itemsToFilter))
+		for _, item := range itemsToFilter {
 			switch typed := item.(type) {
 			case ToolCallItem:
 				callID := toolCallIDFromItem(typed.RawItem)
@@ -2087,7 +2482,11 @@ func (r Runner) runSingleTurnStreamed(
 			}
 			filtered = append(filtered, item)
 		}
-		streamedStepResult.NewStepItems = filtered
+		if streamedStepResult.SessionStepItems != nil {
+			streamedStepResult.SessionStepItems = filtered
+		} else {
+			streamedStepResult.NewStepItems = filtered
+		}
 	}
 	RunImpl().StreamStepResultToQueue(streamedStepResult, streamedResult.eventQueue)
 	return singleStepResult, nil

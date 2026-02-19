@@ -75,6 +75,9 @@ type FunctionTool struct {
 	// If set and returns true, the tool call will pause until explicitly approved.
 	NeedsApproval FunctionToolNeedsApproval
 
+	// Optional agent reference when this tool wraps an agent.
+	AgentTool *Agent
+
 	// Internal marker used for codex-tool specific runtime validation.
 	// Regular tools should leave this as false.
 	IsCodexTool bool

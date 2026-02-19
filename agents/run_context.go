@@ -40,6 +40,15 @@ type ToolApprovalItem struct {
 	RawItem  any
 }
 
+func (ToolApprovalItem) isRunItem() {}
+
+func (ToolApprovalItem) ToInputItem() TResponseInputItem {
+	panic(AgentsErrorf(
+		"ToolApprovalItem cannot be converted to an input item. " +
+			"These items should be filtered out before preparing input for the API.",
+	))
+}
+
 // RunContextWrapper wraps caller context and tracks usage and approval decisions.
 type RunContextWrapper[T any] struct {
 	Context   T
@@ -146,7 +155,22 @@ func (c *RunContextWrapper[T]) GetApprovalStatus(
 	if known || existingPending == nil {
 		return approved, known
 	}
-	return c.IsToolApproved(resolveApprovalToolName(*existingPending), callID)
+	approved, known = c.IsToolApproved(resolveApprovalToolName(*existingPending), callID)
+	if known || callID == "" || !isMCPApprovalItem(*existingPending) {
+		return approved, known
+	}
+	for _, record := range c.approvals {
+		if record == nil {
+			continue
+		}
+		if _, ok := record.ApprovedCallIDs[callID]; ok {
+			return true, true
+		}
+		if _, ok := record.RejectedCallIDs[callID]; ok {
+			return false, true
+		}
+	}
+	return approved, known
 }
 
 // SerializeApprovals exports approval state as JSON-friendly data.

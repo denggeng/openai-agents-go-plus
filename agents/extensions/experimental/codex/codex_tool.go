@@ -135,12 +135,12 @@ type codexToolCallArguments struct {
 }
 
 type codexToolInputPayload struct {
-	Inputs   []CodexToolInputItem `json:"inputs"`
-	ThreadID *string              `json:"thread_id,omitempty"`
+	Inputs   *[]CodexToolInputItem `json:"inputs"`
+	ThreadID *string               `json:"thread_id,omitempty"`
 }
 
 type codexToolRunContextInputPayload struct {
-	Inputs []CodexToolInputItem `json:"inputs"`
+	Inputs *[]CodexToolInputItem `json:"inputs"`
 }
 
 // NewCodexTool builds a FunctionTool that executes Codex thread turns.
@@ -228,6 +228,7 @@ func NewCodexTool(options any) (agents.FunctionTool, error) {
 
 	var persistedMu sync.Mutex
 	var persistedThread *Thread
+	failureErrorFunction := resolvedOptions.FailureErrorFunction
 
 	tool := agents.FunctionTool{
 		Name:             name,
@@ -237,102 +238,108 @@ func NewCodexTool(options any) (agents.FunctionTool, error) {
 		IsEnabled:        resolvedOptions.IsEnabled,
 		IsCodexTool:      true,
 		OnInvokeTool: func(ctx context.Context, arguments string) (any, error) {
-			runContextValue, _ := agents.RunContextValueFromContext(ctx)
-			if resolvedOptions.UseRunContextThreadID {
-				if err := validateRunContextThreadIDContext(runContextValue, resolvedRunContextThreadIDKey); err != nil {
+			result, err := func() (any, error) {
+				runContextValue, _ := agents.RunContextValueFromContext(ctx)
+				if resolvedOptions.UseRunContextThreadID {
+					if err := validateRunContextThreadIDContext(runContextValue, resolvedRunContextThreadIDKey); err != nil {
+						return nil, err
+					}
+				}
+
+				var parsed codexToolCallArguments
+				if resolvedParametersSchema != nil {
+					parsed, err = parseCodexToolInputWithCustomParameters(arguments)
+				} else if resolvedOptions.UseRunContextThreadID {
+					parsed, err = parseCodexToolInputWithoutThreadID(arguments)
+				} else {
+					parsed, err = parseCodexToolInput(arguments)
+				}
+				if err != nil {
 					return nil, err
 				}
-			}
 
-			var parsed codexToolCallArguments
-			if resolvedParametersSchema != nil {
-				parsed, err = parseCodexToolInputWithCustomParameters(arguments)
-			} else if resolvedOptions.UseRunContextThreadID {
-				parsed, err = parseCodexToolInputWithoutThreadID(arguments)
-			} else {
-				parsed, err = parseCodexToolInput(arguments)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			callThreadID, err := resolveCallThreadID(
-				parsed.ThreadID,
-				resolvedOptions.ThreadID,
-				runContextValue,
-				resolvedRunContextThreadIDKey,
-				resolvedOptions.UseRunContextThreadID,
-			)
-			if err != nil {
-				return nil, err
-			}
-			codexClient, err := resolveCodex()
-			if err != nil {
-				return nil, err
-			}
-
-			var thread *Thread
-			if resolvedOptions.PersistSession {
-				persistedMu.Lock()
-				thread, err = getOrCreatePersistedThread(
-					codexClient,
-					callThreadID,
-					resolvedThreadOptions,
-					persistedThread,
-				)
-				if err == nil && persistedThread == nil {
-					persistedThread = thread
-				}
-				persistedMu.Unlock()
-			} else {
-				thread, err = getThread(codexClient, callThreadID, resolvedThreadOptions)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			turnOptions := buildTurnOptions(resolvedTurnOptions, resolvedOutputSchema)
-			streamed, err := thread.RunStreamed(ctx, parsed.Inputs, turnOptions)
-			if err != nil {
-				return nil, err
-			}
-
-			response, usage, resolvedThreadID, err := consumeCodexToolEvents(
-				ctx,
-				streamed,
-				parsed,
-				thread,
-				resolvedOptions.OnStream,
-				spanDataMaxChars,
-			)
-			if resolvedThreadID == nil {
-				resolvedThreadID = callThreadID
-			}
-			if err != nil {
-				tryStoreThreadIDInRunContextAfterError(
+				callThreadID, err := resolveCallThreadID(
+					parsed.ThreadID,
+					resolvedOptions.ThreadID,
 					runContextValue,
 					resolvedRunContextThreadIDKey,
-					resolvedThreadID,
 					resolvedOptions.UseRunContextThreadID,
 				)
-				return nil, err
-			}
-
-			if resolvedOptions.UseRunContextThreadID {
-				if err := storeThreadIDInRunContext(
-					runContextValue,
-					resolvedRunContextThreadIDKey,
-					resolvedThreadID,
-				); err != nil {
+				if err != nil {
 					return nil, err
 				}
-			}
+				codexClient, err := resolveCodex()
+				if err != nil {
+					return nil, err
+				}
 
-			return CodexToolResult{
-				ThreadID: resolvedThreadID,
-				Response: response,
-				Usage:    usage,
-			}, nil
+				var thread *Thread
+				if resolvedOptions.PersistSession {
+					persistedMu.Lock()
+					thread, err = getOrCreatePersistedThread(
+						codexClient,
+						callThreadID,
+						resolvedThreadOptions,
+						persistedThread,
+					)
+					if err == nil && persistedThread == nil {
+						persistedThread = thread
+					}
+					persistedMu.Unlock()
+				} else {
+					thread, err = getThread(codexClient, callThreadID, resolvedThreadOptions)
+				}
+				if err != nil {
+					return nil, err
+				}
+
+				turnOptions := buildTurnOptions(resolvedTurnOptions, resolvedOutputSchema)
+				streamed, err := thread.RunStreamed(ctx, parsed.Inputs, turnOptions)
+				if err != nil {
+					return nil, err
+				}
+
+				response, usage, resolvedThreadID, err := consumeCodexToolEvents(
+					ctx,
+					streamed,
+					parsed,
+					thread,
+					resolvedOptions.OnStream,
+					spanDataMaxChars,
+				)
+				if resolvedThreadID == nil {
+					resolvedThreadID = callThreadID
+				}
+				if err != nil {
+					tryStoreThreadIDInRunContextAfterError(
+						runContextValue,
+						resolvedRunContextThreadIDKey,
+						resolvedThreadID,
+						resolvedOptions.UseRunContextThreadID,
+					)
+					return nil, err
+				}
+
+				if resolvedOptions.UseRunContextThreadID {
+					if err := storeThreadIDInRunContext(
+						runContextValue,
+						resolvedRunContextThreadIDKey,
+						resolvedThreadID,
+					); err != nil {
+						return nil, err
+					}
+				}
+
+				return CodexToolResult{
+					ThreadID: resolvedThreadID,
+					Response: response,
+					Usage:    usage,
+				}, nil
+			}()
+			if err != nil {
+				return handleCodexToolFailure(ctx, err, failureErrorFunction)
+			}
+			return result, nil
 		},
 	}
 	if resolvedOptions.FailureErrorFunction != nil {
@@ -348,6 +355,21 @@ func MustNewCodexTool(options any) agents.FunctionTool {
 		panic(err)
 	}
 	return tool
+}
+
+func handleCodexToolFailure(
+	ctx context.Context,
+	err error,
+	failureErrorFunction *agents.ToolErrorFunction,
+) (any, error) {
+	if failureErrorFunction == nil {
+		return nil, err
+	}
+	fn := *failureErrorFunction
+	if fn == nil {
+		return nil, err
+	}
+	return fn(ctx, err)
 }
 
 // CoerceCodexToolOptions accepts nil, CodexToolOptions, or map-based options.
@@ -658,12 +680,12 @@ func parseCodexToolInput(inputJSON string) (codexToolCallArguments, error) {
 		return codexToolCallArguments{}, agents.ModelBehaviorErrorf("Invalid JSON input for codex tool: %v", err)
 	}
 
-	if len(payload.Inputs) == 0 {
+	if payload.Inputs == nil {
 		return codexToolCallArguments{}, agents.NewUserError("Codex tool parameters must include an inputs field.")
 	}
 
-	normalizedInputs := make([]map[string]any, 0, len(payload.Inputs))
-	for _, item := range payload.Inputs {
+	normalizedInputs := make([]map[string]any, 0, len(*payload.Inputs))
+	for _, item := range *payload.Inputs {
 		normalized, err := normalizeCodexToolInputItem(item)
 		if err != nil {
 			return codexToolCallArguments{}, err
@@ -692,12 +714,12 @@ func parseCodexToolInputWithoutThreadID(inputJSON string) (codexToolCallArgument
 	if err := decoder.Decode(&payload); err != nil {
 		return codexToolCallArguments{}, agents.ModelBehaviorErrorf("Invalid JSON input for codex tool: %v", err)
 	}
-	if len(payload.Inputs) == 0 {
+	if payload.Inputs == nil {
 		return codexToolCallArguments{}, agents.NewUserError("Codex tool parameters must include an inputs field.")
 	}
 
-	normalizedInputs := make([]map[string]any, 0, len(payload.Inputs))
-	for _, item := range payload.Inputs {
+	normalizedInputs := make([]map[string]any, 0, len(*payload.Inputs))
+	for _, item := range *payload.Inputs {
 		normalized, err := normalizeCodexToolInputItem(item)
 		if err != nil {
 			return codexToolCallArguments{}, err
@@ -724,8 +746,8 @@ func parseCodexToolInputWithCustomParameters(inputJSON string) (codexToolCallArg
 		return codexToolCallArguments{}, agents.NewUserError("Codex tool parameters must include an inputs field.")
 	}
 	inputsList, ok := inputsRaw.([]any)
-	if !ok || len(inputsList) == 0 {
-		return codexToolCallArguments{}, agents.NewUserError("Codex tool parameters must include an inputs field.")
+	if !ok {
+		return codexToolCallArguments{}, agents.NewUserError("Codex tool inputs must be a list.")
 	}
 
 	normalizedInputs := make([]map[string]any, 0, len(inputsList))

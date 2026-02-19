@@ -25,6 +25,7 @@ type RunErrorDetails struct {
 	Context                    context.Context
 	Input                      Input
 	NewItems                   []RunItem
+	ModelInputItems            []RunItem
 	RawResponses               []ModelResponse
 	LastAgent                  *Agent
 	InputGuardrailResults      []InputGuardrailResult

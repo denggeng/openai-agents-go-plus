@@ -147,6 +147,13 @@ func TestResolveCodexToolNameValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), `must be "codex" or start with "codex_"`)
 }
 
+func TestCodexToolAllowsNonAlnumSuffixWhenRunContextThreadIDDisabled(t *testing.T) {
+	name := "codex_a-b"
+	tool, err := NewCodexTool(CodexToolOptions{Name: &name})
+	require.NoError(t, err)
+	assert.Equal(t, "codex_a-b", tool.Name)
+}
+
 func TestCodexToolResultStringifies(t *testing.T) {
 	threadID := "thread-1"
 	result := CodexToolResult{
@@ -183,6 +190,63 @@ func TestParseCodexToolInputValidationErrors(t *testing.T) {
 	_, err = parseCodexToolInput(`{"inputs":[{"type":"text","text":"hello","path":"x"}]}`)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"path" is not allowed`)
+}
+
+func TestParseCodexToolInputThreadIDValidationErrors(t *testing.T) {
+	_, err := parseCodexToolInput(`{"inputs":[{"type":"text","text":"hello"}],"thread_id":"   "}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "thread_id")
+}
+
+func TestParseCodexToolInputAllowsEmptyInputs(t *testing.T) {
+	parsed, err := parseCodexToolInput(`{"inputs":[]}`)
+	require.NoError(t, err)
+	assert.Empty(t, parsed.Inputs)
+	assert.Nil(t, parsed.ThreadID)
+}
+
+func TestParseCodexToolInputWithCustomParametersRequiresInputs(t *testing.T) {
+	_, err := parseCodexToolInputWithCustomParameters(`{}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "inputs field")
+}
+
+func TestParseCodexToolInputWithCustomParametersAllowsEmptyInputs(t *testing.T) {
+	parsed, err := parseCodexToolInputWithCustomParameters(`{"inputs":[]}`)
+	require.NoError(t, err)
+	assert.Empty(t, parsed.Inputs)
+	assert.Nil(t, parsed.ThreadID)
+}
+
+func TestNormalizeCodexToolInputItemAcceptsLocalImage(t *testing.T) {
+	path := " /tmp/img.png "
+	item := CodexToolInputItem{Type: "local_image", Path: &path}
+	normalized, err := normalizeCodexToolInputItem(item)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"type": "local_image", "path": "/tmp/img.png"}, normalized)
+}
+
+func TestCodexToolOnInvokeToolHandlesFailureErrorFunction(t *testing.T) {
+	handler := agents.ToolErrorFunction(func(context.Context, error) (any, error) {
+		return "handled", nil
+	})
+	tool, err := NewCodexTool(CodexToolOptions{FailureErrorFunction: &handler})
+	require.NoError(t, err)
+
+	result, err := tool.OnInvokeTool(t.Context(), "{bad")
+	require.NoError(t, err)
+	assert.Equal(t, "handled", result)
+}
+
+func TestCodexToolOnInvokeToolRaisesWithoutFailureHandler(t *testing.T) {
+	tool, err := NewCodexTool(CodexToolOptions{})
+	require.NoError(t, err)
+
+	result, err := tool.OnInvokeTool(t.Context(), "{bad")
+	require.Error(t, err)
+	var modelErr agents.ModelBehaviorError
+	assert.ErrorAs(t, err, &modelErr)
+	assert.Nil(t, result)
 }
 
 func TestResolveOutputSchemaDescriptor(t *testing.T) {
@@ -334,6 +398,63 @@ func TestConsumeCodexToolEventsDefaultResponseNoInputs(t *testing.T) {
 	assert.Equal(t, "thread-1", *resolvedThreadID)
 }
 
+func TestConsumeCodexToolEventsWithOnStreamError(t *testing.T) {
+	events := make(chan ThreadEvent, 6)
+	errs := make(chan error, 1)
+	exitCode := 0
+	events <- ItemStartedEvent{Item: CommandExecutionItem{ID: "cmd-1", Command: "ls", Status: "in_progress"}}
+	events <- ItemCompletedEvent{Item: CommandExecutionItem{ID: "cmd-1", Command: "ls", Status: "completed", ExitCode: &exitCode}}
+	events <- ItemStartedEvent{Item: McpToolCallItem{
+		ID:        "mcp-1",
+		Server:    "server",
+		Tool:      "tool",
+		Arguments: map[string]any{"q": "x"},
+		Status:    "in_progress",
+	}}
+	events <- ItemCompletedEvent{Item: McpToolCallItem{
+		ID:        "mcp-1",
+		Server:    "server",
+		Tool:      "tool",
+		Arguments: map[string]any{"q": "x"},
+		Status:    "failed",
+		Error:     &McpToolCallError{Message: "boom"},
+	}}
+	events <- ItemCompletedEvent{Item: AgentMessageItem{ID: "agent-1", Text: "done"}}
+	events <- TurnCompletedEvent{Usage: &Usage{InputTokens: 1, CachedInputTokens: 0, OutputTokens: 1}}
+	close(events)
+	close(errs)
+
+	callbacks := make([]string, 0, 2)
+	onStream := CodexToolStreamHandler(func(ctx context.Context, payload CodexToolStreamEvent) error {
+		callbacks = append(callbacks, payload.Event.EventType())
+		if payload.Event.EventType() == "item.started" {
+			panic("boom")
+		}
+		return nil
+	})
+
+	threadID := "thread-1"
+	thread := &Thread{id: &threadID}
+	streamed := &StreamedTurn{Events: events, Errors: errs}
+
+	response, usage, resolvedThreadID, err := consumeCodexToolEvents(
+		t.Context(),
+		streamed,
+		codexToolCallArguments{Inputs: []map[string]any{{"type": "text", "text": "hello"}}},
+		thread,
+		onStream,
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "done", response)
+	require.NotNil(t, usage)
+	assert.Equal(t, 1, usage.InputTokens)
+	assert.Equal(t, 1, usage.OutputTokens)
+	require.NotNil(t, resolvedThreadID)
+	assert.Equal(t, "thread-1", *resolvedThreadID)
+	assert.Contains(t, callbacks, "item.started")
+}
+
 func TestConsumeCodexToolEventsThreadStartedUpdatesThreadID(t *testing.T) {
 	events := make(chan ThreadEvent, 2)
 	errs := make(chan error, 1)
@@ -481,6 +602,167 @@ func TestNewCodexToolInvokesAndAggregates(t *testing.T) {
 	assert.Equal(t, 10, result.Usage.InputTokens)
 	assert.Equal(t, 1, result.Usage.CachedInputTokens)
 	assert.Equal(t, 5, result.Usage.OutputTokens)
+}
+
+func TestNewCodexToolPersistedThreadIDForRecoverableTurnFailure(t *testing.T) {
+	execClient := &recordingExec{
+		events: []any{
+			map[string]any{"type": "thread.started", "thread_id": "thread-next"},
+			map[string]any{"type": "turn.failed", "error": map[string]any{"message": "boom"}},
+		},
+	}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	handler := agents.ToolErrorFunction(func(context.Context, error) (any, error) {
+		return "handled", nil
+	})
+	tool, err := NewCodexTool(CodexToolOptions{
+		Codex:                 codexClient,
+		UseRunContextThreadID: true,
+		FailureErrorFunction:  &handler,
+	})
+	require.NoError(t, err)
+
+	runContext := map[string]any{}
+	ctx := agents.ContextWithRunContextValue(t.Context(), runContext)
+
+	first, err := tool.OnInvokeTool(ctx, `{"inputs":[{"type":"text","text":"hello"}]}`)
+	require.NoError(t, err)
+	assert.Equal(t, "handled", first)
+
+	second, err := tool.OnInvokeTool(ctx, `{"inputs":[{"type":"text","text":"hello again"}]}`)
+	require.NoError(t, err)
+	assert.Equal(t, "handled", second)
+
+	assert.Equal(t, "thread-next", runContext["codex_thread_id"])
+
+	args := execClient.Args()
+	require.Len(t, args, 2)
+	assert.Nil(t, args[0].ThreadID)
+	require.NotNil(t, args[1].ThreadID)
+	assert.Equal(t, "thread-next", *args[1].ThreadID)
+}
+
+func TestNewCodexToolPersistedThreadIDForRaisedTurnFailure(t *testing.T) {
+	execClient := &recordingExec{
+		events: []any{
+			map[string]any{"type": "thread.started", "thread_id": "thread-next"},
+			map[string]any{"type": "turn.failed", "error": map[string]any{"message": "boom"}},
+		},
+	}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	tool, err := NewCodexTool(CodexToolOptions{
+		Codex:                 codexClient,
+		UseRunContextThreadID: true,
+	})
+	require.NoError(t, err)
+
+	runContext := map[string]any{}
+	ctx := agents.ContextWithRunContextValue(t.Context(), runContext)
+
+	_, err = tool.OnInvokeTool(ctx, `{"inputs":[{"type":"text","text":"hello"}]}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Codex turn failed: boom")
+	assert.Equal(t, "thread-next", runContext["codex_thread_id"])
+
+	_, err = tool.OnInvokeTool(ctx, `{"inputs":[{"type":"text","text":"hello again"}]}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Codex turn failed: boom")
+	assert.Equal(t, "thread-next", runContext["codex_thread_id"])
+
+	args := execClient.Args()
+	require.Len(t, args, 2)
+	assert.Nil(t, args[0].ThreadID)
+	require.NotNil(t, args[1].ThreadID)
+	assert.Equal(t, "thread-next", *args[1].ThreadID)
+}
+
+func TestNewCodexToolFallsBackToCallThreadIDWhenThreadObjectIDIsNone(t *testing.T) {
+	execClient := &recordingExec{
+		events: []any{
+			map[string]any{
+				"type": "item.completed",
+				"item": map[string]any{"id": "agent-1", "type": "agent_message", "text": "done"},
+			},
+			map[string]any{
+				"type": "turn.completed",
+				"usage": map[string]any{
+					"input_tokens":        1,
+					"cached_input_tokens": 0,
+					"output_tokens":       1,
+				},
+			},
+		},
+	}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	tool, err := NewCodexTool(CodexToolOptions{
+		Codex:                 codexClient,
+		UseRunContextThreadID: true,
+		Parameters:            buildCodexToolSchema(true),
+	})
+	require.NoError(t, err)
+
+	runContext := map[string]any{}
+	ctx := agents.ContextWithRunContextValue(t.Context(), runContext)
+
+	firstInput := `{"inputs":[{"type":"text","text":"hello"}],"thread_id":"thread-explicit"}`
+	secondInput := `{"inputs":[{"type":"text","text":"hello again"}]}`
+
+	first, err := tool.OnInvokeTool(ctx, firstInput)
+	require.NoError(t, err)
+	firstResult, ok := first.(CodexToolResult)
+	require.True(t, ok)
+	require.NotNil(t, firstResult.ThreadID)
+	assert.Equal(t, "thread-explicit", *firstResult.ThreadID)
+
+	second, err := tool.OnInvokeTool(ctx, secondInput)
+	require.NoError(t, err)
+	secondResult, ok := second.(CodexToolResult)
+	require.True(t, ok)
+	require.NotNil(t, secondResult.ThreadID)
+	assert.Equal(t, "thread-explicit", *secondResult.ThreadID)
+
+	assert.Equal(t, "thread-explicit", runContext["codex_thread_id"])
+
+	args := execClient.Args()
+	require.Len(t, args, 2)
+	require.NotNil(t, args[0].ThreadID)
+	assert.Equal(t, "thread-explicit", *args[0].ThreadID)
+	require.NotNil(t, args[1].ThreadID)
+	assert.Equal(t, "thread-explicit", *args[1].ThreadID)
+}
+
+func TestCodexToolPassesIdleTimeoutSeconds(t *testing.T) {
+	execClient := &recordingExec{
+		events: []any{
+			map[string]any{"type": "thread.started", "thread_id": "thread-1"},
+			map[string]any{
+				"type": "item.completed",
+				"item": map[string]any{"id": "agent-1", "type": "agent_message", "text": "done"},
+			},
+			map[string]any{
+				"type": "turn.completed",
+				"usage": map[string]any{
+					"input_tokens":        1,
+					"cached_input_tokens": 0,
+					"output_tokens":       1,
+				},
+			},
+		},
+	}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	tool, err := NewCodexTool(CodexToolOptions{
+		Codex:              codexClient,
+		DefaultTurnOptions: map[string]any{"idle_timeout_seconds": 3.5},
+	})
+	require.NoError(t, err)
+
+	_, err = tool.OnInvokeTool(t.Context(), `{"inputs":[{"type":"text","text":"Check timeout option"}]}`)
+	require.NoError(t, err)
+
+	args := execClient.Args()
+	require.Len(t, args, 1)
+	require.NotNil(t, args[0].IdleTimeoutSeconds)
+	assert.InDelta(t, 3.5, *args[0].IdleTimeoutSeconds, 1e-9)
 }
 
 func TestNewCodexToolResumesFromInputThreadID(t *testing.T) {
@@ -1019,7 +1301,7 @@ func TestCodexToolNameCollisionWithOtherToolFailsFast(t *testing.T) {
 func TestResolveCodexOptionsReadsEnvOverride(t *testing.T) {
 	options := CodexOptions{
 		CodexPathOverride: ptr(" /bin/codex "),
-		Env:              map[any]any{"CODEX_API_KEY": "env-key"},
+		Env:               map[any]any{"CODEX_API_KEY": "env-key"},
 	}
 
 	resolved, err := resolveCodexOptions(options)
@@ -1110,6 +1392,52 @@ func TestNewCodexToolAcceptsKeywordOverrides(t *testing.T) {
 	assert.False(t, enabled)
 }
 
+func TestNewCodexToolAcceptsAllMapOverrides(t *testing.T) {
+	execClient := &recordingExec{
+		events: []any{
+			map[string]any{"type": "thread.started", "thread_id": "thread-1"},
+			map[string]any{
+				"type": "item.completed",
+				"item": map[string]any{"id": "agent-1", "type": "agent_message", "text": "Codex done."},
+			},
+			map[string]any{
+				"type": "turn.completed",
+				"usage": map[string]any{
+					"input_tokens":        1,
+					"cached_input_tokens": 0,
+					"output_tokens":       1,
+				},
+			},
+		},
+	}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	onStream := CodexToolStreamHandler(func(context.Context, CodexToolStreamEvent) error { return nil })
+	failureHandler := agents.ToolErrorFunction(func(context.Context, error) (any, error) { return "handled", nil })
+	tool, err := NewCodexTool(map[string]any{
+		"name":                      "codex_overrides",
+		"description":               "desc",
+		"parameters":                map[string]any{"type": "object", "properties": map[string]any{"inputs": map[string]any{"type": "array"}}},
+		"span_data_max_chars":       10,
+		"output_schema":             map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false},
+		"codex":                     codexClient,
+		"codex_options":             map[string]any{"api_key": "from-kwargs"},
+		"default_thread_options":    map[string]any{"model": "gpt"},
+		"thread_id":                 "thread-1",
+		"sandbox_mode":              "read-only",
+		"working_directory":         "/work",
+		"skip_git_repo_check":       true,
+		"default_turn_options":      map[string]any{"idle_timeout_seconds": 1.0},
+		"persist_session":           true,
+		"on_stream":                 onStream,
+		"is_enabled":                false,
+		"failure_error_function":    failureHandler,
+		"use_run_context_thread_id": true,
+		"run_context_thread_id_key": "thread_key",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "codex_overrides", tool.Name)
+}
+
 func TestResolveCodexOptionsEnvOverrideWins(t *testing.T) {
 	t.Setenv("CODEX_API_KEY", "env-codex")
 	t.Setenv("OPENAI_API_KEY", "env-openai")
@@ -1175,6 +1503,21 @@ func TestBuildTurnOptionsOverridesSchema(t *testing.T) {
 	}
 	turn := buildTurnOptions(defaults, outputSchema)
 	assert.Equal(t, outputSchema, turn.OutputSchema)
+	require.NotNil(t, turn.IdleTimeoutSeconds)
+	assert.Equal(t, 1.0, *turn.IdleTimeoutSeconds)
+}
+
+func TestBuildTurnOptionsMergesOutputSchema(t *testing.T) {
+	outputSchema := map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}
+	turn := buildTurnOptions(nil, outputSchema)
+	assert.Equal(t, outputSchema, turn.OutputSchema)
+
+	defaults := &TurnOptions{
+		OutputSchema:       map[string]any{"type": "object", "properties": map[string]any{"x": map[string]any{"type": "string"}}},
+		IdleTimeoutSeconds: ptr(1.0),
+	}
+	turn = buildTurnOptions(defaults, nil)
+	assert.Equal(t, defaults.OutputSchema, turn.OutputSchema)
 	require.NotNil(t, turn.IdleTimeoutSeconds)
 	assert.Equal(t, 1.0, *turn.IdleTimeoutSeconds)
 }
@@ -1324,6 +1667,51 @@ func TestNewCodexToolUsesRunContextThreadIDWithStructContext(t *testing.T) {
 	assert.Equal(t, "thread-next", runContext.CodexThreadID)
 }
 
+func TestNewCodexToolUsesRunContextThreadIDWithFieldNameMatch(t *testing.T) {
+	type runContextStruct struct {
+		UserID        string
+		CodexThreadID string
+	}
+
+	execClient := &recordingExec{
+		events: []any{
+			map[string]any{"type": "thread.started", "thread_id": "thread-next"},
+			map[string]any{
+				"type": "item.completed",
+				"item": map[string]any{"id": "agent-1", "type": "agent_message", "text": "done"},
+			},
+			map[string]any{
+				"type": "turn.completed",
+				"usage": map[string]any{
+					"input_tokens":        1,
+					"cached_input_tokens": 0,
+					"output_tokens":       1,
+				},
+			},
+		},
+	}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	tool, err := NewCodexTool(CodexToolOptions{
+		Codex:                 codexClient,
+		UseRunContextThreadID: true,
+	})
+	require.NoError(t, err)
+
+	runContext := &runContextStruct{
+		UserID:        "u1",
+		CodexThreadID: "thread-prev",
+	}
+	ctx := agents.ContextWithRunContextValue(t.Context(), runContext)
+	_, err = tool.OnInvokeTool(ctx, `{"inputs":[{"type":"text","text":"hello"}]}`)
+	require.NoError(t, err)
+
+	args := execClient.Args()
+	require.Len(t, args, 1)
+	require.NotNil(t, args[0].ThreadID)
+	assert.Equal(t, "thread-prev", *args[0].ThreadID)
+	assert.Equal(t, "thread-next", runContext.CodexThreadID)
+}
+
 func TestNewCodexToolRunContextStructMissingFieldRejected(t *testing.T) {
 	type runContextStruct struct {
 		UserID string
@@ -1344,6 +1732,26 @@ func TestNewCodexToolRunContextStructMissingFieldRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), `support field "codex_thread_id"`)
 }
 
+func TestNewCodexToolRunContextStructUnexportedFieldRejected(t *testing.T) {
+	type runContextStruct struct {
+		codexThreadID string `json:"codex_thread_id"`
+	}
+
+	execClient := &recordingExec{}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	tool, err := NewCodexTool(CodexToolOptions{
+		Codex:                 codexClient,
+		UseRunContextThreadID: true,
+	})
+	require.NoError(t, err)
+
+	runContext := &runContextStruct{codexThreadID: "thread-prev"}
+	ctx := agents.ContextWithRunContextValue(t.Context(), runContext)
+	_, err = tool.OnInvokeTool(ctx, `{"inputs":[{"type":"text","text":"hello"}]}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "writable run context field")
+}
+
 func TestNewCodexToolRunContextStructByValueRejected(t *testing.T) {
 	type runContextStruct struct {
 		CodexThreadID string `json:"codex_thread_id"`
@@ -1362,6 +1770,22 @@ func TestNewCodexToolRunContextStructByValueRejected(t *testing.T) {
 	_, err = tool.OnInvokeTool(ctx, `{"inputs":[{"type":"text","text":"hello"}]}`)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "struct contexts must be passed by pointer")
+}
+
+func TestNewCodexToolRunContextRejectsNonStringKeyMap(t *testing.T) {
+	execClient := &recordingExec{}
+	codexClient := newCodexWithExec(execClient, CodexOptions{})
+	tool, err := NewCodexTool(CodexToolOptions{
+		Codex:                 codexClient,
+		UseRunContextThreadID: true,
+	})
+	require.NoError(t, err)
+
+	runContext := map[any]any{"codex_thread_id": "thread-prev"}
+	ctx := agents.ContextWithRunContextValue(t.Context(), runContext)
+	_, err = tool.OnInvokeTool(ctx, `{"inputs":[{"type":"text","text":"hello"}]}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "string keys")
 }
 
 func TestNewCodexToolRunContextModeRejectsThreadIDWithoutCustomParameters(t *testing.T) {
@@ -1459,6 +1883,12 @@ func TestResolveRunContextThreadIDKeyRejectsLossyDefaultSuffix(t *testing.T) {
 	assert.Contains(t, err.Error(), "run_context_thread_id_key")
 }
 
+func TestResolveRunContextThreadIDKeyDefaultsToToolNameSuffix(t *testing.T) {
+	key, err := resolveRunContextThreadIDKey("codex_engineer", nil, true)
+	require.NoError(t, err)
+	assert.Equal(t, "codex_thread_id_engineer", key)
+}
+
 func TestCoerceCodexToolOptionsRejectsEmptyRunContextThreadIDKey(t *testing.T) {
 	_, err := CoerceCodexToolOptions(map[string]any{
 		"use_run_context_thread_id": true,
@@ -1528,4 +1958,82 @@ func TestNewCodexToolAcceptsCustomParametersSchema(t *testing.T) {
 		`{"inputs":[{"type":"text","text":"hello"}],"extra":"ignored-by-custom-parser"}`,
 	)
 	require.NoError(t, err)
+}
+
+func TestCodexToolTruncateSpanStringLimits(t *testing.T) {
+	zero := 0
+	assert.Equal(t, "", truncateSpanString("hello", &zero))
+
+	limit := 3
+	longValue := strings.Repeat("x", 100)
+	assert.Equal(t, "xxx", truncateSpanString(longValue, &limit))
+}
+
+func TestCodexToolTruncateSpanValueHandlesCircularReference(t *testing.T) {
+	value := []any{}
+	value = append(value, value)
+	limit := 1
+	truncated := truncateSpanValue(value, &limit)
+
+	truncatedMap, ok := truncated.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, true, truncatedMap["truncated"])
+}
+
+func TestCodexToolEnforceSpanDataBudgetZeroMax(t *testing.T) {
+	maxChars := 0
+	trimmed := enforceSpanDataBudget(map[string]any{"output": "x"}, &maxChars)
+	assert.Empty(t, trimmed)
+}
+
+func TestCodexToolEnforceSpanDataBudgetTrimsValuesWhenBudgetTight(t *testing.T) {
+	data := map[string]any{
+		"command":   "run",
+		"output":    strings.Repeat("x", 50),
+		"arguments": strings.Repeat("y", 50),
+	}
+	base := map[string]any{
+		"command":   "run",
+		"output":    "",
+		"arguments": "",
+	}
+	maxChars := jsonCharSize(base) + 1
+	trimmed := enforceSpanDataBudget(data, &maxChars)
+
+	_, hasCommand := trimmed["command"]
+	_, hasOutput := trimmed["output"]
+	_, hasArguments := trimmed["arguments"]
+	assert.True(t, hasCommand)
+	assert.True(t, hasOutput)
+	assert.True(t, hasArguments)
+	assert.LessOrEqual(t, jsonCharSize(trimmed), maxChars)
+}
+
+func TestCodexToolEnforceSpanDataBudgetDropsUntilBaseFits(t *testing.T) {
+	data := map[string]any{
+		"command": "run",
+		"output":  strings.Repeat("x", 50),
+	}
+	base := map[string]any{
+		"command": "",
+		"output":  "",
+	}
+	maxChars := jsonCharSize(base) - 1
+	trimmed := enforceSpanDataBudget(data, &maxChars)
+
+	_, hasCommand := trimmed["command"]
+	_, hasOutput := trimmed["output"]
+	assert.False(t, hasCommand && hasOutput)
+}
+
+func TestCodexToolHandleItemStartedIgnoresMissingID(t *testing.T) {
+	spans := map[string]tracing.Span{}
+	handleCodexItemStarted(t.Context(), ReasoningItem{ID: "", Text: "hi"}, spans, nil)
+	assert.Empty(t, spans)
+}
+
+func TestCodexToolHandleItemUpdatedIgnoresMissingSpan(t *testing.T) {
+	spans := map[string]tracing.Span{}
+	handleCodexItemUpdated(ReasoningItem{ID: "missing", Text: "hi"}, spans, nil)
+	assert.Empty(t, spans)
 }

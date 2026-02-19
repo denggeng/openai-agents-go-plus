@@ -233,6 +233,10 @@ type SingleStepResult struct {
 	// Items generated during this current step.
 	NewStepItems []RunItem
 
+	// Full unfiltered items for session history. When set, these are used instead of
+	// NewStepItems for session persistence and observability.
+	SessionStepItems []RunItem
+
 	// Results of tool input guardrails run during this step.
 	ToolInputGuardrailResults []ToolInputGuardrailResult
 
@@ -246,6 +250,14 @@ type SingleStepResult struct {
 // GeneratedItems returns the items generated during the agent run (i.e. everything generated after `OriginalInput`).
 func (result SingleStepResult) GeneratedItems() []RunItem {
 	return slices.Concat(result.PreStepItems, result.NewStepItems)
+}
+
+// StepSessionItems returns the items to use for session persistence and streaming.
+func (result SingleStepResult) StepSessionItems() []RunItem {
+	if result.SessionStepItems != nil {
+		return result.SessionStepItems
+	}
+	return result.NewStepItems
 }
 
 func GetModelTracingImpl(tracingDisabled, traceIncludeSensitiveData bool) ModelTracing {
@@ -425,6 +437,7 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 			runHandoffs,
 			hooks,
 			runConfig,
+			contextWrapper,
 		)
 		if err != nil {
 			return nil, err
@@ -1131,9 +1144,9 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 		ctx context.Context,
 		funcTool FunctionTool,
 		toolCall ResponseFunctionToolCall,
-	) (any, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, *ToolApprovalItem, error) {
+	) (any, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, []ToolApprovalItem, error) {
 		var result any
-		var approvalItem *ToolApprovalItem
+		var approvalItems []ToolApprovalItem
 		var toolInputGuardrailResults []ToolInputGuardrailResult
 		var toolOutputGuardrailResults []ToolOutputGuardrailResult
 
@@ -1225,7 +1238,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 							return nil
 						}
 						if !known {
-							approvalItem = &pending
+							approvalItems = append(approvalItems, pending)
 							return nil
 						}
 					}
@@ -1305,6 +1318,18 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 					})
 				}
 
+				if agentResult, ok := asAgentToolRunResult(result); ok {
+					if agentResult.Result != nil && len(agentResult.Result.Interruptions) > 0 {
+						parentSig := agentToolSignatureFromResponseToolCall(&toolCall)
+						approvalItems = approvalItems[:0]
+						for _, interruption := range agentResult.Result.Interruptions {
+							approvalItems = append(approvalItems, wrapAgentToolInterruption(interruption, parentSig))
+						}
+						return nil
+					}
+					result = agentResult.Output
+				}
+
 				result, err = ri.executeToolOutputGuardrails(
 					ctx,
 					agent,
@@ -1354,13 +1379,13 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
-		return result, toolInputGuardrailResults, toolOutputGuardrailResults, approvalItem, nil
+		return result, toolInputGuardrailResults, toolOutputGuardrailResults, approvalItems, nil
 	}
 
 	results := make([]any, len(toolRuns))
 	perToolInputGuardrailResults := make([][]ToolInputGuardrailResult, len(toolRuns))
 	perToolOutputGuardrailResults := make([][]ToolOutputGuardrailResult, len(toolRuns))
-	perToolApprovalItems := make([]*ToolApprovalItem, len(toolRuns))
+	perToolApprovalItems := make([][]ToolApprovalItem, len(toolRuns))
 	resultErrors := make([]error, len(toolRuns))
 
 	var cancel context.CancelFunc
@@ -1393,8 +1418,8 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 	functionInterruptions := make([]ToolApprovalItem, 0)
 	for i, result := range results {
 		toolRun := toolRuns[i]
-		if approvalItem := perToolApprovalItems[i]; approvalItem != nil {
-			functionInterruptions = append(functionInterruptions, *approvalItem)
+		if approvalItems := perToolApprovalItems[i]; len(approvalItems) > 0 {
+			functionInterruptions = append(functionInterruptions, approvalItems...)
 			functionToolResults[i] = FunctionToolResult{
 				Tool:    toolRun.FunctionTool,
 				Output:  nil,
@@ -1424,6 +1449,20 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 	}
 
 	return functionToolResults, toolInputGuardrailResults, toolOutputGuardrailResults, functionInterruptions, nil
+}
+
+func asAgentToolRunResult(result any) (AgentToolRunResult, bool) {
+	switch v := result.(type) {
+	case AgentToolRunResult:
+		return v, true
+	case *AgentToolRunResult:
+		if v == nil {
+			return AgentToolRunResult{}, false
+		}
+		return *v, true
+	default:
+		return AgentToolRunResult{}, false
+	}
 }
 
 func (runImpl) executeToolInputGuardrails(
@@ -1671,6 +1710,7 @@ func (runImpl) ExecuteHandoffs(
 	runHandoffs []ToolRunHandoff,
 	hooks RunHooks,
 	runConfig RunConfig,
+	contextWrapper *RunContextWrapper[any],
 ) (*SingleStepResult, error) {
 	// If there is more than one handoff, add tool responses that reject those handoffs
 	multipleHandoffs := len(runHandoffs) > 1
@@ -1774,29 +1814,63 @@ func (runImpl) ExecuteHandoffs(
 	if inputFilter == nil {
 		inputFilter = runConfig.HandoffInputFilter
 	}
-	if inputFilter != nil {
+	shouldNestHistory := runConfig.NestHandoffHistory
+	if handoff.NestHandoffHistory.Valid() {
+		shouldNestHistory = handoff.NestHandoffHistory.Value
+	}
+
+	var sessionStepItems []RunItem
+	if inputFilter != nil || shouldNestHistory {
 		Logger().Debug("Filtering inputs for handoff")
 		handoffInputData := HandoffInputData{
 			InputHistory:    CopyInput(originalInput),
 			PreHandoffItems: slices.Clone(preStepItems),
 			NewItems:        slices.Clone(newStepItems),
-		}
-		filtered, err := inputFilter(ctx, handoffInputData)
-		if err != nil {
-			return nil, fmt.Errorf("handoff input filter error: %w", err)
+			RunContext:      contextWrapper,
 		}
 
-		originalInput = CopyInput(filtered.InputHistory)
-		preStepItems = slices.Clone(filtered.PreHandoffItems)
-		newStepItems = slices.Clone(filtered.NewItems)
+		if inputFilter != nil {
+			filtered, err := inputFilter(ctx, handoffInputData)
+			if err != nil {
+				return nil, fmt.Errorf("handoff input filter error: %w", err)
+			}
+
+			if filtered.InputHistory != nil {
+				originalInput = CopyInput(filtered.InputHistory)
+			} else {
+				originalInput = InputItems{}
+			}
+			preStepItems = slices.Clone(filtered.PreHandoffItems)
+			newStepItems = slices.Clone(filtered.NewItems)
+
+			if filtered.InputItems != nil {
+				sessionStepItems = slices.Clone(filtered.NewItems)
+				newStepItems = slices.Clone(filtered.InputItems)
+			}
+		} else if shouldNestHistory {
+			nested := NestHandoffHistory(handoffInputData, runConfig.HandoffHistoryMapper)
+			if nested.InputHistory != nil {
+				originalInput = CopyInput(nested.InputHistory)
+			} else {
+				originalInput = InputItems{}
+			}
+			preStepItems = slices.Clone(nested.PreHandoffItems)
+			sessionStepItems = slices.Clone(nested.NewItems)
+			if nested.InputItems != nil {
+				newStepItems = slices.Clone(nested.InputItems)
+			} else {
+				newStepItems = slices.Clone(nested.NewItems)
+			}
+		}
 	}
 
 	return &SingleStepResult{
-		OriginalInput: originalInput,
-		ModelResponse: newResponse,
-		PreStepItems:  preStepItems,
-		NewStepItems:  newStepItems,
-		NextStep:      NextStepHandoff{NewAgent: newAgent},
+		OriginalInput:    originalInput,
+		ModelResponse:    newResponse,
+		PreStepItems:     preStepItems,
+		NewStepItems:     newStepItems,
+		SessionStepItems: sessionStepItems,
+		NextStep:         NextStepHandoff{NewAgent: newAgent},
 	}, nil
 }
 
@@ -1984,7 +2058,7 @@ func (runImpl) RunSingleOutputGuardrail(
 }
 
 func (runImpl) StreamStepResultToQueue(stepResult SingleStepResult, queue *asyncqueue.Queue[StreamEvent]) {
-	for _, item := range stepResult.NewStepItems {
+	for _, item := range stepResult.StepSessionItems() {
 		var event StreamEvent
 
 		switch item.(type) {

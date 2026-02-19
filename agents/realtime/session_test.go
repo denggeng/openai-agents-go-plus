@@ -101,6 +101,43 @@ func TestRealtimeSessionModelReturnsUnderlyingModel(t *testing.T) {
 	assert.Equal(t, model, session.Model())
 }
 
+func TestRealtimeSessionSendHelpers(t *testing.T) {
+	model := &mockRealtimeModel{}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent"},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{},
+	)
+
+	require.NoError(t, session.Enter(t.Context()))
+	<-session.Events() // initial history event
+
+	require.NoError(t, session.SendMessage(t.Context(), "hi"))
+	require.NoError(t, session.SendAudio(t.Context(), []byte("abc"), true))
+	require.NoError(t, session.Interrupt(t.Context()))
+
+	hasUser := false
+	hasAudio := false
+	hasInterrupt := false
+	for _, event := range model.sentEvents {
+		switch typed := event.(type) {
+		case RealtimeModelSendUserInput:
+			hasUser = true
+		case RealtimeModelSendAudio:
+			if typed.Commit {
+				hasAudio = true
+			}
+		case RealtimeModelSendInterrupt:
+			hasInterrupt = true
+		}
+	}
+	assert.True(t, hasUser)
+	assert.True(t, hasAudio)
+	assert.True(t, hasInterrupt)
+}
+
 func TestRealtimeSessionEventsStopOnClose(t *testing.T) {
 	model := &mockRealtimeModel{}
 	session := NewRealtimeSession(
