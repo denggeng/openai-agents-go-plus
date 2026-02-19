@@ -1976,6 +1976,29 @@ func (r Runner) startStreaming(
 	streamedResult.setInput(preparedInput)
 
 	for !streamedResult.IsComplete() {
+		if streamedResult.CancelMode() == CancelModeAfterTurn {
+			tempResult := &RunResult{
+				Input:                      streamedResult.Input(),
+				NewItems:                   streamedResult.NewItems(),
+				ModelInputItems:            streamedResult.ModelInputItems(),
+				RawResponses:               streamedResult.RawResponses(),
+				FinalOutput:                streamedResult.FinalOutput(),
+				InputGuardrailResults:      streamedResult.InputGuardrailResults(),
+				OutputGuardrailResults:     streamedResult.OutputGuardrailResults(),
+				ToolInputGuardrailResults:  streamedResult.ToolInputGuardrailResults(),
+				ToolOutputGuardrailResults: streamedResult.ToolOutputGuardrailResults(),
+				Interruptions:              streamedResult.Interruptions(),
+				LastAgent:                  currentAgent,
+			}
+			if len(tempResult.NewItems) > 0 || len(tempResult.RawResponses) > 0 {
+				if err := r.saveResultToSession(ctx, startingInput, tempResult, resumeState); err != nil {
+					return err
+				}
+			}
+			streamedResult.markAsComplete()
+			streamedResult.eventQueue.Put(queueCompleteSentinel{})
+			break
+		}
 		allTools, err := r.getAllTools(ctx, currentAgent)
 		if err != nil {
 			return err
@@ -2368,6 +2391,9 @@ func (r Runner) runSingleTurnStreamed(
 						OutputTokensDetails: event.Response.Usage.OutputTokensDetails,
 						TotalTokens:         uint64(event.Response.Usage.TotalTokens),
 					}
+				}
+				if u.Requests == 0 {
+					u.Requests = 1
 				}
 				finalResponse = &ModelResponse{
 					Output:     event.Response.Output,

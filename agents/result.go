@@ -146,6 +146,8 @@ type RunResultStreaming struct {
 	conversationID             *atomic.Pointer[string]
 	previousResponseID         *atomic.Pointer[string]
 	autoPreviousResponseID     *atomic.Bool
+	cancelMode                 *atomic.Pointer[CancelMode]
+	waitingOnEventQueue        *atomic.Bool
 }
 
 func newRunResultStreaming(ctx context.Context) *RunResultStreaming {
@@ -176,6 +178,8 @@ func newRunResultStreaming(ctx context.Context) *RunResultStreaming {
 		conversationID:             newZeroValAtomicPointer[string](),
 		previousResponseID:         newZeroValAtomicPointer[string](),
 		autoPreviousResponseID:     new(atomic.Bool),
+		cancelMode:                 newCancelModePointer(),
+		waitingOnEventQueue:        new(atomic.Bool),
 	}
 }
 
@@ -183,6 +187,21 @@ func newZeroValAtomicPointer[T any]() *atomic.Pointer[T] {
 	var zero T
 	p := new(atomic.Pointer[T])
 	p.Store(&zero)
+	return p
+}
+
+type CancelMode string
+
+const (
+	CancelModeNone      CancelMode = "none"
+	CancelModeImmediate CancelMode = "immediate"
+	CancelModeAfterTurn CancelMode = "after_turn"
+)
+
+func newCancelModePointer() *atomic.Pointer[CancelMode] {
+	p := new(atomic.Pointer[CancelMode])
+	mode := CancelModeNone
+	p.Store(&mode)
 	return p
 }
 
@@ -337,6 +356,39 @@ func (r *RunResultStreaming) createOutputGuardrailsTask(ctx context.Context, fn 
 func (r *RunResultStreaming) getStoredError() error  { return *r.storedError.Load() }
 func (r *RunResultStreaming) setStoredError(v error) { r.storedError.Store(&v) }
 
+func (r *RunResultStreaming) CancelMode() CancelMode {
+	if r == nil {
+		return CancelModeNone
+	}
+	ptr := r.cancelMode.Load()
+	if ptr == nil {
+		return CancelModeNone
+	}
+	return *ptr
+}
+
+func (r *RunResultStreaming) setCancelMode(mode CancelMode) {
+	if r == nil {
+		return
+	}
+	value := mode
+	r.cancelMode.Store(&value)
+}
+
+func (r *RunResultStreaming) isWaitingOnEventQueue() bool {
+	if r == nil {
+		return false
+	}
+	return r.waitingOnEventQueue.Load()
+}
+
+func (r *RunResultStreaming) setWaitingOnEventQueue(v bool) {
+	if r == nil {
+		return
+	}
+	r.waitingOnEventQueue.Store(v)
+}
+
 // ToInputList creates a new input list, merging the original input with all the new items generated.
 func (r *RunResultStreaming) ToInputList() []TResponseInputItem {
 	return toInputList(r.Input(), r.NewItems())
@@ -384,18 +436,41 @@ func (r *RunResultStreaming) LastAgent() *Agent {
 	return r.CurrentAgent()
 }
 
-// Cancel the streaming run, stopping all background tasks and marking the run as complete.
-func (r *RunResultStreaming) Cancel() {
+// Cancel the streaming run.
+// Mode options:
+//   - CancelModeImmediate: stop immediately, cancel tasks, clear queues (default).
+//   - CancelModeAfterTurn: allow current turn to finish, then stop.
+func (r *RunResultStreaming) Cancel(mode ...CancelMode) {
+	if r == nil {
+		return
+	}
+	cancelMode := CancelModeImmediate
+	if len(mode) > 0 {
+		cancelMode = mode[0]
+		if cancelMode == "" {
+			cancelMode = CancelModeImmediate
+		}
+	}
+	r.setCancelMode(cancelMode)
+
+	if cancelMode != CancelModeImmediate {
+		return
+	}
+
 	r.markAsComplete() // Mark the run as complete to stop event streaming
 	r.cleanupTasks()   // Cancel all running tasks
 	r.awaitTasks()
 
-	// Optionally, clear the event queue to prevent processing stale events
-	for !r.eventQueue.IsEmpty() {
-		_, _ = r.eventQueue.GetNoWait()
-	}
 	for !r.inputGuardrailQueue.IsEmpty() {
 		_, _ = r.inputGuardrailQueue.GetNoWait()
+	}
+
+	// Unblock any streamers waiting on the event queue.
+	r.eventQueue.Put(queueCompleteSentinel{})
+	if !r.isWaitingOnEventQueue() {
+		for !r.eventQueue.IsEmpty() {
+			_, _ = r.eventQueue.GetNoWait()
+		}
 	}
 }
 
@@ -423,7 +498,9 @@ func (r *RunResultStreaming) StreamEvents(fn func(StreamEvent) error) error {
 			break
 		}
 
+		r.setWaitingOnEventQueue(true)
 		item := r.eventQueue.Get()
+		r.setWaitingOnEventQueue(false)
 
 		if _, ok := item.(queueCompleteSentinel); ok {
 			// Check for errors, in case the queue was completed due to an error
