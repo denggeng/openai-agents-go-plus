@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.9.2 - 2026-02-20
+
 ### Added
 - Core agent loop with tools, handoffs, guardrails, and streaming events.
 - Streaming cancellation with immediate and after-turn modes.

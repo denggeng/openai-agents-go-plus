@@ -15,7 +15,7 @@
 package agents
 
 // Version can be overridden at build time with -ldflags "-X ...".
-var Version = "dev"
+var Version = "0.9.2"
 
 func DefaultUserAgent() string {
 	return "Agents/Go " + Version
