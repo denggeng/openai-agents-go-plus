@@ -1,8 +1,8 @@
 # OpenAI Agents Go SDK
 
 The OpenAI Agents SDK is a lightweight yet powerful framework for building
-multi-agent workflows. It is provider-agnostic, supporting the OpenAI Responses
-and Chat Completions APIs, as well as other LLMs.
+multi-agent workflows. It is provider-agnostic, supporting the OpenAI Responses,
+Chat Completions, and Realtime APIs, as well as other LLMs via custom providers.
 
 This is a Go port of [OpenAI Agents Python SDK](https://openai.github.io/openai-agents-python/)
 (see its license [here](https://github.com/openai/openai-agents-python/tree/main?tab=MIT-1-ov-file#readme)).
@@ -14,6 +14,8 @@ implementation, for both its behavior and the API.
 1. **Agents**: LLMs configured with instructions, tools, guardrails, and handoffs
 2. **Handoffs**: A specialized tool call used by the Agents SDK for transferring control between agents
 3. **Guardrails**: Configurable safety checks for input and output validation
+4. **Sessions**: Automatic conversation history management across runs
+5. **Tracing**: Built-in tracking of agent runs for debugging and analytics
 
 Explore the [examples](examples) directory to see the SDK in action:
 
@@ -29,14 +31,25 @@ Explore the [examples](examples) directory to see the SDK in action:
 | [model_providers](examples/model_providers) | Integrating custom model providers and proxies like LiteLLM. |
 | [research_bot](examples/research_bot) | General research bot combining planner, search, and writer agents. |
 | [repl](examples/repl) | Command-line REPL for interactive experimentation. |
+| [realtime](examples/realtime) | Realtime voice workflows, including Twilio SIP integration. |
 | [session](examples/session) | Demonstrates persistent session memory across multiple runs. |
 | [tools](examples/tools) | Usage of built-in tools such as code interpreter, computer use, file search, and web search. |
 | [voice](examples/voice) | Static and streaming voice response examples. |
 
+## Requirements
+
+- Go `1.24+` (see `go.mod`)
+- `OPENAI_API_KEY` for OpenAI-backed models
+
+Optional dependencies (only needed for specific features):
+- SQLite sessions require CGO (via `github.com/mattn/go-sqlite3`)
+- Voice examples may require PortAudio on your system
+- Computer-use tool relies on Playwright
+
 ## Installation
 
 ```
-go get github.com/denggeng/openai-agents-go-plus
+go get github.com/denggeng/openai-agents-go-plus@latest
 ```
 
 ## Hello world example
@@ -158,6 +171,23 @@ When you call `agents.Run()`, we run a loop until we get a final output.
 
 There is a `MaxTurns` parameter that you can use to limit the number of times the loop executes.
 
+## Streaming
+
+You can stream semantic events as the run progresses:
+
+```go
+result, err := agents.RunStreamed(context.Background(), agent, "Draft a short summary.")
+if err != nil {
+    panic(err)
+}
+_ = result.StreamEvents(func(event agents.StreamEvent) error {
+    // handle RunItemStreamEvent / RawResponsesStreamEvent, etc.
+    return nil
+})
+```
+
+For streaming cancellation, call `result.Cancel()` (immediate) or `result.Cancel(agents.CancelModeAfterTurn)` (finish the current turn, then stop).
+
 ### Final output
 
 Final output is the last thing the agent produces in the loop.
@@ -169,6 +199,75 @@ As a result, the mental model for the agent loop is:
 
 1. If the current agent has an `OutputType`, the loop runs until the agent produces structured output matching that type.
 2. If the current agent does not have an `OutputType`, the loop runs until the current agent produces a message without any tool calls/handoffs.
+
+## Sessions
+
+Sessions let you persist conversation history across runs without manually passing the full input list each time.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/denggeng/openai-agents-go-plus/memory"
+)
+
+func main() {
+	session, err := memory.NewSQLiteSession(context.Background(), memory.SQLiteSessionParams{
+		SessionID:        "conversation_123",
+		DBDataSourceName: "conversations.db",
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer session.Close()
+
+	agent := agents.New("Assistant").WithInstructions("Reply concisely.").WithModel("gpt-4o")
+	runner := agents.Runner{Config: agents.RunConfig{Session: session}}
+
+	// First turn
+	result1, _ := runner.Run(context.Background(), agent, "What city is the Golden Gate Bridge in?")
+	fmt.Println(result1.FinalOutput) // San Francisco
+
+	// Second turn (history automatically included)
+	result2, _ := runner.Run(context.Background(), agent, "What state is it in?")
+	fmt.Println(result2.FinalOutput) // California
+}
+```
+
+Available session backends include SQLite, Redis, Dapr, Postgres, encrypted sessions, and advanced branching sessions (see `memory/` and `examples/session`).
+
+## Tracing
+
+Tracing is enabled by default and records agent, model, tool, and guardrail spans. You can disable it via `RunConfig.TracingDisabled` or set `OPENAI_AGENTS_DISABLE_TRACING=1`.
+To export traces, register a processor/exporter via `tracing.AddTraceProcessor` or customize the default exporter in `tracing/`.
+
+## Human-in-the-loop (HITL) & long-running runs
+
+Tool approval flows and resumable run state are supported. Use tool approval policies to pause runs, persist state, and resume later with approvals applied.
+
+## Realtime & Voice
+
+- Realtime streaming workflows: `examples/realtime` (Twilio SIP example included).
+- Voice pipelines (STT/TTS + workflow): `examples/voice`.
+
+## MCP (Model Context Protocol)
+
+Local and hosted MCP integrations are available in `examples/mcp` and `examples/hosted_mcp`, covering filesystem, git, prompts, and streaming servers.
+
+## Custom model providers
+
+You can plug in custom model providers or proxies (for example LiteLLM) via the `model_providers` examples and by implementing the `agents.Model` interface.
+
+## Development
+
+```bash
+go test ./...
+gofmt -w ./agents ./openaitypes ./memory
+```
 
 ## Common agent patterns
 
