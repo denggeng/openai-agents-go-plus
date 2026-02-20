@@ -39,6 +39,7 @@ type AdvancedSQLiteSession struct {
 	sessionTable   string
 	messagesTable  string
 	turnUsageTable string
+	sessionSettings *SessionSettings
 
 	currentBranchID string
 	branches        map[string]*SQLiteSession
@@ -56,6 +57,9 @@ type AdvancedSQLiteSessionParams struct {
 	SessionTable   string
 	MessagesTable  string
 	TurnUsageTable string
+
+	// Optional session settings (e.g., default history limit).
+	SessionSettings *SessionSettings
 }
 
 type AdvancedConversationTurn struct {
@@ -108,12 +112,17 @@ func NewAdvancedSQLiteSession(ctx context.Context, params AdvancedSQLiteSessionP
 		return nil, fmt.Errorf("session id is required")
 	}
 
+	settings := params.SessionSettings
+	if settings == nil {
+		settings = &SessionSettings{}
+	}
 	s := &AdvancedSQLiteSession{
 		rootSessionID:   params.SessionID,
 		dbDSN:           cmp.Or(params.DBDataSourceName, "file::memory:?cache=shared"),
 		sessionTable:    cmp.Or(params.SessionTable, "agent_sessions"),
 		messagesTable:   cmp.Or(params.MessagesTable, "agent_messages"),
 		turnUsageTable:  cmp.Or(params.TurnUsageTable, "turn_usage"),
+		sessionSettings: settings,
 		currentBranchID: MainBranchID,
 		branches:        make(map[string]*SQLiteSession),
 	}
@@ -134,6 +143,10 @@ func NewAdvancedSQLiteSession(ctx context.Context, params AdvancedSQLiteSessionP
 
 func (s *AdvancedSQLiteSession) SessionID(context.Context) string {
 	return s.rootSessionID
+}
+
+func (s *AdvancedSQLiteSession) SessionSettings() *SessionSettings {
+	return s.sessionSettings
 }
 
 func (s *AdvancedSQLiteSession) CurrentBranchID() string {
@@ -934,6 +947,7 @@ func (s *AdvancedSQLiteSession) newBranchSession(ctx context.Context, branchID s
 		DBDataSourceName: s.dbDSN,
 		SessionTable:     s.sessionTable,
 		MessagesTable:    s.messagesTable,
+		SessionSettings:  s.sessionSettings,
 	})
 }
 

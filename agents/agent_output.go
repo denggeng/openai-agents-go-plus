@@ -176,6 +176,7 @@ func isStruct[T any]() bool {
 func (t outputTypeImpl[T]) IsPlainText() bool        { return t.isPlainText }
 func (t outputTypeImpl[T]) Name() string             { return t.name }
 func (t outputTypeImpl[T]) IsStrictJSONSchema() bool { return t.strictJSONSchema }
+func (t outputTypeImpl[T]) IsWrapped() bool          { return t.isWrapped }
 
 func (t outputTypeImpl[T]) JSONSchema() (map[string]any, error) {
 	if t.isPlainText {

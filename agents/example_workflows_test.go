@@ -46,9 +46,9 @@ type MathHomeworkOutput struct {
 }
 
 type MessageOutput struct {
-	Reasoning string  `json:"reasoning"`
-	Response  string  `json:"response"`
-	UserName  string  `json:"user_name,omitempty"`
+	Reasoning string `json:"reasoning"`
+	Response  string `json:"response"`
+	UserName  string `json:"user_name,omitempty"`
 }
 
 type AppContext struct {

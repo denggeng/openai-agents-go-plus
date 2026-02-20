@@ -136,6 +136,27 @@ func (s *EncryptedSession) SessionID(context.Context) string {
 	return s.sessionID
 }
 
+func (s *EncryptedSession) SessionSettings() *SessionSettings {
+	if provider, ok := s.underlying.(SessionSettingsProvider); ok {
+		return provider.SessionSettings()
+	}
+	return nil
+}
+
+func (s *EncryptedSession) IgnoreIDsForMatching() bool {
+	if provider, ok := s.underlying.(SessionIgnoreIDsProvider); ok {
+		return provider.IgnoreIDsForMatching()
+	}
+	return false
+}
+
+func (s *EncryptedSession) SanitizeInputItemsForPersistence(items []TResponseInputItem) []TResponseInputItem {
+	if sanitizer, ok := s.underlying.(SessionItemSanitizer); ok {
+		return sanitizer.SanitizeInputItemsForPersistence(items)
+	}
+	return items
+}
+
 func (s *EncryptedSession) GetItems(ctx context.Context, limit int) ([]TResponseInputItem, error) {
 	items, err := s.underlying.GetItems(ctx, limit)
 	if err != nil {

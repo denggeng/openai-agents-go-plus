@@ -33,6 +33,7 @@ type AsyncSQLiteSession struct {
 	dbDSN         string
 	sessionTable  string
 	messagesTable string
+	sessionSettings *SessionSettings
 	db            *sql.DB
 	mu            sync.Mutex
 }
@@ -49,15 +50,23 @@ type AsyncSQLiteSessionParams struct {
 
 	// Optional name of the table to store message data.
 	MessagesTable string
+
+	// Optional session settings (e.g., default history limit).
+	SessionSettings *SessionSettings
 }
 
 // NewAsyncSQLiteSession initializes the async SQLite session.
 func NewAsyncSQLiteSession(ctx context.Context, params AsyncSQLiteSessionParams) (_ *AsyncSQLiteSession, err error) {
+	settings := params.SessionSettings
+	if settings == nil {
+		settings = &SessionSettings{}
+	}
 	s := &AsyncSQLiteSession{
 		sessionID:     params.SessionID,
 		dbDSN:         cmp.Or(params.DBDataSourceName, "file::memory:?cache=shared"),
 		sessionTable:  cmp.Or(params.SessionTable, "agent_sessions"),
 		messagesTable: cmp.Or(params.MessagesTable, "agent_messages"),
+		sessionSettings: settings,
 	}
 
 	defer func() {
@@ -87,6 +96,10 @@ func NewAsyncSQLiteSession(ctx context.Context, params AsyncSQLiteSessionParams)
 
 func (s *AsyncSQLiteSession) SessionID(context.Context) string {
 	return s.sessionID
+}
+
+func (s *AsyncSQLiteSession) SessionSettings() *SessionSettings {
+	return s.sessionSettings
 }
 
 func (s *AsyncSQLiteSession) GetItems(ctx context.Context, limit int) (_ []TResponseInputItem, err error) {

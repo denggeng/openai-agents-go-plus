@@ -17,6 +17,7 @@ package agents_test
 import (
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/denggeng/openai-agents-go-plus/agents"
@@ -95,6 +96,200 @@ func TestSessionLimitWithRunner(t *testing.T) {
 			assert.Equal(t, "Message 4", inputItemText(t, inputItems[2]))
 		})
 	}
+}
+
+func TestSessionSettingsLimitWithRunner(t *testing.T) {
+	ptrInt := func(v int) *int { return &v }
+
+	runAgent := func(t *testing.T, streaming bool, session memory.Session, agent *agents.Agent, input string, settings *memory.SessionSettings) any {
+		t.Helper()
+
+		runner := agents.Runner{
+			Config: agents.RunConfig{
+				Session:         session,
+				SessionSettings: settings,
+			},
+		}
+
+		if streaming {
+			result, err := runner.RunStreamed(t.Context(), agent, input)
+			require.NoError(t, err)
+			require.NoError(t, result.StreamEvents(func(agents.StreamEvent) error { return nil }))
+			return result.FinalOutput()
+		}
+		result, err := runner.Run(t.Context(), agent, input)
+		require.NoError(t, err)
+		return result.FinalOutput
+	}
+
+	for _, streaming := range []bool{false, true} {
+		t.Run("streaming="+boolLabel(streaming), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "session_limit_settings.db")
+			session, err := memory.NewSQLiteSession(t.Context(), memory.SQLiteSessionParams{
+				SessionID:        "limit_settings_test",
+				DBDataSourceName: dbPath,
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, session.Close()) })
+
+			model := agentstesting.NewFakeModel(false, nil)
+			agent := agents.New("test").WithModelInstance(model)
+
+			model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+				Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 1")},
+			})
+			_ = runAgent(t, streaming, session, agent, "Message 1", nil)
+
+			model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+				Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 2")},
+			})
+			_ = runAgent(t, streaming, session, agent, "Message 2", nil)
+
+			model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+				Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 3")},
+			})
+			_ = runAgent(t, streaming, session, agent, "Message 3", nil)
+
+			allItems, err := session.GetItems(t.Context(), 0)
+			require.NoError(t, err)
+			assert.Len(t, allItems, 6)
+
+			model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+				Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 4")},
+			})
+			_ = runAgent(t, streaming, session, agent, "Message 4", &memory.SessionSettings{Limit: ptrInt(2)})
+
+			lastInput := model.LastTurnArgs.Input
+			require.IsType(t, agents.InputItems{}, lastInput)
+			inputItems := lastInput.(agents.InputItems)
+			require.Len(t, inputItems, 3)
+
+			assert.Equal(t, "Message 3", inputItemText(t, inputItems[0]))
+			assert.Equal(t, "Reply 3", inputItemText(t, inputItems[1]))
+			assert.Equal(t, "Message 4", inputItemText(t, inputItems[2]))
+		})
+	}
+}
+
+func TestSessionSettingsLimitZero(t *testing.T) {
+	ptrInt := func(v int) *int { return &v }
+
+	dbPath := filepath.Join(t.TempDir(), "session_settings_limit_zero.db")
+	session, err := memory.NewSQLiteSession(t.Context(), memory.SQLiteSessionParams{
+		SessionID:        "limit_zero_test",
+		DBDataSourceName: dbPath,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, session.Close()) })
+
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := agents.New("test").WithModelInstance(model)
+
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 1")},
+	})
+	_, err = agents.Runner{Config: agents.RunConfig{Session: session}}.Run(t.Context(), agent, "Message 1")
+	require.NoError(t, err)
+
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 2")},
+	})
+	_, err = agents.Runner{Config: agents.RunConfig{Session: session}}.Run(t.Context(), agent, "Message 2")
+	require.NoError(t, err)
+
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 3")},
+	})
+	_, err = agents.Runner{Config: agents.RunConfig{
+		Session:         session,
+		SessionSettings: &memory.SessionSettings{Limit: ptrInt(0)},
+	}}.Run(t.Context(), agent, "Message 3")
+	require.NoError(t, err)
+
+	lastInput := model.LastTurnArgs.Input
+	require.IsType(t, agents.InputItems{}, lastInput)
+	inputItems := lastInput.(agents.InputItems)
+	require.Len(t, inputItems, 1)
+	assert.Equal(t, "Message 3", inputItemText(t, inputItems[0]))
+}
+
+func TestSessionSettingsLimitNilGetsAllHistory(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "session_settings_limit_none.db")
+	session, err := memory.NewSQLiteSession(t.Context(), memory.SQLiteSessionParams{
+		SessionID:        "limit_none_test",
+		DBDataSourceName: dbPath,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, session.Close()) })
+
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := agents.New("test").WithModelInstance(model)
+
+	for i := 1; i <= 5; i++ {
+		model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+			Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply " + strconv.Itoa(i))},
+		})
+		_, err := agents.Runner{Config: agents.RunConfig{Session: session}}.Run(t.Context(), agent, "Message "+strconv.Itoa(i))
+		require.NoError(t, err)
+	}
+
+	allItems, err := session.GetItems(t.Context(), 0)
+	require.NoError(t, err)
+	assert.Len(t, allItems, 10)
+
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 6")},
+	})
+	_, err = agents.Runner{Config: agents.RunConfig{
+		Session:         session,
+		SessionSettings: &memory.SessionSettings{Limit: nil},
+	}}.Run(t.Context(), agent, "Message 6")
+	require.NoError(t, err)
+
+	lastInput := model.LastTurnArgs.Input
+	require.IsType(t, agents.InputItems{}, lastInput)
+	inputItems := lastInput.(agents.InputItems)
+	require.Len(t, inputItems, 11)
+	assert.Equal(t, "Message 1", inputItemText(t, inputItems[0]))
+	assert.Equal(t, "Message 6", inputItemText(t, inputItems[10]))
+}
+
+func TestSessionSettingsLimitLargerThanHistory(t *testing.T) {
+	ptrInt := func(v int) *int { return &v }
+
+	dbPath := filepath.Join(t.TempDir(), "session_settings_limit_large.db")
+	session, err := memory.NewSQLiteSession(t.Context(), memory.SQLiteSessionParams{
+		SessionID:        "limit_large_test",
+		DBDataSourceName: dbPath,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, session.Close()) })
+
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := agents.New("test").WithModelInstance(model)
+
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 1")},
+	})
+	_, err = agents.Runner{Config: agents.RunConfig{Session: session}}.Run(t.Context(), agent, "Message 1")
+	require.NoError(t, err)
+
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("Reply 2")},
+	})
+	_, err = agents.Runner{Config: agents.RunConfig{
+		Session:         session,
+		SessionSettings: &memory.SessionSettings{Limit: ptrInt(100)},
+	}}.Run(t.Context(), agent, "Message 2")
+	require.NoError(t, err)
+
+	lastInput := model.LastTurnArgs.Input
+	require.IsType(t, agents.InputItems{}, lastInput)
+	inputItems := lastInput.(agents.InputItems)
+	require.Len(t, inputItems, 3)
+	assert.Equal(t, "Message 1", inputItemText(t, inputItems[0]))
+	assert.Equal(t, "Reply 1", inputItemText(t, inputItems[1]))
+	assert.Equal(t, "Message 2", inputItemText(t, inputItems[2]))
 }
 
 func TestSessionLimitZeroReturnsAllHistory(t *testing.T) {

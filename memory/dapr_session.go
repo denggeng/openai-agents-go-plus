@@ -72,6 +72,7 @@ type DaprSession struct {
 	ttl            time.Duration
 	consistency    DaprConsistencyLevel
 	ownsClient     bool
+	sessionSettings *SessionSettings
 	messagesKey    string
 	metadataKey    string
 	mu             sync.Mutex
@@ -87,6 +88,7 @@ type DaprSessionParams struct {
 	TTL            time.Duration
 	Consistency    DaprConsistencyLevel
 	OwnsClient     bool
+	SessionSettings *SessionSettings
 }
 
 func NewDaprSession(params DaprSessionParams) (*DaprSession, error) {
@@ -107,6 +109,10 @@ func NewDaprSession(params DaprSessionParams) (*DaprSession, error) {
 		return nil, fmt.Errorf("invalid consistency level %q", consistency)
 	}
 
+	settings := params.SessionSettings
+	if settings == nil {
+		settings = &SessionSettings{}
+	}
 	sessionID := strings.TrimSpace(params.SessionID)
 	return &DaprSession{
 		sessionID:      sessionID,
@@ -115,6 +121,7 @@ func NewDaprSession(params DaprSessionParams) (*DaprSession, error) {
 		ttl:            params.TTL,
 		consistency:    consistency,
 		ownsClient:     params.OwnsClient,
+		sessionSettings: settings,
 		messagesKey:    sessionID + ":messages",
 		metadataKey:    sessionID + ":metadata",
 		now:            time.Now,
@@ -134,6 +141,10 @@ func NewDaprSession(params DaprSessionParams) (*DaprSession, error) {
 
 func (s *DaprSession) SessionID(context.Context) string {
 	return s.sessionID
+}
+
+func (s *DaprSession) SessionSettings() *SessionSettings {
+	return s.sessionSettings
 }
 
 func (s *DaprSession) GetItems(ctx context.Context, limit int) ([]TResponseInputItem, error) {

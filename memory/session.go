@@ -24,6 +24,10 @@ import (
 // TResponseInputItem is a type alias for the ResponseInputItemUnionParam type from the OpenAI SDK.
 type TResponseInputItem = responses.ResponseInputItemUnionParam
 
+// SessionInputCallback customizes how new input is merged with history.
+// It should return the combined input items to send to the model.
+type SessionInputCallback func(history []TResponseInputItem, newInput []TResponseInputItem) ([]TResponseInputItem, error)
+
 // A Session stores conversation history for a specific session, allowing
 // agents to maintain context without requiring explicit manual memory management.
 type Session interface {
@@ -44,6 +48,21 @@ type Session interface {
 
 	// ClearSession clears all items for this session.
 	ClearSession(context.Context) error
+}
+
+// SessionSettingsProvider exposes session-level defaults for history retrieval.
+type SessionSettingsProvider interface {
+	SessionSettings() *SessionSettings
+}
+
+// SessionIgnoreIDsProvider indicates item IDs should be ignored when matching persisted items.
+type SessionIgnoreIDsProvider interface {
+	IgnoreIDsForMatching() bool
+}
+
+// SessionItemSanitizer allows sessions to sanitize items before persistence.
+type SessionItemSanitizer interface {
+	SanitizeInputItemsForPersistence(items []TResponseInputItem) []TResponseInputItem
 }
 
 // RunUsageTrackingAwareSession extends Session with usage tracking support.

@@ -120,6 +120,44 @@ func TestSubsequentRunsStreamed(t *testing.T) {
 	assert.Len(t, result.ToInputList(), 3, "should have original input and generated items")
 }
 
+func TestStreamedReasoningItemIDPolicyOmitsFollowUpReasoningIDs(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{
+			agentstesting.GetFunctionTool("foo", "tool_result"),
+		},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			reasoningOutputItem("rs_stream", "Thinking..."),
+			agentstesting.GetFunctionToolCall("foo", `{"a": "b"}`),
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	result, err := (agents.Runner{Config: agents.RunConfig{
+		ReasoningItemIDPolicy: agents.ReasoningItemIDPolicyOmit,
+	}}).RunStreamed(t.Context(), agent, "hello")
+	require.NoError(t, err)
+	require.NoError(t, result.StreamEvents(func(agents.StreamEvent) error { return nil }))
+
+	assert.Equal(t, "done", result.FinalOutput())
+	secondRequestReasoning := findReasoningInputItem(model.LastTurnArgs.Input)
+	require.NotNil(t, secondRequestReasoning)
+	_, hasID := secondRequestReasoning["id"]
+	assert.False(t, hasID)
+
+	historyReasoning := findReasoningInputItem(result.ToInputList())
+	require.NotNil(t, historyReasoning)
+	_, hasID = historyReasoning["id"]
+	assert.False(t, hasID)
+}
+
 func TestToolCallRunsStreamed(t *testing.T) {
 	model := agentstesting.NewFakeModel(false, nil)
 	agent := &agents.Agent{
@@ -655,4 +693,183 @@ func TestDynamicToolAdditionRunStreamed(t *testing.T) {
 
 	assert.Equal(t, "done", result.FinalOutput())
 	assert.True(t, tool2Called)
+}
+
+type recordingSession struct {
+	history      []agents.TResponseInputItem
+	savedBatches [][]agents.TResponseInputItem
+}
+
+func (s *recordingSession) SessionID(context.Context) string {
+	return "recording"
+}
+
+func (s *recordingSession) GetItems(_ context.Context, limit int) ([]agents.TResponseInputItem, error) {
+	if limit <= 0 || limit >= len(s.history) {
+		return append([]agents.TResponseInputItem(nil), s.history...), nil
+	}
+	start := len(s.history) - limit
+	if start < 0 {
+		start = 0
+	}
+	return append([]agents.TResponseInputItem(nil), s.history[start:]...), nil
+}
+
+func (s *recordingSession) AddItems(_ context.Context, items []agents.TResponseInputItem) error {
+	s.history = append(s.history, items...)
+	s.savedBatches = append(s.savedBatches, append([]agents.TResponseInputItem(nil), items...))
+	return nil
+}
+
+func (s *recordingSession) PopItem(context.Context) (*agents.TResponseInputItem, error) {
+	if len(s.history) == 0 {
+		return nil, nil
+	}
+	item := s.history[len(s.history)-1]
+	s.history = s.history[:len(s.history)-1]
+	return &item, nil
+}
+
+func (s *recordingSession) ClearSession(context.Context) error {
+	s.history = nil
+	return nil
+}
+
+type dummyOpenAIConversationSession struct {
+	t     *testing.T
+	saved [][]agents.TResponseInputItem
+}
+
+func (s *dummyOpenAIConversationSession) SessionID(context.Context) string {
+	return "conv_test"
+}
+
+func (s *dummyOpenAIConversationSession) GetItems(context.Context, int) ([]agents.TResponseInputItem, error) {
+	return nil, nil
+}
+
+func (s *dummyOpenAIConversationSession) AddItems(_ context.Context, items []agents.TResponseInputItem) error {
+	for _, item := range items {
+		payload := inputItemPayload(s.t, item)
+		_, hasID := payload["id"]
+		require.False(s.t, hasID, "IDs should be stripped before saving")
+		_, hasProvider := payload["provider_data"]
+		require.False(s.t, hasProvider, "provider_data should be stripped before saving")
+	}
+	s.saved = append(s.saved, append([]agents.TResponseInputItem(nil), items...))
+	return nil
+}
+
+func (s *dummyOpenAIConversationSession) PopItem(context.Context) (*agents.TResponseInputItem, error) {
+	return nil, nil
+}
+
+func (s *dummyOpenAIConversationSession) ClearSession(context.Context) error {
+	return nil
+}
+
+func (s *dummyOpenAIConversationSession) IgnoreIDsForMatching() bool {
+	return true
+}
+
+func (s *dummyOpenAIConversationSession) SanitizeInputItemsForPersistence(items []agents.TResponseInputItem) []agents.TResponseInputItem {
+	if len(items) == 0 {
+		return nil
+	}
+	sanitized := make([]agents.TResponseInputItem, 0, len(items))
+	for _, item := range items {
+		payload := inputItemPayload(s.t, item)
+		delete(payload, "id")
+		delete(payload, "provider_data")
+		sanitized = append(sanitized, inputItemFromPayload(s.t, payload))
+	}
+	return sanitized
+}
+
+func TestStreamInputPersistenceStripsIDsForOpenAIConversationSession(t *testing.T) {
+	session := &dummyOpenAIConversationSession{t: t}
+
+	model := agentstesting.NewFakeModel(false, nil)
+	model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+		Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("ok")},
+	})
+
+	agent := agents.New("test").WithModelInstance(model)
+
+	inputItems := []agents.TResponseInputItem{
+		inputItemFromPayload(t, map[string]any{
+			"id":            "message-1",
+			"type":          "message",
+			"role":          "user",
+			"content":       "hello",
+			"provider_data": map[string]any{"model": "litellm/test"},
+		}),
+	}
+
+	result, err := agents.Runner{Config: agents.RunConfig{
+		Session: session,
+		SessionInputCallback: func(existing, newInput []agents.TResponseInputItem) ([]agents.TResponseInputItem, error) {
+			return append(existing, newInput...), nil
+		},
+	}}.RunInputsStreamed(t.Context(), agent, inputItems)
+	require.NoError(t, err)
+	require.NoError(t, result.StreamEvents(func(agents.StreamEvent) error { return nil }))
+
+	require.NotEmpty(t, session.saved, "input items should be persisted via save_result_to_session")
+}
+
+func TestStreamInputPersistenceSavesOnlyNewTurnInput(t *testing.T) {
+	session := &recordingSession{}
+	model := agentstesting.NewFakeModel(false, nil)
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("first")}},
+		{Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("second")}},
+	})
+	agent := agents.New("test").WithModelInstance(model)
+
+	runConfig := agents.RunConfig{
+		SessionInputCallback: func(existing, newInput []agents.TResponseInputItem) ([]agents.TResponseInputItem, error) {
+			return append(existing, newInput...), nil
+		},
+	}
+
+	first, err := agents.Runner{Config: agents.RunConfig{Session: session, SessionInputCallback: runConfig.SessionInputCallback}}.RunInputsStreamed(
+		t.Context(),
+		agent,
+		[]agents.TResponseInputItem{agentstesting.GetTextInputItem("hello")},
+	)
+	require.NoError(t, err)
+	require.NoError(t, first.StreamEvents(func(agents.StreamEvent) error { return nil }))
+
+	second, err := agents.Runner{Config: agents.RunConfig{Session: session, SessionInputCallback: runConfig.SessionInputCallback}}.RunInputsStreamed(
+		t.Context(),
+		agent,
+		[]agents.TResponseInputItem{agentstesting.GetTextInputItem("next")},
+	)
+	require.NoError(t, err)
+	require.NoError(t, second.StreamEvents(func(agents.StreamEvent) error { return nil }))
+
+	require.Len(t, session.savedBatches, 2, "each turn should persist once")
+	for _, batch := range session.savedBatches {
+		userMessages := userMessageContents(t, batch)
+		require.Len(t, userMessages, 1, "persisted input should contain only new turn input")
+	}
+	assert.Equal(t, "hello", userMessageContents(t, session.savedBatches[0])[0])
+	assert.Equal(t, "next", userMessageContents(t, session.savedBatches[1])[0])
+}
+
+func userMessageContents(t *testing.T, items []agents.TResponseInputItem) []string {
+	t.Helper()
+	var out []string
+	for _, item := range items {
+		payload := inputItemPayload(t, item)
+		if payload["type"] != "message" {
+			continue
+		}
+		if role, ok := payload["role"].(string); ok && role != "user" {
+			continue
+		}
+		out = append(out, inputItemContentText(t, item))
+	}
+	return out
 }

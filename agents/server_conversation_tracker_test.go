@@ -24,6 +24,20 @@ func (d dummyRunItem) ToInputItem() TResponseInputItem {
 	if item, ok := d.RawItem.(TResponseInputItem); ok {
 		return item
 	}
+	if payload, ok := d.RawItem.(map[string]any); ok {
+		if typ, _ := payload["type"].(string); typ == "reasoning" {
+			id, _ := payload["id"].(string)
+			reasoning := responses.ResponseReasoningItemParam{
+				ID:   id,
+				Type: constant.ValueOf[constant.Reasoning](),
+			}
+			return TResponseInputItem{OfReasoning: &reasoning}
+		}
+		raw, _ := json.Marshal(payload)
+		var item TResponseInputItem
+		param.SetJSON(raw, &item)
+		return item
+	}
 	if item, ok := d.RawItem.(responses.ResponseInputItemFunctionCallOutputParam); ok {
 		return TResponseInputItem{OfFunctionCallOutput: &item}
 	}
@@ -73,7 +87,7 @@ func (m *fakeModel) StreamResponse(
 }
 
 func TestServerConversationTrackerPrepareInputFiltersItemsSeenByServerAndToolCalls(t *testing.T) {
-	tracker := NewOpenAIServerConversationTracker("conv", "", false)
+	tracker := NewOpenAIServerConversationTracker("conv", "", false, ReasoningItemIDPolicyPreserve)
 
 	originalInput := []TResponseInputItem{
 		inputItemFromMap(t, map[string]any{"id": "input-1", "type": "message"}),
@@ -115,7 +129,7 @@ func TestServerConversationTrackerPrepareInputFiltersItemsSeenByServerAndToolCal
 }
 
 func TestServerConversationTrackerMarkInputAsSentAndRewindInputRespectsRemainingInitialInput(t *testing.T) {
-	tracker := NewOpenAIServerConversationTracker("conv2", "", false)
+	tracker := NewOpenAIServerConversationTracker("conv2", "", false, ReasoningItemIDPolicyPreserve)
 
 	pending1 := inputItemFromMap(t, map[string]any{"id": "p-1", "type": "message"})
 	pending2 := inputItemFromMap(t, map[string]any{"id": "p-2", "type": "message"})
@@ -133,7 +147,7 @@ func TestServerConversationTrackerMarkInputAsSentAndRewindInputRespectsRemaining
 }
 
 func TestServerConversationTrackerTrackServerItemsFiltersRemainingInitialInputByFingerprint(t *testing.T) {
-	tracker := NewOpenAIServerConversationTracker("conv3", "", false)
+	tracker := NewOpenAIServerConversationTracker("conv3", "", false, ReasoningItemIDPolicyPreserve)
 
 	pendingKept := inputItemFromMap(t, map[string]any{"id": "keep-me", "type": "message"})
 	pendingFiltered := inputItemFromMap(t, map[string]any{
@@ -161,7 +175,7 @@ func TestServerConversationTrackerTrackServerItemsFiltersRemainingInitialInputBy
 }
 
 func TestServerConversationTrackerPrepareInputDoesNotSkipFakeResponseIDs(t *testing.T) {
-	tracker := NewOpenAIServerConversationTracker("conv5", "", false)
+	tracker := NewOpenAIServerConversationTracker("conv5", "", false, ReasoningItemIDPolicyPreserve)
 
 	modelResponse := ModelResponse{
 		Output: []TResponseOutputItem{
@@ -187,7 +201,7 @@ func TestServerConversationTrackerGetNewResponseMarksFilteredInputAsSent(t *test
 	model.SetNextOutput([]TResponseOutputItem{textOutputMessage("ok")})
 	agent := New("test").WithModelInstance(model)
 
-	tracker := NewOpenAIServerConversationTracker("conv4", "", false)
+	tracker := NewOpenAIServerConversationTracker("conv4", "", false, ReasoningItemIDPolicyPreserve)
 	item1 := textInputItem("first")
 	item2 := textInputItem("second")
 
@@ -233,7 +247,7 @@ func TestServerConversationTrackerRunSingleTurnStreamedMarksFilteredInputAsSent(
 	model.SetNextOutput([]TResponseOutputItem{textOutputMessage("ok")})
 	agent := New("test").WithModelInstance(model)
 
-	tracker := NewOpenAIServerConversationTracker("conv6", "", false)
+	tracker := NewOpenAIServerConversationTracker("conv6", "", false, ReasoningItemIDPolicyPreserve)
 	item1 := textInputItem("first")
 	item2 := textInputItem("second")
 
@@ -315,6 +329,76 @@ func textOutputMessage(content string) TResponseOutputItem {
 	}
 }
 
+func TestServerConversationTrackerMarkInputAsSentUsesRawGeneratedSourceForRebuiltItem(t *testing.T) {
+	tracker := NewOpenAIServerConversationTracker("conv2b", "", false, ReasoningItemIDPolicyPreserve)
+
+	rawGenerated := map[string]any{
+		"type":    "function_call_output",
+		"call_id": "call-2b",
+		"output":  "done",
+	}
+	generatedItems := []RunItem{
+		dummyRunItem{RawItem: rawGenerated, Type: "function_call_output_item"},
+	}
+
+	prepared := tracker.PrepareInput(InputItems(nil), generatedItems)
+	require.Len(t, prepared, 1)
+
+	rebuilt := inputItemFromMap(t, inputItemPayload(t, prepared[0]))
+	tracker.MarkInputAsSent([]TResponseInputItem{rebuilt})
+
+	rawID := itemIdentity(rawGenerated)
+	_, ok := tracker.sentItems[rawID]
+	assert.True(t, ok)
+
+	rebuiltID := itemIdentity(&rebuilt)
+	_, ok = tracker.sentItems[rebuiltID]
+	assert.False(t, ok)
+
+	preparedAgain := tracker.PrepareInput(InputItems(nil), generatedItems)
+	assert.Empty(t, preparedAgain)
+}
+
+func TestServerConversationTrackerPrepareInputAppliesReasoningItemIDPolicy(t *testing.T) {
+	tracker := NewOpenAIServerConversationTracker("conv7", "", false, ReasoningItemIDPolicyOmit)
+	generatedItems := []RunItem{
+		dummyRunItem{RawItem: map[string]any{
+			"type":    "reasoning",
+			"id":      "rs_turn_input",
+			"content": []map[string]any{{"type": "input_text", "text": "reasoning trace"}},
+		}, Type: "reasoning_item"},
+	}
+
+	prepared := tracker.PrepareInput(InputItems(nil), generatedItems)
+	require.Len(t, prepared, 1)
+	payload := inputItemPayload(t, prepared[0])
+	assert.Equal(t, "reasoning", payload["type"])
+	_, hasID := payload["id"]
+	assert.False(t, hasID)
+}
+
+func TestServerConversationTrackerDoesNotResendOmittedReasoningAfterMarkSent(t *testing.T) {
+	tracker := NewOpenAIServerConversationTracker("conv8", "", false, ReasoningItemIDPolicyOmit)
+	generatedItems := []RunItem{
+		dummyRunItem{RawItem: map[string]any{
+			"type":    "reasoning",
+			"id":      "rs_turn_input",
+			"content": []map[string]any{{"type": "input_text", "text": "reasoning trace"}},
+		}, Type: "reasoning_item"},
+	}
+
+	firstPrepared := tracker.PrepareInput(InputItems(nil), generatedItems)
+	require.Len(t, firstPrepared, 1)
+	payload := inputItemPayload(t, firstPrepared[0])
+	_, hasID := payload["id"]
+	assert.False(t, hasID)
+
+	tracker.MarkInputAsSent(firstPrepared)
+
+	secondPrepared := tracker.PrepareInput(InputItems(nil), generatedItems)
+	assert.Empty(t, secondPrepared)
+}
+
 func assertInputItemEqual(t *testing.T, expected, actual TResponseInputItem) {
 	t.Helper()
 	assert.Equal(t, mustFingerprint(t, expected), mustFingerprint(t, actual))
@@ -325,4 +409,13 @@ func mustFingerprint(t *testing.T, item TResponseInputItem) string {
 	fp, ok := fingerprintForTracker(item)
 	require.True(t, ok)
 	return fp
+}
+
+func inputItemPayload(t *testing.T, item TResponseInputItem) map[string]any {
+	t.Helper()
+	raw, err := item.MarshalJSON()
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(raw, &payload))
+	return payload
 }

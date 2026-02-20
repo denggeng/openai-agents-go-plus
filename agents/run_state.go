@@ -93,6 +93,7 @@ type RunState struct {
 	ToolUseTracker             map[string][]string                `json:"tool_use_tracker,omitempty"`
 	ConversationID             string                             `json:"conversation_id,omitempty"`
 	AutoPreviousResponseID     bool                               `json:"auto_previous_response_id,omitempty"`
+	ReasoningItemIDPolicy      ReasoningItemIDPolicy              `json:"reasoning_item_id_policy,omitempty"`
 	Trace                      *TraceState                        `json:"trace,omitempty"`
 }
 
@@ -112,13 +113,14 @@ func NewRunStateFromResult(result RunResult, currentTurn uint64, maxTurns uint64
 		MaxTurns:                   maxTurns,
 		CurrentAgentName:           displayAgentName(result.LastAgent),
 		OriginalInput:              slices.Clone(ItemHelpers().InputToNewInputList(result.Input)),
-		GeneratedItems:             toInputList(InputItems{}, modelItems),
+		GeneratedItems:             toInputListWithPolicy(InputItems{}, modelItems, result.reasoningItemIDPolicy),
 		GeneratedRunItems:          slices.Clone(modelItems),
 		SessionItems:               slices.Clone(result.NewItems),
 		ModelResponses:             slices.Clone(result.RawResponses),
 		PreviousResponseID:         previousResponseID,
 		ConversationID:             result.ConversationID,
 		AutoPreviousResponseID:     result.AutoPreviousResponseID,
+		ReasoningItemIDPolicy:      result.reasoningItemIDPolicy,
 		Interruptions:              slices.Clone(result.Interruptions),
 		InputGuardrailResults:      guardrailResultStatesFromInput(result.InputGuardrailResults),
 		OutputGuardrailResults:     guardrailResultStatesFromOutput(result.OutputGuardrailResults),
@@ -147,13 +149,14 @@ func NewRunStateFromStreaming(result *RunResultStreaming) RunState {
 		MaxTurns:                   result.MaxTurns(),
 		CurrentAgentName:           displayAgentName(result.LastAgent()),
 		OriginalInput:              slices.Clone(ItemHelpers().InputToNewInputList(result.Input())),
-		GeneratedItems:             toInputList(InputItems{}, modelItems),
+		GeneratedItems:             toInputListWithPolicy(InputItems{}, modelItems, result.reasoningItemIDPolicy),
 		GeneratedRunItems:          slices.Clone(modelItems),
 		SessionItems:               slices.Clone(result.NewItems()),
 		ModelResponses:             slices.Clone(result.RawResponses()),
 		PreviousResponseID:         previousResponseID,
 		ConversationID:             result.ConversationID(),
 		AutoPreviousResponseID:     result.AutoPreviousResponseID(),
+		ReasoningItemIDPolicy:      result.reasoningItemIDPolicy,
 		Interruptions:              slices.Clone(result.Interruptions()),
 		InputGuardrailResults:      guardrailResultStatesFromInput(result.InputGuardrailResults()),
 		OutputGuardrailResults:     guardrailResultStatesFromOutput(result.OutputGuardrailResults()),
@@ -288,6 +291,9 @@ func (s RunState) ResumeRunConfig(base RunConfig) RunConfig {
 	}
 	if cfg.MaxTurns == 0 && s.MaxTurns > 0 {
 		cfg.MaxTurns = s.MaxTurns
+	}
+	if cfg.ReasoningItemIDPolicy == "" && s.ReasoningItemIDPolicy != "" {
+		cfg.ReasoningItemIDPolicy = s.ReasoningItemIDPolicy
 	}
 	return cfg
 }

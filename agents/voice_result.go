@@ -250,7 +250,7 @@ func (r *StreamedAudioResult) streamAudio(
 	finishTurn bool,
 ) error {
 	var spanInput string
-	if r.voicePipelineConfig.TraceIncludeSensitiveData.Or(true) {
+	if r.voicePipelineConfig.TraceIncludeSensitiveData.Or(defaultTraceIncludeSensitiveData()) {
 		spanInput = text
 	}
 
@@ -271,7 +271,7 @@ func (r *StreamedAudioResult) streamAudio(
 			defer func() {
 				if err != nil {
 					var errorText string
-					if r.voicePipelineConfig.TraceIncludeSensitiveData.Or(true) {
+					if r.voicePipelineConfig.TraceIncludeSensitiveData.Or(defaultTraceIncludeSensitiveData()) {
 						errorText = text
 					}
 					ttsSpan.SetError(tracing.SpanError{
@@ -417,7 +417,7 @@ func (r *StreamedAudioResult) waitForTurnCompletion(ctx context.Context) error {
 
 func (r *StreamedAudioResult) finishTurn(ctx context.Context) error {
 	if span := r.getTracingSpan(); span != nil {
-		if r.voicePipelineConfig.TraceIncludeSensitiveData.Or(true) {
+		if r.voicePipelineConfig.TraceIncludeSensitiveData.Or(defaultTraceIncludeSensitiveData()) {
 			span.SpanData().(*tracing.SpeechGroupSpanData).Input = r.getTurnTextBuffer()
 		}
 

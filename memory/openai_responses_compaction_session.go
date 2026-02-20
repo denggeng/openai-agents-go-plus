@@ -163,6 +163,27 @@ func (s *OpenAIResponsesCompactionSession) SessionID(ctx context.Context) string
 	return s.underlyingSession.SessionID(ctx)
 }
 
+func (s *OpenAIResponsesCompactionSession) SessionSettings() *SessionSettings {
+	if provider, ok := s.underlyingSession.(SessionSettingsProvider); ok {
+		return provider.SessionSettings()
+	}
+	return nil
+}
+
+func (s *OpenAIResponsesCompactionSession) IgnoreIDsForMatching() bool {
+	if provider, ok := s.underlyingSession.(SessionIgnoreIDsProvider); ok {
+		return provider.IgnoreIDsForMatching()
+	}
+	return false
+}
+
+func (s *OpenAIResponsesCompactionSession) SanitizeInputItemsForPersistence(items []TResponseInputItem) []TResponseInputItem {
+	if sanitizer, ok := s.underlyingSession.(SessionItemSanitizer); ok {
+		return sanitizer.SanitizeInputItemsForPersistence(items)
+	}
+	return items
+}
+
 func (s *OpenAIResponsesCompactionSession) GetItems(ctx context.Context, limit int) ([]TResponseInputItem, error) {
 	return s.underlyingSession.GetItems(ctx, limit)
 }

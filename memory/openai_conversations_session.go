@@ -93,6 +93,9 @@ type OpenAIConversationsSessionParams struct {
 	ConversationID string
 	Client         *openai.Client
 
+	// Optional session settings (e.g., default history limit).
+	SessionSettings *SessionSettings
+
 	// Internal dependency injection hooks used in tests.
 	conversationsSvc openAIConversationsService
 	itemsSvc         openAIConversationItemsService
@@ -104,6 +107,7 @@ type OpenAIConversationsSession struct {
 
 	conversationsSvc openAIConversationsService
 	itemsSvc         openAIConversationItemsService
+	sessionSettings  *SessionSettings
 	mu               sync.Mutex
 }
 
@@ -133,10 +137,15 @@ func NewOpenAIConversationsSession(params OpenAIConversationsSessionParams) *Ope
 		}
 	}
 
+	settings := params.SessionSettings
+	if settings == nil {
+		settings = &SessionSettings{}
+	}
 	return &OpenAIConversationsSession{
 		sessionID:        params.ConversationID,
 		conversationsSvc: conversationsSvc,
 		itemsSvc:         itemsSvc,
+		sessionSettings:  settings,
 	}
 }
 
@@ -173,6 +182,47 @@ func (s *OpenAIConversationsSession) SessionID(context.Context) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sessionID
+}
+
+func (s *OpenAIConversationsSession) SessionSettings() *SessionSettings {
+	return s.sessionSettings
+}
+
+func (s *OpenAIConversationsSession) IgnoreIDsForMatching() bool {
+	return true
+}
+
+func (s *OpenAIConversationsSession) SanitizeInputItemsForPersistence(items []TResponseInputItem) []TResponseInputItem {
+	if len(items) == 0 {
+		return nil
+	}
+	sanitized := make([]TResponseInputItem, 0, len(items))
+	for _, item := range items {
+		sanitized = append(sanitized, sanitizeConversationItem(item))
+	}
+	return sanitized
+}
+
+func sanitizeConversationItem(item TResponseInputItem) TResponseInputItem {
+	raw, err := item.MarshalJSON()
+	if err != nil {
+		return item
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return item
+	}
+	delete(payload, "id")
+	delete(payload, "provider_data")
+	updated, err := json.Marshal(payload)
+	if err != nil {
+		return item
+	}
+	var out TResponseInputItem
+	if err := json.Unmarshal(updated, &out); err != nil {
+		return item
+	}
+	return out
 }
 
 func (s *OpenAIConversationsSession) ensureSessionID(ctx context.Context) (string, error) {

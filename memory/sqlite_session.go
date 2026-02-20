@@ -41,6 +41,7 @@ type SQLiteSession struct {
 	dbDSN         string
 	sessionTable  string
 	messagesTable string
+	sessionSettings *SessionSettings
 	db            *sql.DB
 	mu            sync.Mutex
 }
@@ -60,15 +61,23 @@ type SQLiteSessionParams struct {
 	// Optional name of the table to store message data.
 	// Defaults to "agent_messages".
 	MessagesTable string
+
+	// Optional session settings (e.g., default history limit).
+	SessionSettings *SessionSettings
 }
 
 // NewSQLiteSession initializes the SQLite session.
 func NewSQLiteSession(ctx context.Context, params SQLiteSessionParams) (_ *SQLiteSession, err error) {
+	settings := params.SessionSettings
+	if settings == nil {
+		settings = &SessionSettings{}
+	}
 	s := &SQLiteSession{
 		sessionID:     params.SessionID,
 		dbDSN:         cmp.Or(params.DBDataSourceName, "file::memory:?cache=shared"),
 		sessionTable:  cmp.Or(params.SessionTable, "agent_sessions"),
 		messagesTable: cmp.Or(params.MessagesTable, "agent_messages"),
+		sessionSettings: settings,
 	}
 
 	defer func() {
@@ -98,6 +107,10 @@ func NewSQLiteSession(ctx context.Context, params SQLiteSessionParams) (_ *SQLit
 
 func (s *SQLiteSession) SessionID(context.Context) string {
 	return s.sessionID
+}
+
+func (s *SQLiteSession) SessionSettings() *SessionSettings {
+	return s.sessionSettings
 }
 
 func (s *SQLiteSession) GetItems(ctx context.Context, limit int) (_ []TResponseInputItem, err error) {

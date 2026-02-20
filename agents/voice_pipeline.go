@@ -127,7 +127,7 @@ func (p *VoicePipeline) processAudioInput(ctx context.Context, audionInput Audio
 	return p.sttModel.Transcribe(ctx, STTModelTranscribeParams{
 		Input:                          audionInput,
 		Settings:                       p.config.STTSettings,
-		TraceIncludeSensitiveData:      p.config.TraceIncludeSensitiveData.Or(true),
+		TraceIncludeSensitiveData:      p.config.TraceIncludeSensitiveData.Or(defaultTraceIncludeSensitiveData()),
 		TraceIncludeSensitiveAudioData: p.config.TraceIncludeSensitiveAudioData.Or(true),
 	})
 }
@@ -209,7 +209,7 @@ func (p *VoicePipeline) runMultiTurn(ctx context.Context, audioInput StreamedAud
 			transcriptionSession, err := p.sttModel.CreateSession(ctx, STTModelCreateSessionParams{
 				Input:                          audioInput,
 				Settings:                       p.config.STTSettings,
-				TraceIncludeSensitiveData:      p.config.TraceIncludeSensitiveData.Or(true),
+				TraceIncludeSensitiveData:      p.config.TraceIncludeSensitiveData.Or(defaultTraceIncludeSensitiveData()),
 				TraceIncludeSensitiveAudioData: p.config.TraceIncludeSensitiveAudioData.Or(true),
 			})
 			if err != nil {

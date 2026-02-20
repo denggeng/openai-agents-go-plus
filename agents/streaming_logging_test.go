@@ -52,13 +52,13 @@ func TestRunStreamedResumeOmitsToolOutputWhenDontLog(t *testing.T) {
 		Output: responses.ResponseInputItemFunctionCallOutputOutputUnionParam{
 			OfString: param.NewOpt("secret"),
 		},
-		Type:   constant.ValueOf[constant.FunctionCallOutput](),
+		Type: constant.ValueOf[constant.FunctionCallOutput](),
 	}
 	runItem := agents.ToolCallOutputItem{
-		Agent:  agent,
+		Agent:   agent,
 		RawItem: rawItem,
-		Output: "secret",
-		Type:   "tool_call_output_item",
+		Output:  "secret",
+		Type:    "tool_call_output_item",
 	}
 
 	state := agents.RunState{

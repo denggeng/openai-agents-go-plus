@@ -146,6 +146,7 @@ type runStateWire struct {
 	ToolUseTracker                map[string][]string                `json:"tool_use_tracker,omitempty"`
 	ConversationID                string                             `json:"conversation_id,omitempty"`
 	AutoPreviousResponseID        bool                               `json:"auto_previous_response_id,omitempty"`
+	ReasoningItemIDPolicy         ReasoningItemIDPolicy              `json:"reasoning_item_id_policy,omitempty"`
 	Trace                         *TraceState                        `json:"trace,omitempty"`
 }
 
@@ -271,6 +272,7 @@ func RunStateFromJSONWithOptions(data []byte, opts RunStateDeserializeOptions) (
 		ToolUseTracker:                wire.ToolUseTracker,
 		ConversationID:                wire.ConversationID,
 		AutoPreviousResponseID:        wire.AutoPreviousResponseID,
+		ReasoningItemIDPolicy:         wire.ReasoningItemIDPolicy,
 		Trace:                         wire.Trace,
 	}
 	if state.SchemaVersion == "" {
@@ -283,7 +285,7 @@ func RunStateFromJSONWithOptions(data []byte, opts RunStateDeserializeOptions) (
 	parsedGenerated, generatedInput := parseRunStateGeneratedItems(wire.GeneratedItems)
 	if len(parsedGenerated) > 0 {
 		state.GeneratedRunItems = parsedGenerated
-		state.GeneratedItems = runItemsToInputItems(parsedGenerated)
+		state.GeneratedItems = runItemsToInputItemsWithPolicy(parsedGenerated, state.ReasoningItemIDPolicy)
 	} else if len(generatedInput) > 0 {
 		state.GeneratedItems = generatedInput
 	}
@@ -374,6 +376,7 @@ func buildRunStateWire(state RunState) (*runStateWire, error) {
 		ToolUseTracker:                state.ToolUseTracker,
 		ConversationID:                state.ConversationID,
 		AutoPreviousResponseID:        state.AutoPreviousResponseID,
+		ReasoningItemIDPolicy:         state.ReasoningItemIDPolicy,
 		Trace:                         state.Trace,
 	}, nil
 }
@@ -560,17 +563,7 @@ func deserializeRunItems(states []RunStateRunItemState) []RunItem {
 }
 
 func runItemsToInputItems(items []RunItem) []TResponseInputItem {
-	if len(items) == 0 {
-		return nil
-	}
-	out := make([]TResponseInputItem, 0, len(items))
-	for _, item := range items {
-		if item == nil {
-			continue
-		}
-		out = append(out, item.ToInputItem())
-	}
-	return out
+	return runItemsToInputItemsWithPolicy(items, ReasoningItemIDPolicyPreserve)
 }
 
 func runItemToState(item RunItem) (RunStateRunItemState, bool) {

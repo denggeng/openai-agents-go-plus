@@ -114,25 +114,7 @@ func (t *AgentToolUseTracker) LoadSnapshot(snapshot map[string][]string) {
 
 // Snapshot returns a copy of tool usage keyed by agent name.
 func (t *AgentToolUseTracker) Snapshot() map[string][]string {
-	if t == nil {
-		return map[string][]string{}
-	}
-	out := make(map[string][]string)
-	if t.NameToTools != nil {
-		for agentName, tools := range t.NameToTools {
-			out[agentName] = append([]string(nil), tools...)
-		}
-	}
-	for _, item := range t.AgentToTools {
-		if item.Agent == nil || item.Agent.Name == "" {
-			continue
-		}
-		if _, ok := out[item.Agent.Name]; ok {
-			continue
-		}
-		out[item.Agent.Name] = append([]string(nil), item.ToolNames...)
-	}
-	return out
+	return t.AsSerializable()
 }
 
 type ToolRunHandoff struct {
@@ -1150,7 +1132,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 		var toolInputGuardrailResults []ToolInputGuardrailResult
 		var toolOutputGuardrailResults []ToolOutputGuardrailResult
 
-		traceIncludeSensitiveData := config.TraceIncludeSensitiveData.Or(true)
+		traceIncludeSensitiveData := config.TraceIncludeSensitiveData.Or(defaultTraceIncludeSensitiveData())
 
 		errorFn := DefaultToolErrorFunction // non-fatal
 		if funcTool.FailureErrorFunction != nil {

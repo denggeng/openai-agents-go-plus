@@ -26,7 +26,7 @@ import (
 )
 
 type streamingFakeModel struct {
-	turnOutputs [][]agents.TResponseOutputItem
+	turnOutputs  [][]agents.TResponseOutputItem
 	lastTurnArgs agentstesting.FakeModelLastTurnArgs
 }
 

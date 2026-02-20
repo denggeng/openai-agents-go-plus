@@ -114,6 +114,7 @@ type PgSession struct {
 	connString    string
 	sessionTable  string
 	messagesTable string
+	sessionSettings *SessionSettings
 	conn          PgConnInterface
 	mu            sync.Mutex
 }
@@ -136,15 +137,23 @@ type PgSessionParams struct {
 
 	// Optional connection interface for dependency injection (mainly for testing)
 	Conn PgConnInterface
+
+	// Optional session settings (e.g., default history limit).
+	SessionSettings *SessionSettings
 }
 
 // NewPgSession initializes the PostgreSQL session.
 func NewPgSession(ctx context.Context, params PgSessionParams) (_ *PgSession, err error) {
+	settings := params.SessionSettings
+	if settings == nil {
+		settings = &SessionSettings{}
+	}
 	s := &PgSession{
 		sessionID:     params.SessionID,
 		connString:    params.ConnectionString,
 		sessionTable:  cmp.Or(params.SessionTable, "agent_sessions"),
 		messagesTable: cmp.Or(params.MessagesTable, "agent_messages"),
+		sessionSettings: settings,
 		conn:          params.Conn,
 	}
 
@@ -180,6 +189,10 @@ func NewPgSession(ctx context.Context, params PgSessionParams) (_ *PgSession, er
 
 func (s *PgSession) SessionID(context.Context) string {
 	return s.sessionID
+}
+
+func (s *PgSession) SessionSettings() *SessionSettings {
+	return s.sessionSettings
 }
 
 func (s *PgSession) GetItems(ctx context.Context, limit int) (_ []TResponseInputItem, err error) {

@@ -31,23 +31,32 @@ type OpenAIServerConversationTracker struct {
 	PreviousResponseID     string
 	AutoPreviousResponseID bool
 
-	sentItems            map[uintptr]struct{}
-	serverItems          map[uintptr]struct{}
-	serverItemIDs        map[string]struct{}
-	serverToolCallIDs    map[string]struct{}
-	sentItemFingerprints map[string]struct{}
+	sentItems                        map[uintptr]struct{}
+	serverItems                      map[uintptr]struct{}
+	serverItemIDs                    map[string]struct{}
+	serverToolCallIDs                map[string]struct{}
+	sentItemFingerprints             map[string]struct{}
+	preparedItemSources              map[uintptr]any
+	preparedItemSourcesByFingerprint map[string][]any
 
 	sentInitialInput      bool
 	remainingInitialInput []TResponseInputItem
 	primedFromState       bool
+	reasoningItemIDPolicy ReasoningItemIDPolicy
 }
 
 // NewOpenAIServerConversationTracker creates a tracker with initialized state.
-func NewOpenAIServerConversationTracker(conversationID, previousResponseID string, autoPreviousResponseID bool) *OpenAIServerConversationTracker {
+func NewOpenAIServerConversationTracker(
+	conversationID,
+	previousResponseID string,
+	autoPreviousResponseID bool,
+	reasoningItemIDPolicy ReasoningItemIDPolicy,
+) *OpenAIServerConversationTracker {
 	tracker := &OpenAIServerConversationTracker{
 		ConversationID:         conversationID,
 		PreviousResponseID:     previousResponseID,
 		AutoPreviousResponseID: autoPreviousResponseID,
+		reasoningItemIDPolicy:  reasoningItemIDPolicy,
 	}
 	tracker.ensureMaps()
 	Logger().Debug(
@@ -73,6 +82,12 @@ func (t *OpenAIServerConversationTracker) ensureMaps() {
 	}
 	if t.sentItemFingerprints == nil {
 		t.sentItemFingerprints = make(map[string]struct{})
+	}
+	if t.preparedItemSources == nil {
+		t.preparedItemSources = make(map[uintptr]any)
+	}
+	if t.preparedItemSourcesByFingerprint == nil {
+		t.preparedItemSourcesByFingerprint = make(map[string][]any)
 	}
 }
 
@@ -242,20 +257,24 @@ func (t *OpenAIServerConversationTracker) MarkInputAsSent(items []TResponseInput
 	}
 	t.ensureMaps()
 
-	deliveredFingerprints := make(map[string]struct{}, len(items))
+	deliveredFingerprints := make(map[string]struct{}, len(items)*2)
 	deliveredIDs := make(map[uintptr]struct{}, len(items))
 
 	for i := range items {
-		item := items[i]
-		if id := pointerIdentity(&items[i]); id != 0 {
+		source := t.consumePreparedItemSource(&items[i])
+		if id := itemIdentity(source); id != 0 {
 			t.sentItems[id] = struct{}{}
 			deliveredIDs[id] = struct{}{}
 		}
-		if fp, ok := fingerprintForTracker(item); ok {
+		if fp, ok := fingerprintForTracker(source); ok {
 			t.sentItemFingerprints[fp] = struct{}{}
 			deliveredFingerprints[fp] = struct{}{}
 		}
-		if callID := callIDFromRaw(item); callID != "" && hasOutputPayload(item) {
+		if fp, ok := fingerprintForTracker(items[i]); ok {
+			t.sentItemFingerprints[fp] = struct{}{}
+			deliveredFingerprints[fp] = struct{}{}
+		}
+		if callID := callIDFromRaw(items[i]); callID != "" && hasOutputPayload(items[i]) {
 			t.serverToolCallIDs[callID] = struct{}{}
 		}
 	}
@@ -267,7 +286,7 @@ func (t *OpenAIServerConversationTracker) MarkInputAsSent(items []TResponseInput
 	remaining := make([]TResponseInputItem, 0, len(t.remainingInitialInput))
 	for i := range t.remainingInitialInput {
 		pending := t.remainingInitialInput[i]
-		if id := pointerIdentity(&t.remainingInitialInput[i]); id != 0 {
+		if id := itemIdentity(&t.remainingInitialInput[i]); id != 0 {
 			if _, exists := deliveredIDs[id]; exists {
 				continue
 			}
@@ -294,10 +313,14 @@ func (t *OpenAIServerConversationTracker) RewindInput(items []TResponseInputItem
 
 	rewindItems := make([]TResponseInputItem, 0, len(items))
 	for i := range items {
+		source := t.consumePreparedItemSource(&items[i])
 		item := items[i]
 		rewindItems = append(rewindItems, item)
-		if id := pointerIdentity(&items[i]); id != 0 {
+		if id := itemIdentity(source); id != 0 {
 			delete(t.sentItems, id)
+		}
+		if fp, ok := fingerprintForTracker(source); ok {
+			delete(t.sentItemFingerprints, fp)
 		}
 		if fp, ok := fingerprintForTracker(item); ok {
 			delete(t.sentItemFingerprints, fp)
@@ -332,11 +355,20 @@ func (t *OpenAIServerConversationTracker) PrepareInput(
 	}
 	t.ensureMaps()
 
-	var inputItems []TResponseInputItem
+	estimated := len(generatedItems)
+	if !t.sentInitialInput {
+		estimated += len(ItemHelpers().InputToNewInputList(originalInput))
+	} else if len(t.remainingInitialInput) > 0 {
+		estimated += len(t.remainingInitialInput)
+	}
+	inputItems := make([]TResponseInputItem, 0, estimated)
 
 	if !t.sentInitialInput {
 		initialItems := ItemHelpers().InputToNewInputList(originalInput)
-		inputItems = append(inputItems, initialItems...)
+		for i := range initialItems {
+			inputItems = append(inputItems, initialItems[i])
+			t.registerPreparedItemSource(&inputItems[len(inputItems)-1], &initialItems[i])
+		}
 		if len(initialItems) > 0 {
 			t.remainingInitialInput = initialItems
 		} else {
@@ -344,7 +376,10 @@ func (t *OpenAIServerConversationTracker) PrepareInput(
 		}
 		t.sentInitialInput = true
 	} else if len(t.remainingInitialInput) > 0 {
-		inputItems = append(inputItems, t.remainingInitialInput...)
+		for i := range t.remainingInitialInput {
+			inputItems = append(inputItems, t.remainingInitialInput[i])
+			t.registerPreparedItemSource(&inputItems[len(inputItems)-1], &t.remainingInitialInput[i])
+		}
 	}
 
 	for i := range generatedItems {
@@ -379,22 +414,113 @@ func (t *OpenAIServerConversationTracker) PrepareInput(
 			}
 		}
 
-		inputItem := generatedItems[i].ToInputItem()
+		inputItem, ok := runItemToInputItem(generatedItems[i], t.reasoningItemIDPolicy)
+		if !ok {
+			continue
+		}
 		if fp, ok := fingerprintForTracker(inputItem); ok {
 			if _, exists := t.sentItemFingerprints[fp]; exists {
-				if t.primedFromState || isOutputInputItem(inputItem) {
+				if t.primedFromState ||
+					isOutputInputItem(inputItem) ||
+					(shouldOmitReasoningItemIDs(t.reasoningItemIDPolicy) && isReasoningInputItem(inputItem)) {
 					continue
 				}
 			}
 		}
 
 		inputItems = append(inputItems, inputItem)
+		t.registerPreparedItemSource(&inputItems[len(inputItems)-1], rawItem)
 		if rawID != 0 {
 			t.sentItems[rawID] = struct{}{}
 		}
 	}
 
 	return inputItems
+}
+
+func (t *OpenAIServerConversationTracker) registerPreparedItemSource(prepared *TResponseInputItem, source any) {
+	if prepared == nil {
+		return
+	}
+	if source == nil {
+		source = prepared
+	}
+	id := pointerIdentity(prepared)
+	if id != 0 {
+		t.preparedItemSources[id] = source
+	}
+	if fp, ok := fingerprintForTracker(*prepared); ok {
+		t.preparedItemSourcesByFingerprint[fp] = append(t.preparedItemSourcesByFingerprint[fp], source)
+	}
+}
+
+func (t *OpenAIServerConversationTracker) resolvePreparedItemSource(prepared *TResponseInputItem) any {
+	if prepared == nil {
+		return nil
+	}
+	if id := pointerIdentity(prepared); id != 0 {
+		if source, ok := t.preparedItemSources[id]; ok {
+			return source
+		}
+	}
+	fp, ok := fingerprintForTracker(*prepared)
+	if !ok {
+		return *prepared
+	}
+	if sources := t.preparedItemSourcesByFingerprint[fp]; len(sources) > 0 {
+		return sources[0]
+	}
+	return *prepared
+}
+
+func (t *OpenAIServerConversationTracker) consumePreparedItemSource(prepared *TResponseInputItem) any {
+	if prepared == nil {
+		return nil
+	}
+	id := pointerIdentity(prepared)
+	var directSource any
+	if id != 0 {
+		directSource = t.preparedItemSources[id]
+		delete(t.preparedItemSources, id)
+	}
+	source := directSource
+	if source == nil {
+		source = t.resolvePreparedItemSource(prepared)
+	}
+
+	fp, ok := fingerprintForTracker(*prepared)
+	if !ok {
+		return source
+	}
+	sources := t.preparedItemSourcesByFingerprint[fp]
+	if len(sources) == 0 {
+		return source
+	}
+
+	target := source
+	if directSource != nil {
+		target = directSource
+	}
+	targetID := itemIdentity(target)
+	removed := false
+	if targetID != 0 {
+		for i := range sources {
+			if itemIdentity(sources[i]) == targetID {
+				sources = append(sources[:i], sources[i+1:]...)
+				removed = true
+				break
+			}
+		}
+	}
+	if !removed {
+		sources = sources[1:]
+	}
+	if len(sources) == 0 {
+		delete(t.preparedItemSourcesByFingerprint, fp)
+	} else {
+		t.preparedItemSourcesByFingerprint[fp] = sources
+	}
+	return source
 }
 
 func isOutputInputItem(raw any) bool {

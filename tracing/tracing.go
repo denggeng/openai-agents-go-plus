@@ -35,12 +35,3 @@ func SetTracingDisabled(disabled bool) {
 func SetTracingExportAPIKey(apiKey string) {
 	DefaultExporter().SetAPIKey(apiKey)
 }
-
-func init() {
-	SetTraceProvider(NewDefaultTraceProvider())
-	// Add the default processor, which exports traces and spans to the backend in batches.
-	// You can change the default behavior by either:
-	//  1. calling AddTraceProcessor(), which adds additional processors, or
-	//  2. calling SetTraceProcessors(), which replaces the default processor.
-	AddTraceProcessor(DefaultProcessor())
-}

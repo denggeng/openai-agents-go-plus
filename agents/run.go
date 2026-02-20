@@ -17,7 +17,6 @@ package agents
 import (
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -100,6 +99,12 @@ type RunConfig struct {
 	// Optional callback that formats tool error messages, such as approval rejections.
 	ToolErrorFormatter ToolErrorFormatter
 
+	// Optional run error handlers keyed by error kind (e.g., max_turns).
+	RunErrorHandlers RunErrorHandlers
+
+	// Optional reasoning item ID policy (e.g., omit reasoning ids for follow-up input).
+	ReasoningItemIDPolicy ReasoningItemIDPolicy
+
 	// Whether tracing is disabled for the agent run. If disabled, we will not trace the agent run.
 	// Default: false (tracing enabled).
 	TracingDisabled bool
@@ -154,6 +159,12 @@ type RunConfig struct {
 
 	// Optional session for the run.
 	Session memory.Session
+
+	// Optional session input callback to customize how session history is merged with new input.
+	SessionInputCallback memory.SessionInputCallback
+
+	// Optional session settings used to override session-level defaults when retrieving history.
+	SessionSettings *memory.SessionSettings
 
 	// Optional limit for the recover of the session of memory.
 	LimitMemory int
@@ -425,12 +436,20 @@ func (r Runner) runWithStartingTurnAndState(
 	if err := validateSessionConversationSettings(r.Config.Session, conversationID, previousResponseID, autoPrevious); err != nil {
 		return nil, err
 	}
+	resolvedReasoningPolicy := r.Config.ReasoningItemIDPolicy
+	if resolvedReasoningPolicy == "" && resumeState != nil {
+		resolvedReasoningPolicy = resumeState.ReasoningItemIDPolicy
+	}
+	if resumeState != nil {
+		resumeState.ReasoningItemIDPolicy = resolvedReasoningPolicy
+	}
 	var serverConversationTracker *OpenAIServerConversationTracker
 	if conversationID != "" || autoPrevious {
 		serverConversationTracker = NewOpenAIServerConversationTracker(
 			conversationID,
 			previousResponseID,
 			autoPrevious,
+			resolvedReasoningPolicy,
 		)
 		if resumeState != nil {
 			sessionItems := runItemsToInputItems(resumeState.SessionItems)
@@ -443,10 +462,21 @@ func (r Runner) runWithStartingTurnAndState(
 		}
 	}
 
+	serverManagedConversation := conversationID != "" || previousResponseID != "" || autoPrevious
+
 	// Prepare input with session if enabled
-	preparedInput, err := r.prepareInputWithSession(ctx, input, resumeState != nil)
+	preparedInput, sessionInputItemsForPersistence, err := r.prepareInputWithSession(
+		ctx,
+		input,
+		resumeState != nil,
+		!serverManagedConversation,
+		serverManagedConversation,
+	)
 	if err != nil {
 		return nil, err
+	}
+	if serverManagedConversation {
+		sessionInputItemsForPersistence = []TResponseInputItem{}
 	}
 
 	hooks := r.Config.Hooks
@@ -481,9 +511,13 @@ func (r Runner) runWithStartingTurnAndState(
 				}
 			}
 		}
-		if len(resumeState.ToolUseTracker) > 0 {
-			toolUseTracker.LoadSnapshot(resumeState.ToolUseTracker)
-		}
+		HydrateToolUseTracker(toolUseTracker, resumeState, startingAgent)
+		sessionInputItemsForPersistence = nil
+	}
+
+	sessionInputForPersistence := input
+	if sessionInputItemsForPersistence != nil {
+		sessionInputForPersistence = InputItems(sessionInputItemsForPersistence)
 	}
 
 	var runResult *RunResult
@@ -629,7 +663,8 @@ func (r Runner) runWithStartingTurnAndState(
 					Interruptions:              interruptions,
 					LastAgent:                  currentAgent,
 				}
-				if err := r.saveResultToSession(ctx, input, runResult, resumeState); err != nil {
+				runResult.reasoningItemIDPolicy = resolvedReasoningPolicy
+				if err := r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState); err != nil {
 					return err
 				}
 				return nil
@@ -673,7 +708,8 @@ func (r Runner) runWithStartingTurnAndState(
 						Interruptions:              interruptions,
 						LastAgent:                  currentAgent,
 					}
-					if err := r.saveResultToSession(ctx, input, runResult, resumeState); err != nil {
+					runResult.reasoningItemIDPolicy = resolvedReasoningPolicy
+					if err := r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState); err != nil {
 						return err
 					}
 					return nil
@@ -755,7 +791,69 @@ func (r Runner) runWithStartingTurnAndState(
 					Message: "Max turns exceeded",
 					Data:    map[string]any{"max_turns": maxTurns},
 				})
-				return MaxTurnsExceededErrorf("max turns %d exceeded", maxTurns)
+				maxTurnsErr := MaxTurnsExceededErrorf("max turns %d exceeded", maxTurns)
+				runErrorData := buildRunErrorData(
+					originalInput,
+					sessionItems,
+					modelResponses,
+					currentAgent,
+					ReasoningItemIDPolicyPreserve,
+				)
+				handlerResult, handlerErr := resolveRunErrorHandlerResult(
+					ctx,
+					r.Config.RunErrorHandlers,
+					maxTurnsErr,
+					contextWrapper,
+					runErrorData,
+				)
+				if handlerErr != nil {
+					return handlerErr
+				}
+				if handlerResult == nil {
+					return maxTurnsErr
+				}
+				validatedOutput, err := validateHandlerFinalOutput(ctx, currentAgent, handlerResult.FinalOutput)
+				if err != nil {
+					return err
+				}
+				outputText := formatFinalOutputText(currentAgent, validatedOutput)
+				synthesizedItem := createMessageOutputItem(currentAgent, outputText)
+				includeInHistory := includeInHistoryDefault(handlerResult.IncludeInHistory)
+				if includeInHistory {
+					modelInputItems = append(modelInputItems, synthesizedItem)
+					sessionItems = append(sessionItems, synthesizedItem)
+				}
+				if err := RunImpl().RunFinalOutputHooks(ctx, currentAgent, hooks, validatedOutput); err != nil {
+					return err
+				}
+				outputGuardrailResults, err = r.runOutputGuardrails(
+					ctx,
+					slices.Concat(currentAgent.OutputGuardrails, r.Config.OutputGuardrails),
+					currentAgent,
+					validatedOutput,
+				)
+				if err != nil {
+					return err
+				}
+				runResult = &RunResult{
+					Input:                      originalInput,
+					NewItems:                   sessionItems,
+					ModelInputItems:            modelInputItems,
+					RawResponses:               modelResponses,
+					FinalOutput:                validatedOutput,
+					InputGuardrailResults:      inputGuardrailResults,
+					OutputGuardrailResults:     outputGuardrailResults,
+					ToolInputGuardrailResults:  toolInputGuardrailResults,
+					ToolOutputGuardrailResults: toolOutputGuardrailResults,
+					Interruptions:              interruptions,
+					LastAgent:                  currentAgent,
+				}
+				runResult.reasoningItemIDPolicy = resolvedReasoningPolicy
+				applyConversationTracking(runResult, serverConversationTracker)
+				if err := r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState); err != nil {
+					return err
+				}
+				return nil
 			}
 			Logger().Debug(
 				"Running agent",
@@ -862,10 +960,11 @@ func (r Runner) runWithStartingTurnAndState(
 					Interruptions:              interruptions,
 					LastAgent:                  currentAgent,
 				}
+				runResult.reasoningItemIDPolicy = resolvedReasoningPolicy
 				applyConversationTracking(runResult, serverConversationTracker)
 
 				// Save the conversation to session if enabled
-				err = r.saveResultToSession(ctx, input, runResult, resumeState)
+				err = r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState)
 				if err != nil {
 					return err
 				}
@@ -895,9 +994,10 @@ func (r Runner) runWithStartingTurnAndState(
 					Interruptions:              interruptions,
 					LastAgent:                  currentAgent,
 				}
+				runResult.reasoningItemIDPolicy = resolvedReasoningPolicy
 				applyConversationTracking(runResult, serverConversationTracker)
 
-				err = r.saveResultToSession(ctx, input, runResult, resumeState)
+				err = r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState)
 				if err != nil {
 					return err
 				}
@@ -1583,6 +1683,14 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 		return nil, err
 	}
 
+	resolvedReasoningPolicy := r.Config.ReasoningItemIDPolicy
+	if resolvedReasoningPolicy == "" && resumeState != nil {
+		resolvedReasoningPolicy = resumeState.ReasoningItemIDPolicy
+	}
+	if resumeState != nil {
+		resumeState.ReasoningItemIDPolicy = resolvedReasoningPolicy
+	}
+
 	maxTurns := r.Config.MaxTurns
 	if maxTurns == 0 {
 		maxTurns = DefaultMaxTurns
@@ -1631,6 +1739,7 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 	streamedResult.setMaxTurns(maxTurns)
 	streamedResult.setCurrentAgentOutputType(startingAgent.OutputType)
 	streamedResult.setTrace(newTrace)
+	streamedResult.reasoningItemIDPolicy = resolvedReasoningPolicy
 	if resumeState != nil {
 		streamedResult.setInputGuardrailResults(resumeState.ResumeInputGuardrailResults())
 		streamedResult.setOutputGuardrailResults(resumeState.ResumeOutputGuardrailResults())
@@ -1639,6 +1748,8 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 	}
 
 	// Kick off the actual agent loop in the background and return the streamed result object.
+	runConfig := r.Config
+	runConfig.ReasoningItemIDPolicy = resolvedReasoningPolicy
 	streamedResult.createRunImplTask(ctx, func(ctx context.Context) error {
 		return r.startStreaming(
 			ctx,
@@ -1648,8 +1759,8 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 			startingTurn,
 			maxTurns,
 			hooks,
-			r.Config,
-			r.Config.PreviousResponseID,
+			runConfig,
+			runConfig.PreviousResponseID,
 			resumeState,
 		)
 	})
@@ -1904,6 +2015,7 @@ func (r Runner) startStreaming(
 
 	conversationID, resolvedPreviousResponseID, autoPrevious := resolveConversationSettings(runConfig, resumeState)
 	previousResponseID = resolvedPreviousResponseID
+	serverManagedConversation := conversationID != "" || previousResponseID != "" || autoPrevious
 
 	var serverConversationTracker *OpenAIServerConversationTracker
 	if conversationID != "" || autoPrevious {
@@ -1911,6 +2023,7 @@ func (r Runner) startStreaming(
 			conversationID,
 			previousResponseID,
 			autoPrevious,
+			runConfig.ReasoningItemIDPolicy,
 		)
 		if resumeState != nil {
 			sessionItems := runItemsToInputItems(resumeState.SessionItems)
@@ -1956,9 +2069,7 @@ func (r Runner) startStreaming(
 				}
 			}
 		}
-		if len(resumeState.ToolUseTracker) > 0 {
-			toolUseTracker.LoadSnapshot(resumeState.ToolUseTracker)
-		}
+		HydrateToolUseTracker(toolUseTracker, resumeState, startingAgent)
 	}
 
 	streamedResult.eventQueue.Put(AgentUpdatedStreamEvent{
@@ -1967,9 +2078,25 @@ func (r Runner) startStreaming(
 	})
 
 	// Prepare input with session if enabled
-	preparedInput, err := r.prepareInputWithSession(ctx, startingInput, isResumedState)
+	preparedInput, sessionInputItemsForPersistence, err := r.prepareInputWithSession(
+		ctx,
+		startingInput,
+		isResumedState,
+		!serverManagedConversation,
+		serverManagedConversation,
+	)
 	if err != nil {
 		return err
+	}
+	if serverManagedConversation {
+		sessionInputItemsForPersistence = []TResponseInputItem{}
+	}
+	if resumeState != nil {
+		sessionInputItemsForPersistence = nil
+	}
+	sessionInputForPersistence := startingInput
+	if sessionInputItemsForPersistence != nil {
+		sessionInputForPersistence = InputItems(sessionInputItemsForPersistence)
 	}
 
 	// Update the streamed result with the prepared input
@@ -1991,7 +2118,7 @@ func (r Runner) startStreaming(
 				LastAgent:                  currentAgent,
 			}
 			if len(tempResult.NewItems) > 0 || len(tempResult.RawResponses) > 0 {
-				if err := r.saveResultToSession(ctx, startingInput, tempResult, resumeState); err != nil {
+				if err := r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState); err != nil {
 					return err
 				}
 			}
@@ -2044,6 +2171,82 @@ func (r Runner) startStreaming(
 				Message: "Max turns exceeded",
 				Data:    map[string]any{"max_turns": maxTurns},
 			})
+			maxTurnsErr := MaxTurnsExceededErrorf("max turns %d exceeded", maxTurns)
+			runErrorData := buildRunErrorData(
+				streamedResult.Input(),
+				streamedResult.NewItems(),
+				streamedResult.RawResponses(),
+				currentAgent,
+				ReasoningItemIDPolicyPreserve,
+			)
+			handlerResult, handlerErr := resolveRunErrorHandlerResult(
+				ctx,
+				runConfig.RunErrorHandlers,
+				maxTurnsErr,
+				contextWrapper,
+				runErrorData,
+			)
+			if handlerErr != nil {
+				return handlerErr
+			}
+			if handlerResult == nil {
+				streamedResult.eventQueue.Put(queueCompleteSentinel{})
+				break
+			}
+			validatedOutput, err := validateHandlerFinalOutput(ctx, currentAgent, handlerResult.FinalOutput)
+			if err != nil {
+				return err
+			}
+			outputText := formatFinalOutputText(currentAgent, validatedOutput)
+			synthesizedItem := createMessageOutputItem(currentAgent, outputText)
+			includeInHistory := includeInHistoryDefault(handlerResult.IncludeInHistory)
+			if includeInHistory {
+				modelItems := append(streamedResult.ModelInputItems(), synthesizedItem)
+				streamedResult.setModelInputItems(modelItems)
+				newItems := append(streamedResult.NewItems(), synthesizedItem)
+				streamedResult.setNewItems(newItems)
+				streamedResult.eventQueue.Put(NewRunItemStreamEvent(StreamEventMessageOutputCreated, synthesizedItem))
+			}
+
+			if err := RunImpl().RunFinalOutputHooks(ctx, currentAgent, hooks, validatedOutput); err != nil {
+				return err
+			}
+
+			streamedResult.createOutputGuardrailsTask(ctx, func(ctx context.Context) ([]OutputGuardrailResult, error) {
+				return r.runOutputGuardrails(
+					ctx,
+					slices.Concat(currentAgent.OutputGuardrails, runConfig.OutputGuardrails),
+					currentAgent,
+					validatedOutput,
+				)
+			})
+			taskResult := streamedResult.getOutputGuardrailsTask().Await()
+			var outputGuardrailResults []OutputGuardrailResult
+			if taskResult.Error == nil {
+				outputGuardrailResults = taskResult.Value
+			}
+			streamedResult.setOutputGuardrailResults(outputGuardrailResults)
+			streamedResult.setFinalOutput(validatedOutput)
+			streamedResult.markAsComplete()
+			streamedResult.setCurrentTurn(maxTurns)
+
+			tempResult := &RunResult{
+				Input:                      streamedResult.Input(),
+				NewItems:                   streamedResult.NewItems(),
+				ModelInputItems:            streamedResult.ModelInputItems(),
+				RawResponses:               streamedResult.RawResponses(),
+				FinalOutput:                streamedResult.FinalOutput(),
+				InputGuardrailResults:      streamedResult.InputGuardrailResults(),
+				OutputGuardrailResults:     streamedResult.OutputGuardrailResults(),
+				ToolInputGuardrailResults:  streamedResult.ToolInputGuardrailResults(),
+				ToolOutputGuardrailResults: streamedResult.ToolOutputGuardrailResults(),
+				Interruptions:              streamedResult.Interruptions(),
+				LastAgent:                  currentAgent,
+			}
+			if err := r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState); err != nil {
+				return err
+			}
+
 			streamedResult.eventQueue.Put(queueCompleteSentinel{})
 			break
 		}
@@ -2126,7 +2329,7 @@ func (r Runner) startStreaming(
 				Interruptions:              streamedResult.Interruptions(),
 				LastAgent:                  currentAgent,
 			}
-			err = r.saveResultToSession(ctx, startingInput, tempResult, resumeState)
+			err = r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState)
 			if err != nil {
 				return err
 			}
@@ -2162,7 +2365,7 @@ func (r Runner) startStreaming(
 				Interruptions:              streamedResult.Interruptions(),
 				LastAgent:                  currentAgent,
 			}
-			err = r.saveResultToSession(ctx, startingInput, tempResult, resumeState)
+			err = r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState)
 			if err != nil {
 				return err
 			}
@@ -2328,8 +2531,16 @@ func (r Runner) runSingleTurnStreamed(
 		)
 	} else {
 		input = ItemHelpers().InputToNewInputList(streamedResult.Input())
+		reasoningPolicy := runConfig.ReasoningItemIDPolicy
+		if reasoningPolicy == "" {
+			reasoningPolicy = ReasoningItemIDPolicyPreserve
+		}
 		for _, item := range streamedResult.ModelInputItems() {
-			input = append(input, item.ToInputItem())
+			converted, ok := runItemToInputItem(item, reasoningPolicy)
+			if !ok {
+				continue
+			}
+			input = append(input, converted)
 		}
 	}
 
@@ -2371,7 +2582,7 @@ func (r Runner) runSingleTurnStreamed(
 		Handoffs:           handoffs,
 		Tracing: GetModelTracingImpl(
 			runConfig.TracingDisabled,
-			runConfig.TraceIncludeSensitiveData.Or(true),
+			runConfig.TraceIncludeSensitiveData.Or(defaultTraceIncludeSensitiveData()),
 		),
 		PreviousResponseID: previousResponseID,
 		ConversationID:     conversationID,
@@ -2582,8 +2793,16 @@ func (r Runner) runSingleTurn(
 	if serverConversationTracker != nil {
 		input = serverConversationTracker.PrepareInput(originalInput, generatedItems)
 	} else {
+		reasoningPolicy := runConfig.ReasoningItemIDPolicy
+		if reasoningPolicy == "" {
+			reasoningPolicy = ReasoningItemIDPolicyPreserve
+		}
 		for _, generatedItem := range generatedItems {
-			input = append(input, generatedItem.ToInputItem())
+			converted, ok := runItemToInputItem(generatedItem, reasoningPolicy)
+			if !ok {
+				continue
+			}
+			input = append(input, converted)
 		}
 	}
 
@@ -2887,7 +3106,7 @@ func (r Runner) getNewResponse(
 		Handoffs:           handoffs,
 		Tracing: GetModelTracingImpl(
 			runConfig.TracingDisabled,
-			runConfig.TraceIncludeSensitiveData.Or(true),
+			runConfig.TraceIncludeSensitiveData.Or(defaultTraceIncludeSensitiveData()),
 		),
 		PreviousResponseID: previousResponseID,
 		ConversationID:     conversationID,
@@ -3005,41 +3224,154 @@ func (r Runner) getModel(agent *Agent, runConfig RunConfig) (Model, error) {
 }
 
 // prepareInputWithSession prepares input by combining it with session history if enabled.
-func (r Runner) prepareInputWithSession(ctx context.Context, input Input, allowInputItems bool) (Input, error) {
+func (r Runner) prepareInputWithSession(
+	ctx context.Context,
+	input Input,
+	allowInputItems bool,
+	includeHistoryInPreparedInput bool,
+	preserveDroppedNewItems bool,
+) (Input, []TResponseInputItem, error) {
 	session := r.Config.Session
 	if session == nil {
-		return input, nil
+		return input, nil, nil
 	}
 
-	// Validate that we don't have both a session and a list input, as this creates
-	// ambiguity about whether the list should append to or replace existing session history
 	if _, ok := input.(InputItems); ok {
-		if !allowInputItems {
-			return nil, NewUserError(
-				"Cannot provide both a session and a list of input items. " +
-					"When using session memory, provide only a string input to append to the " +
-					"conversation, or use Session: nil and provide a list to manually manage " +
-					"conversation history.",
-			)
-		}
 		// When resuming with a session, assume the input already includes history.
-		return input, nil
+		if allowInputItems {
+			return input, nil, nil
+		}
 	}
 
-	limit := r.Config.LimitMemory
-	// Get previous conversation history
-	history, err := session.GetItems(ctx, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get session items: %w", err)
+	resolvedSettings := resolveSessionSettings(session, r.Config.SessionSettings)
+	var effectiveLimit *int
+	if resolvedSettings != nil && resolvedSettings.Limit != nil {
+		effectiveLimit = resolvedSettings.Limit
+	} else if r.Config.LimitMemory != 0 {
+		limit := r.Config.LimitMemory
+		effectiveLimit = &limit
 	}
 
-	// Convert input to list format
+	var history []TResponseInputItem
+	if effectiveLimit != nil {
+		if *effectiveLimit > 0 {
+			var err error
+			history, err = session.GetItems(ctx, *effectiveLimit)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get session items: %w", err)
+			}
+		} else if *effectiveLimit == 0 {
+			history = nil
+		}
+	} else {
+		var err error
+		history, err = session.GetItems(ctx, 0)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get session items: %w", err)
+		}
+	}
+
 	newInputList := ItemHelpers().InputToNewInputList(input)
+	newInputList = slices.Clone(newInputList)
 
-	// Combine history with new input
-	combinedInput := slices.Concat(history, newInputList)
+	callback := r.Config.SessionInputCallback
+	if callback == nil || !includeHistoryInPreparedInput {
+		var prepared []TResponseInputItem
+		if includeHistoryInPreparedInput {
+			prepared = slices.Concat(history, newInputList)
+		} else {
+			prepared = newInputList
+		}
+		deduped := deduplicatePreparedInput(prepared)
+		return InputItems(deduped), newInputList, nil
+	}
 
-	return InputItems(combinedInput), nil
+	historyForCallback := slices.Clone(history)
+	newItemsForCallback := slices.Clone(newInputList)
+	combined, err := callback(historyForCallback, newItemsForCallback)
+	if err != nil {
+		return nil, nil, err
+	}
+	if combined == nil {
+		combined = nil
+	}
+
+	appended := appendedItemsFromCallback(combined, historyForCallback, newItemsForCallback)
+
+	var prepared []TResponseInputItem
+	if includeHistoryInPreparedInput {
+		prepared = combined
+	} else if len(appended) > 0 {
+		prepared = appended
+	} else if preserveDroppedNewItems {
+		prepared = newItemsForCallback
+	}
+
+	deduped := deduplicatePreparedInput(prepared)
+	return InputItems(deduped), appended, nil
+}
+
+func resolveSessionSettings(session memory.Session, override *memory.SessionSettings) *memory.SessionSettings {
+	var base *memory.SessionSettings
+	if provider, ok := session.(memory.SessionSettingsProvider); ok {
+		base = provider.SessionSettings()
+	}
+	return base.Resolve(override)
+}
+
+func deduplicatePreparedInput(items []TResponseInputItem) []TResponseInputItem {
+	if len(items) == 0 {
+		return nil
+	}
+	anyItems := make([]any, len(items))
+	for i, item := range items {
+		anyItems[i] = item
+	}
+	filteredAny := dropOrphanFunctionCalls(anyItems)
+	filtered := make([]TResponseInputItem, 0, len(filteredAny))
+	for _, entry := range filteredAny {
+		item, ok := entry.(TResponseInputItem)
+		if !ok {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return deduplicateInputItemsPreferringLatest(filtered)
+}
+
+func appendedItemsFromCallback(
+	combined []TResponseInputItem,
+	history []TResponseInputItem,
+	newItems []TResponseInputItem,
+) []TResponseInputItem {
+	if len(combined) == 0 {
+		return nil
+	}
+
+	historyCounts := make(map[string]int, len(history))
+	for _, item := range history {
+		historyCounts[inputItemKey(item, false)]++
+	}
+	newCounts := make(map[string]int, len(newItems))
+	for _, item := range newItems {
+		newCounts[inputItemKey(item, false)]++
+	}
+
+	appended := make([]TResponseInputItem, 0, len(combined))
+	for _, item := range combined {
+		key := inputItemKey(item, false)
+		if newCounts[key] > 0 {
+			newCounts[key]--
+			appended = append(appended, item)
+			continue
+		}
+		if historyCounts[key] > 0 {
+			historyCounts[key]--
+			continue
+		}
+		appended = append(appended, item)
+	}
+	return appended
 }
 
 // saveResultToSession saves the conversation turn to session.
@@ -3068,15 +3400,67 @@ func (r Runner) saveResultToSession(ctx context.Context, originalInput Input, re
 		inputList = nil
 	}
 
-	// Convert new items to input format.
-	newItemsAsInput := make([]TResponseInputItem, len(newRunItems))
-	for i, item := range newRunItems {
-		newItemsAsInput[i] = item.ToInputItem()
+	// Convert new items to input format using reasoning-id policy when configured.
+	newItemsAsInput := make([]TResponseInputItem, 0, len(newRunItems))
+	reasoningPolicy := ReasoningItemIDPolicyPreserve
+	if result != nil && result.reasoningItemIDPolicy != "" {
+		reasoningPolicy = result.reasoningItemIDPolicy
+	} else if resumeState != nil && resumeState.ReasoningItemIDPolicy != "" {
+		reasoningPolicy = resumeState.ReasoningItemIDPolicy
+	}
+	if resumeState != nil && len(result.NewItems) > 0 && len(newRunItems) > 0 {
+		seen := make(map[string]struct{}, len(newRunItems))
+		for _, item := range newRunItems {
+			converted, ok := runItemToInputItem(item, reasoningPolicy)
+			if !ok {
+				continue
+			}
+			seen[inputItemKey(converted, false)] = struct{}{}
+		}
+		var missing []RunItem
+		for _, item := range result.NewItems {
+			switch item.(type) {
+			case ToolCallOutputItem, *ToolCallOutputItem:
+			default:
+				continue
+			}
+			converted, ok := runItemToInputItem(item, reasoningPolicy)
+			if !ok {
+				continue
+			}
+			key := inputItemKey(converted, false)
+			if _, ok := seen[key]; !ok {
+				missing = append(missing, item)
+			}
+		}
+		if len(missing) > 0 {
+			newRunItems = append(missing, newRunItems...)
+		}
+	}
+
+	for _, item := range newRunItems {
+		converted, ok := runItemToInputItem(item, reasoningPolicy)
+		if !ok {
+			continue
+		}
+		newItemsAsInput = append(newItemsAsInput, converted)
 	}
 
 	// Save all items from this turn, deduplicating within the batch.
 	itemsToSave := deduplicateInputItemsPreferringLatest(slices.Concat(inputList, newItemsAsInput))
-	savedRunItemsCount := countSavedInputItems(newItemsAsInput, itemsToSave)
+
+	ignoreIDs := false
+	if provider, ok := session.(memory.SessionIgnoreIDsProvider); ok {
+		ignoreIDs = provider.IgnoreIDsForMatching()
+	}
+
+	itemsForCount := newItemsAsInput
+	if sanitizer, ok := session.(memory.SessionItemSanitizer); ok {
+		itemsForCount = sanitizer.SanitizeInputItemsForPersistence(newItemsAsInput)
+		itemsToSave = sanitizer.SanitizeInputItemsForPersistence(itemsToSave)
+	}
+
+	savedRunItemsCount := countSavedInputItems(itemsForCount, itemsToSave, ignoreIDs)
 
 	if len(itemsToSave) > 0 {
 		if err := session.AddItems(ctx, itemsToSave); err != nil {
@@ -3124,48 +3508,22 @@ func (r Runner) saveResultToSession(ctx context.Context, originalInput Input, re
 	return nil
 }
 
-func deduplicateInputItemsPreferringLatest(items []TResponseInputItem) []TResponseInputItem {
-	if len(items) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(items))
-	out := make([]TResponseInputItem, 0, len(items))
-	for i := len(items) - 1; i >= 0; i-- {
-		key := fingerprintInputItem(items[i])
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, items[i])
-	}
-	slices.Reverse(out)
-	return out
-}
-
-func countSavedInputItems(newItems []TResponseInputItem, itemsToSave []TResponseInputItem) int {
+func countSavedInputItems(newItems []TResponseInputItem, itemsToSave []TResponseInputItem, ignoreIDs bool) int {
 	if len(newItems) == 0 || len(itemsToSave) == 0 {
 		return 0
 	}
 	counts := make(map[string]int, len(itemsToSave))
 	for _, item := range itemsToSave {
-		key := fingerprintInputItem(item)
+		key := inputItemKey(item, ignoreIDs)
 		counts[key]++
 	}
 	saved := 0
 	for _, item := range newItems {
-		key := fingerprintInputItem(item)
+		key := inputItemKey(item, ignoreIDs)
 		if counts[key] > 0 {
 			counts[key]--
 			saved++
 		}
 	}
 	return saved
-}
-
-func fingerprintInputItem(item TResponseInputItem) string {
-	data, err := json.Marshal(item)
-	if err != nil {
-		return fmt.Sprintf("%#v", item)
-	}
-	return string(data)
 }

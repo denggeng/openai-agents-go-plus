@@ -73,8 +73,8 @@ type queryArgs struct {
 func (m *scenarioModel) GetResponse(_ context.Context, params agents.ModelResponseParams) (*agents.ModelResponse, error) {
 	if inputHasRejection(params.Input) {
 		return &agents.ModelResponse{
-			Output:    []agents.TResponseOutputItem{agentstesting.GetTextMessage(agents.DefaultApprovalRejectionMessage)},
-			Usage:     usage.NewUsage(),
+			Output: []agents.TResponseOutputItem{agentstesting.GetTextMessage(agents.DefaultApprovalRejectionMessage)},
+			Usage:  usage.NewUsage(),
 		}, nil
 	}
 
@@ -99,8 +99,8 @@ func (m *scenarioModel) GetResponse(_ context.Context, params agents.ModelRespon
 	}
 
 	return &agents.ModelResponse{
-		Output:    []agents.TResponseOutputItem{toolCall},
-		Usage:     usage.NewUsage(),
+		Output: []agents.TResponseOutputItem{toolCall},
+		Usage:  usage.NewUsage(),
 	}, nil
 }
 

@@ -16,6 +16,7 @@ package agents_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/denggeng/openai-agents-go-plus/agents"
@@ -152,6 +153,48 @@ func TestRunStateResumeHelpers(t *testing.T) {
 	cfg := state.ResumeRunConfig(agents.RunConfig{})
 	assert.Equal(t, uint64(42), cfg.MaxTurns)
 	assert.Equal(t, "resp_abc", cfg.PreviousResponseID)
+}
+
+func TestRunStateReasoningItemIDPolicySerialization(t *testing.T) {
+	agent := &agents.Agent{Name: "AgentReasoningPolicy"}
+	reasoning := responses.ResponseReasoningItem{
+		ID: "rs_state",
+		Summary: []responses.ResponseReasoningItemSummary{{
+			Text: "Thinking...",
+			Type: constant.ValueOf[constant.SummaryText](),
+		}},
+		Type: constant.ValueOf[constant.Reasoning](),
+	}
+	state := agents.RunState{
+		SchemaVersion:         agents.CurrentRunStateSchemaVersion,
+		MaxTurns:              2,
+		CurrentAgentName:      agent.Name,
+		ReasoningItemIDPolicy: agents.ReasoningItemIDPolicyOmit,
+		GeneratedRunItems: []agents.RunItem{
+			agents.ReasoningItem{
+				Agent:   agent,
+				RawItem: reasoning,
+				Type:    "reasoning_item",
+			},
+		},
+	}
+
+	encoded, err := state.ToJSON()
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &payload))
+	assert.Equal(t, "omit", payload["reasoning_item_id_policy"])
+
+	restored, err := agents.RunStateFromJSON(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, agents.ReasoningItemIDPolicyOmit, restored.ReasoningItemIDPolicy)
+	require.Len(t, restored.GeneratedItems, 1)
+
+	itemPayload := inputItemPayload(t, restored.GeneratedItems[0])
+	assert.Equal(t, "reasoning", itemPayload["type"])
+	_, hasID := itemPayload["id"]
+	assert.False(t, hasID)
 }
 
 func TestRunStateFromJSONRejectsUnsupportedSchemaVersion(t *testing.T) {

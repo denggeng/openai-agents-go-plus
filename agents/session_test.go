@@ -15,6 +15,7 @@
 package agents_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -22,8 +23,6 @@ import (
 	"github.com/denggeng/openai-agents-go-plus/agents"
 	"github.com/denggeng/openai-agents-go-plus/agentstesting"
 	"github.com/denggeng/openai-agents-go-plus/memory"
-	"github.com/openai/openai-go/v3/packages/param"
-	"github.com/openai/openai-go/v3/responses"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -173,52 +172,153 @@ func TestAgentSession(t *testing.T) {
 				assert.Equal(t, "I like dogs", lastInput.(agents.InputItems)[0].OfMessage.Content.OfString.Value)
 			})
 
-			t.Run("cannot use both session and list input items", func(t *testing.T) {
-				// Test that passing both a session and list input raises a UserError.
-				session, err := memory.NewSQLiteSession(t.Context(), memory.SQLiteSessionParams{
-					SessionID:        "test",
-					DBDataSourceName: filepath.Join(t.TempDir(), "test.db"),
-				})
-				require.NoError(t, err)
-				t.Cleanup(func() { assert.NoError(t, session.Close()) })
-
-				model := agentstesting.NewFakeModel(false, nil)
-				agent := agents.New("test").WithModelInstance(model)
-
-				// Test that providing both a session and a list input raises a UserError
-				model.SetNextOutput(agentstesting.FakeModelTurnOutput{
-					Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("This shouldn't run")},
-				})
-
-				listInput := agents.InputItems{
-					{OfMessage: &responses.EasyInputMessageParam{
-						Content: responses.EasyInputMessageContentUnionParam{OfString: param.NewOpt("Test message")},
-						Role:    responses.EasyInputMessageRoleUser,
-						Type:    responses.EasyInputMessageTypeMessage,
-					}},
-				}
-
-				runner := agents.Runner{
-					Config: agents.RunConfig{
-						Session: session,
-					},
-				}
-
-				var finalError error
-				if streaming {
-					result, err := runner.RunInputsStreamed(t.Context(), agent, listInput)
-					require.NoError(t, err)
-					finalError = result.StreamEvents(func(agents.StreamEvent) error { return nil })
-				} else {
-					_, finalError = runner.RunInputs(t.Context(), agent, listInput)
-				}
-
-				assert.ErrorAs(t, finalError, &agents.UserError{})
-
-				// Verify the error message explains the issue
-				assert.ErrorContains(t, finalError, "Cannot provide both a session and a list of input items")
-				assert.ErrorContains(t, finalError, "manually manage conversation history")
-			})
 		})
 	}
+}
+
+func TestSessionMemoryAppendsListInputByDefault(t *testing.T) {
+	for _, streaming := range []bool{true, false} {
+		t.Run(fmt.Sprintf("streaming %v", streaming), func(t *testing.T) {
+			session, err := memory.NewSQLiteSession(t.Context(), memory.SQLiteSessionParams{
+				SessionID:        "test_validation_parametrized",
+				DBDataSourceName: filepath.Join(t.TempDir(), "test_validation.db"),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, session.Close()) })
+
+			model := agentstesting.NewFakeModel(false, nil)
+			agent := agents.New("test").WithModelInstance(model)
+
+			initialHistory := []agents.TResponseInputItem{
+				agentstesting.GetTextInputItem("Earlier message"),
+				inputItemFromPayload(t, map[string]any{
+					"type":    "message",
+					"role":    "assistant",
+					"content": "Saved reply",
+				}),
+			}
+			require.NoError(t, session.AddItems(t.Context(), initialHistory))
+
+			listInput := []agents.TResponseInputItem{
+				agentstesting.GetTextInputItem("Test message"),
+			}
+
+			model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+				Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("This should run")},
+			})
+
+			if streaming {
+				result, err := agents.Runner{Config: agents.RunConfig{Session: session}}.RunInputsStreamed(t.Context(), agent, listInput)
+				require.NoError(t, err)
+				require.NoError(t, result.StreamEvents(func(agents.StreamEvent) error { return nil }))
+			} else {
+				_, err := agents.Runner{Config: agents.RunConfig{Session: session}}.RunInputs(t.Context(), agent, listInput)
+				require.NoError(t, err)
+			}
+
+			lastInput := agents.ItemHelpers().InputToNewInputList(model.LastTurnArgs.Input)
+			require.Len(t, lastInput, 3)
+			assert.Equal(t, "Earlier message", inputItemContentText(t, lastInput[0]))
+			assert.Equal(t, "Saved reply", inputItemContentText(t, lastInput[1]))
+			assert.Equal(t, "Test message", inputItemContentText(t, lastInput[2]))
+		})
+	}
+}
+
+func TestSessionCallbackPreparedInput(t *testing.T) {
+	for _, streaming := range []bool{true, false} {
+		t.Run(fmt.Sprintf("streaming %v", streaming), func(t *testing.T) {
+			session, err := memory.NewSQLiteSession(t.Context(), memory.SQLiteSessionParams{
+				SessionID:        "session_callback_test",
+				DBDataSourceName: filepath.Join(t.TempDir(), "session_callback.db"),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, session.Close()) })
+
+			model := agentstesting.NewFakeModel(false, nil)
+			agent := agents.New("test").WithModelInstance(model)
+
+			initialHistory := []agents.TResponseInputItem{
+				agentstesting.GetTextInputItem("Hello there."),
+				inputItemFromPayload(t, map[string]any{
+					"type":    "message",
+					"role":    "assistant",
+					"content": "Hi, I'm here to assist you.",
+				}),
+			}
+			require.NoError(t, session.AddItems(t.Context(), initialHistory))
+
+			callback := func(history []agents.TResponseInputItem, newInput []agents.TResponseInputItem) ([]agents.TResponseInputItem, error) {
+				filtered := make([]agents.TResponseInputItem, 0, len(history)+len(newInput))
+				for _, item := range history {
+					if inputItemRole(t, item) == "user" {
+						filtered = append(filtered, item)
+					}
+				}
+				filtered = append(filtered, newInput...)
+				return filtered, nil
+			}
+
+			newTurnInput := []agents.TResponseInputItem{
+				agentstesting.GetTextInputItem("What your name?"),
+			}
+
+			model.SetNextOutput(agentstesting.FakeModelTurnOutput{
+				Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("I'm gpt-4o")},
+			})
+
+			runner := agents.Runner{Config: agents.RunConfig{
+				Session:              session,
+				SessionInputCallback: callback,
+			}}
+
+			if streaming {
+				result, err := runner.RunInputsStreamed(t.Context(), agent, newTurnInput)
+				require.NoError(t, err)
+				require.NoError(t, result.StreamEvents(func(agents.StreamEvent) error { return nil }))
+			} else {
+				_, err := runner.RunInputs(t.Context(), agent, newTurnInput)
+				require.NoError(t, err)
+			}
+
+			lastInput := agents.ItemHelpers().InputToNewInputList(model.LastTurnArgs.Input)
+			require.Len(t, lastInput, 2)
+			assert.Equal(t, "Hello there.", inputItemContentText(t, lastInput[0]))
+			assert.Equal(t, "What your name?", inputItemContentText(t, lastInput[1]))
+		})
+	}
+}
+
+func inputItemContentText(t *testing.T, item agents.TResponseInputItem) string {
+	t.Helper()
+	raw, err := item.MarshalJSON()
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(raw, &payload))
+	content := payload["content"]
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		if len(v) == 0 {
+			return ""
+		}
+		entry, ok := v[0].(map[string]any)
+		require.True(t, ok)
+		text, _ := entry["text"].(string)
+		return text
+	default:
+		require.FailNowf(t, "unexpected content shape", "%T", v)
+		return ""
+	}
+}
+
+func inputItemRole(t *testing.T, item agents.TResponseInputItem) string {
+	t.Helper()
+	raw, err := item.MarshalJSON()
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(raw, &payload))
+	role, _ := payload["role"].(string)
+	return role
 }

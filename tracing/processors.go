@@ -480,25 +480,39 @@ func (b *BatchTraceProcessor) exportBatches(ctx context.Context, force bool) err
 
 var globalExporter atomic.Pointer[BackendSpanExporter]
 var globalProcessor atomic.Pointer[BatchTraceProcessor]
-
-func init() {
-	exporter := NewBackendSpanExporter(BackendSpanExporterParams{})
-	processor := NewBatchTraceProcessor(BatchTraceProcessorParams{
-		Exporter: exporter,
-	})
-
-	globalExporter.Store(exporter)
-	globalProcessor.Store(processor)
-}
+var defaultExporterOnce sync.Once
+var defaultProcessorOnce sync.Once
 
 // DefaultExporter returns the default exporter, which exports traces and
 // spans to the backend in batches.
 func DefaultExporter() *BackendSpanExporter {
+	if exporter := globalExporter.Load(); exporter != nil {
+		return exporter
+	}
+	defaultExporterOnce.Do(func() {
+		if globalExporter.Load() != nil {
+			return
+		}
+		exporter := NewBackendSpanExporter(BackendSpanExporterParams{})
+		globalExporter.Store(exporter)
+	})
 	return globalExporter.Load()
 }
 
 // DefaultProcessor returns the default processor, which exports traces and
 // spans to the backend in batches.
 func DefaultProcessor() *BatchTraceProcessor {
+	if processor := globalProcessor.Load(); processor != nil {
+		return processor
+	}
+	defaultProcessorOnce.Do(func() {
+		if globalProcessor.Load() != nil {
+			return
+		}
+		processor := NewBatchTraceProcessor(BatchTraceProcessorParams{
+			Exporter: DefaultExporter(),
+		})
+		globalProcessor.Store(processor)
+	})
 	return globalProcessor.Load()
 }

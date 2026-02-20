@@ -73,6 +73,8 @@ type RunResult struct {
 
 	// Whether automatic previous response tracking was enabled.
 	AutoPreviousResponseID bool
+
+	reasoningItemIDPolicy ReasoningItemIDPolicy
 }
 
 func (r RunResult) String() string {
@@ -81,7 +83,7 @@ func (r RunResult) String() string {
 
 // ToInputList creates a new input list, merging the original input with all the new items generated.
 func (r RunResult) ToInputList() []TResponseInputItem {
-	return toInputList(r.Input, r.NewItems)
+	return toInputListWithPolicy(r.Input, r.NewItems, r.reasoningItemIDPolicy)
 }
 
 // LastResponseID is a convenience method to get the response ID of the last model response.
@@ -146,6 +148,7 @@ type RunResultStreaming struct {
 	conversationID             *atomic.Pointer[string]
 	previousResponseID         *atomic.Pointer[string]
 	autoPreviousResponseID     *atomic.Bool
+	reasoningItemIDPolicy      ReasoningItemIDPolicy
 	cancelMode                 *atomic.Pointer[CancelMode]
 	waitingOnEventQueue        *atomic.Bool
 }
@@ -178,6 +181,7 @@ func newRunResultStreaming(ctx context.Context) *RunResultStreaming {
 		conversationID:             newZeroValAtomicPointer[string](),
 		previousResponseID:         newZeroValAtomicPointer[string](),
 		autoPreviousResponseID:     new(atomic.Bool),
+		reasoningItemIDPolicy:      ReasoningItemIDPolicyPreserve,
 		cancelMode:                 newCancelModePointer(),
 		waitingOnEventQueue:        new(atomic.Bool),
 	}
@@ -391,7 +395,7 @@ func (r *RunResultStreaming) setWaitingOnEventQueue(v bool) {
 
 // ToInputList creates a new input list, merging the original input with all the new items generated.
 func (r *RunResultStreaming) ToInputList() []TResponseInputItem {
-	return toInputList(r.Input(), r.NewItems())
+	return toInputListWithPolicy(r.Input(), r.NewItems(), r.reasoningItemIDPolicy)
 }
 
 // LastResponseID is a convenience method to get the response ID of the last model response.
@@ -638,11 +642,19 @@ func (r *RunResultStreaming) String() string {
 }
 
 func toInputList(input Input, newRunItems []RunItem) []TResponseInputItem {
+	return toInputListWithPolicy(input, newRunItems, ReasoningItemIDPolicyPreserve)
+}
+
+func toInputListWithPolicy(input Input, newRunItems []RunItem, policy ReasoningItemIDPolicy) []TResponseInputItem {
 	originalItems := ItemHelpers().InputToNewInputList(input)
 
-	result := make([]TResponseInputItem, len(newRunItems))
-	for i, item := range newRunItems {
-		result[i] = item.ToInputItem()
+	result := make([]TResponseInputItem, 0, len(newRunItems))
+	for _, item := range newRunItems {
+		converted, ok := runItemToInputItem(item, policy)
+		if !ok {
+			continue
+		}
+		result = append(result, converted)
 	}
 
 	return slices.Concat(originalItems, result)

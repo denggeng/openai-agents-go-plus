@@ -27,6 +27,7 @@ import (
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -145,6 +146,136 @@ func TestToolCallRuns(t *testing.T) {
 			"the tool call, the tool result, and the done message")
 }
 
+func TestReasoningItemIDPolicyOmitsFollowUpReasoningIDs(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{
+			agentstesting.GetFunctionTool("foo", "tool_result"),
+		},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			reasoningOutputItem("rs_first", "Thinking..."),
+			agentstesting.GetFunctionToolCall("foo", `{"a": "b"}`),
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	result, err := (agents.Runner{Config: agents.RunConfig{
+		ReasoningItemIDPolicy: agents.ReasoningItemIDPolicyOmit,
+	}}).Run(t.Context(), agent, "hello")
+	require.NoError(t, err)
+	assert.Equal(t, "done", result.FinalOutput)
+
+	secondRequestReasoning := findReasoningInputItem(model.LastTurnArgs.Input)
+	require.NotNil(t, secondRequestReasoning)
+	_, hasID := secondRequestReasoning["id"]
+	assert.False(t, hasID)
+
+	historyReasoning := findReasoningInputItem(result.ToInputList())
+	require.NotNil(t, historyReasoning)
+	_, hasID = historyReasoning["id"]
+	assert.False(t, hasID)
+}
+
+func TestCallModelInputFilterCanReintroduceReasoningIDs(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{
+			agentstesting.GetFunctionTool("foo", "tool_result"),
+		},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			reasoningOutputItem("rs_filter", "Thinking..."),
+			agentstesting.GetFunctionToolCall("foo", `{"a": "b"}`),
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	filterFn := func(_ context.Context, data agents.CallModelData) (*agents.ModelInputData, error) {
+		updated := make([]agents.TResponseInputItem, 0, len(data.ModelData.Input))
+		for _, item := range data.ModelData.Input {
+			payload := inputItemPayload(t, item)
+			if payload["type"] == "reasoning" {
+				payload["id"] = "rs_reintroduced"
+				updated = append(updated, inputItemFromPayload(t, payload))
+				continue
+			}
+			updated = append(updated, item)
+		}
+		return &agents.ModelInputData{
+			Input:        updated,
+			Instructions: data.ModelData.Instructions,
+		}, nil
+	}
+
+	result, err := (agents.Runner{Config: agents.RunConfig{
+		ReasoningItemIDPolicy: agents.ReasoningItemIDPolicyOmit,
+		CallModelInputFilter:  filterFn,
+	}}).Run(t.Context(), agent, "hello")
+	require.NoError(t, err)
+	assert.Equal(t, "done", result.FinalOutput)
+
+	secondRequestReasoning := findReasoningInputItem(model.LastTurnArgs.Input)
+	require.NotNil(t, secondRequestReasoning)
+	assert.Equal(t, "rs_reintroduced", secondRequestReasoning["id"])
+
+	historyReasoning := findReasoningInputItem(result.ToInputList())
+	require.NotNil(t, historyReasoning)
+	_, hasID := historyReasoning["id"]
+	assert.False(t, hasID)
+}
+
+func TestResumedRunUsesSerializedReasoningItemIDPolicy(t *testing.T) {
+	model := agentstesting.NewFakeModel(false, nil)
+	tool := agentstesting.GetFunctionTool("approval_tool", "ok")
+	tool.NeedsApproval = agents.FunctionToolNeedsApprovalEnabled()
+	agent := &agents.Agent{
+		Name:  "test",
+		Model: param.NewOpt(agents.NewAgentModel(model)),
+		Tools: []agents.Tool{tool},
+	}
+
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{
+			reasoningOutputItem("rs_resume", "Thinking..."),
+			agentstesting.GetFunctionToolCall("approval_tool", `{}`),
+		}},
+		{Value: []agents.TResponseOutputItem{
+			agentstesting.GetTextMessage("done"),
+		}},
+	})
+
+	firstRun, err := (agents.Runner{Config: agents.RunConfig{
+		ReasoningItemIDPolicy: agents.ReasoningItemIDPolicyOmit,
+	}}).Run(t.Context(), agent, "hello")
+	require.NoError(t, err)
+	require.Len(t, firstRun.Interruptions, 1)
+
+	state := agents.NewRunStateFromResult(*firstRun, 1, agents.DefaultMaxTurns)
+	require.NoError(t, state.ApproveTool(firstRun.Interruptions[0]))
+
+	resumed, err := agents.Runner{}.RunFromState(t.Context(), agent, state)
+	require.NoError(t, err)
+	assert.Equal(t, "done", resumed.FinalOutput)
+
+	secondRequestReasoning := findReasoningInputItem(model.LastTurnArgs.Input)
+	require.NotNil(t, secondRequestReasoning)
+	_, hasID := secondRequestReasoning["id"]
+	assert.False(t, hasID)
+}
+
 func TestHandoffs(t *testing.T) {
 	model := agentstesting.NewFakeModel(false, nil)
 	agent1 := &agents.Agent{
@@ -189,6 +320,64 @@ func TestHandoffs(t *testing.T) {
 		"should have 7 inputs: orig input, tool call, tool result, "+
 			"message, handoff, handoff result, and done message")
 	assert.Same(t, agent1, result.LastAgent, "should have handed off to agent1")
+}
+
+func findReasoningInputItem(input any) map[string]any {
+	items, ok := input.([]agents.TResponseInputItem)
+	if !ok {
+		if typed, ok := input.(agents.InputItems); ok {
+			items = typed
+		} else {
+			return nil
+		}
+	}
+	for _, item := range items {
+		raw, err := item.MarshalJSON()
+		if err != nil {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			continue
+		}
+		if payload["type"] == "reasoning" {
+			return payload
+		}
+	}
+	return nil
+}
+
+func reasoningOutputItem(id, text string) agents.TResponseOutputItem {
+	return agents.TResponseOutputItem{
+		ID:   id,
+		Type: "reasoning",
+		Summary: []responses.ResponseReasoningItemSummary{{
+			Text: text,
+			Type: constant.ValueOf[constant.SummaryText](),
+		}},
+	}
+}
+
+func inputItemPayload(t *testing.T, item agents.TResponseInputItem) map[string]any {
+	if t != nil {
+		t.Helper()
+	}
+	raw, err := item.MarshalJSON()
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(raw, &payload))
+	return payload
+}
+
+func inputItemFromPayload(t *testing.T, payload map[string]any) agents.TResponseInputItem {
+	if t != nil {
+		t.Helper()
+	}
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	var item agents.TResponseInputItem
+	param.SetJSON(raw, &item)
+	return item
 }
 
 type AgentRunnerTestFoo struct {

@@ -16,16 +16,21 @@ package tracing
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 )
 
 var globalTraceProvider atomic.Pointer[TraceProvider]
+var defaultProviderOnce sync.Once
+var shutdownOnce sync.Once
+var shutdownHandlerRegistered atomic.Bool
 
 // SetTraceProvider sets the global trace provider used by tracing utilities.
 // A nil value is ignored.
 func SetTraceProvider(provider TraceProvider) {
 	if provider != nil {
 		globalTraceProvider.Store(&provider)
+		registerShutdownHandler()
 	}
 }
 
@@ -33,11 +38,11 @@ func SetTraceProvider(provider TraceProvider) {
 // It panics if a trace provider is not set.
 // Use SafeGetTraceProvider for a safer alternative.
 func GetTraceProvider() TraceProvider {
-	v, ok := SafeGetTraceProvider()
-	if !ok {
-		panic(errors.New("trace provider not set"))
+	if v, ok := SafeGetTraceProvider(); ok {
+		registerShutdownHandler()
+		return v
 	}
-	return v
+	return bootstrapDefaultTraceProvider()
 }
 
 // SafeGetTraceProvider returns the global trace provider used by tracing utilities.
@@ -47,4 +52,28 @@ func SafeGetTraceProvider() (TraceProvider, bool) {
 		return nil, false
 	}
 	return *v, true
+}
+
+func bootstrapDefaultTraceProvider() TraceProvider {
+	defaultProviderOnce.Do(func() {
+		if _, ok := SafeGetTraceProvider(); ok {
+			return
+		}
+		var provider TraceProvider = NewDefaultTraceProvider()
+		globalTraceProvider.Store(&provider)
+		provider.RegisterProcessor(DefaultProcessor())
+		registerShutdownHandler()
+	})
+
+	v, ok := SafeGetTraceProvider()
+	if !ok {
+		panic(errors.New("trace provider not set"))
+	}
+	return v
+}
+
+func registerShutdownHandler() {
+	shutdownOnce.Do(func() {
+		shutdownHandlerRegistered.Store(true)
+	})
 }

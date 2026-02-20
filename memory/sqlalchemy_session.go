@@ -44,6 +44,9 @@ type SQLAlchemySessionParams struct {
 	// Optional table overrides used when URL-based construction is used.
 	SessionsTable string
 	MessagesTable string
+
+	// Optional session settings (e.g., default history limit).
+	SessionSettings *SessionSettings
 }
 
 func NewSQLAlchemySession(ctx context.Context, params SQLAlchemySessionParams) (*SQLAlchemySession, error) {
@@ -69,6 +72,7 @@ func NewSQLAlchemySession(ctx context.Context, params SQLAlchemySessionParams) (
 			DBDataSourceName: dsn,
 			SessionTable:     params.SessionsTable,
 			MessagesTable:    params.MessagesTable,
+			SessionSettings:  params.SessionSettings,
 		})
 		if err != nil {
 			return nil, err
@@ -81,6 +85,7 @@ func NewSQLAlchemySession(ctx context.Context, params SQLAlchemySessionParams) (
 			ConnectionString: dsn,
 			SessionTable:     params.SessionsTable,
 			MessagesTable:    params.MessagesTable,
+			SessionSettings:  params.SessionSettings,
 		})
 		if err != nil {
 			return nil, err
@@ -96,6 +101,13 @@ func NewSQLAlchemySession(ctx context.Context, params SQLAlchemySessionParams) (
 
 func (s *SQLAlchemySession) SessionID(ctx context.Context) string {
 	return s.session.SessionID(ctx)
+}
+
+func (s *SQLAlchemySession) SessionSettings() *SessionSettings {
+	if provider, ok := s.session.(SessionSettingsProvider); ok {
+		return provider.SessionSettings()
+	}
+	return nil
 }
 
 func (s *SQLAlchemySession) GetItems(ctx context.Context, limit int) ([]TResponseInputItem, error) {

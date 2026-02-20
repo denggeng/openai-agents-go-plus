@@ -32,6 +32,7 @@ type RedisSession struct {
 	ownsClient  bool
 	keyPrefix   string
 	ttl         time.Duration
+	sessionSettings *SessionSettings
 	sessionKey  string
 	messagesKey string
 	counterKey  string
@@ -55,6 +56,9 @@ type RedisSessionParams struct {
 
 	// Optional TTL for session keys. Zero means no expiration.
 	TTL time.Duration
+
+	// Optional session settings (e.g., default history limit).
+	SessionSettings *SessionSettings
 }
 
 // NewRedisSession initializes a Redis session.
@@ -77,12 +81,17 @@ func NewRedisSession(ctx context.Context, params RedisSessionParams) (*RedisSess
 		ownsClient = true
 	}
 
+	settings := params.SessionSettings
+	if settings == nil {
+		settings = &SessionSettings{}
+	}
 	s := &RedisSession{
 		sessionID:  params.SessionID,
 		client:     client,
 		ownsClient: ownsClient,
 		keyPrefix:  cmp.Or(params.KeyPrefix, "agents:session"),
 		ttl:        params.TTL,
+		sessionSettings: settings,
 	}
 	s.sessionKey = fmt.Sprintf("%s:%s", s.keyPrefix, s.sessionID)
 	s.messagesKey = fmt.Sprintf("%s:messages", s.sessionKey)
@@ -97,6 +106,10 @@ func NewRedisSession(ctx context.Context, params RedisSessionParams) (*RedisSess
 
 func (s *RedisSession) SessionID(context.Context) string {
 	return s.sessionID
+}
+
+func (s *RedisSession) SessionSettings() *SessionSettings {
+	return s.sessionSettings
 }
 
 func (s *RedisSession) GetItems(ctx context.Context, limit int) ([]TResponseInputItem, error) {

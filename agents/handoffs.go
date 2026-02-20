@@ -303,14 +303,14 @@ func SafeHandoffFromAgent(params HandoffFromAgentParams) (*Handoff, error) {
 	}
 
 	return &Handoff{
-		ToolName:         toolName,
-		ToolDescription:  toolDescription,
-		InputJSONSchema:  rawInputJSONSchema,
-		OnInvokeHandoff:  invokeHandoff,
-		AgentName:        params.Agent.Name,
-		InputFilter:      params.InputFilter,
+		ToolName:           toolName,
+		ToolDescription:    toolDescription,
+		InputJSONSchema:    rawInputJSONSchema,
+		OnInvokeHandoff:    invokeHandoff,
+		AgentName:          params.Agent.Name,
+		InputFilter:        params.InputFilter,
 		NestHandoffHistory: params.NestHandoffHistory,
-		StrictJSONSchema: param.NewOpt(true),
-		IsEnabled:        isEnabled,
+		StrictJSONSchema:   param.NewOpt(true),
+		IsEnabled:          isEnabled,
 	}, nil
 }
