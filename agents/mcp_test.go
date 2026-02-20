@@ -19,6 +19,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -54,7 +55,40 @@ func createMCPServerCommand(t *testing.T) *exec.Cmd {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(exe)
-	cmd.Env = append(os.Environ(), runAsMCPServer+"=true")
+	env := filterEnv(os.Environ(),
+		runAsMCPServer,
+		"ENV_USE_STDERR",
+		"CONFIGX_USE_STDERR",
+	)
+	cmd.Env = append(env,
+		runAsMCPServer+"=true",
+		"ENV_USE_STDERR=true",
+		"CONFIGX_USE_STDERR=true",
+	)
 
 	return cmd
+}
+
+func filterEnv(env []string, keys ...string) []string {
+	if len(keys) == 0 {
+		return env
+	}
+	prefixes := make([]string, 0, len(keys))
+	for _, key := range keys {
+		prefixes = append(prefixes, key+"=")
+	}
+	filtered := env[:0]
+	for _, entry := range env {
+		skip := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(entry, prefix) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
