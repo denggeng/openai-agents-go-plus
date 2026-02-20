@@ -280,6 +280,8 @@ See examples in [`examples/agent_patterns`](examples/agent_patterns).
 This project was started by [Matteo Grella](https://github.com/matteo-grella) and [Marco Nicola](https://github.com/marco-nicola) as a port of [OpenAI's Agents SDK](https://openai.github.io/openai-agents-python/), aimed at supporting its adoption by Go developers and offering something potentially useful to the OpenAI team.  
 It has since evolved with community contributions, and we welcome new ideas, improvements, and pull requests from anyone interested in shaping its future.
 
+Maintained by [Geng Deng](https://github.com/denggeng), focusing on syncing newer OpenAI Python SDK features into this Go port to keep parity.
+
 ## Acknowledgments
 
 We would like to thank the OpenAI team for creating the original [OpenAI Agents Python SDK](https://openai.github.io/openai-agents-python/) and the [official OpenAI Go client library](https://github.com/openai/openai-go), which serve as the foundation for this Go implementation.
