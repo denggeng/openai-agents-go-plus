@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+- MCP stdio tests: avoid stdout noise from transitive deps after dependency bumps.
+
 ## 0.9.2+patch1 - 2026-02-20
 
 ### Fixed
