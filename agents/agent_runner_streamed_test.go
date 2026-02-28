@@ -849,13 +849,20 @@ func TestStreamInputPersistenceSavesOnlyNewTurnInput(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, second.StreamEvents(func(agents.StreamEvent) error { return nil }))
 
-	require.Len(t, session.savedBatches, 2, "each turn should persist once")
+	require.GreaterOrEqual(t, len(session.savedBatches), 2, "each turn should persist input")
+	var userBatches [][]agents.TResponseInputItem
 	for _, batch := range session.savedBatches {
+		if len(userMessageContents(t, batch)) > 0 {
+			userBatches = append(userBatches, batch)
+		}
+	}
+	require.Len(t, userBatches, 2, "each turn should persist only new turn input once")
+	for _, batch := range userBatches {
 		userMessages := userMessageContents(t, batch)
 		require.Len(t, userMessages, 1, "persisted input should contain only new turn input")
 	}
-	assert.Equal(t, "hello", userMessageContents(t, session.savedBatches[0])[0])
-	assert.Equal(t, "next", userMessageContents(t, session.savedBatches[1])[0])
+	assert.Equal(t, "hello", userMessageContents(t, userBatches[0])[0])
+	assert.Equal(t, "next", userMessageContents(t, userBatches[1])[0])
 }
 
 func userMessageContents(t *testing.T, items []agents.TResponseInputItem) []string {

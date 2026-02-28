@@ -519,6 +519,23 @@ func (r Runner) runWithStartingTurnAndState(
 	if sessionInputItemsForPersistence != nil {
 		sessionInputForPersistence = InputItems(sessionInputItemsForPersistence)
 	}
+	sessionPersistenceEnabled := r.Config.Session != nil && serverConversationTracker == nil
+	savedSessionItemsCount := 0
+	isResumedState := resumeState != nil
+
+	if sessionPersistenceEnabled && resumeState == nil && len(sessionInputItemsForPersistence) > 0 {
+		initialPersist := &RunResult{}
+		initialPersist.reasoningItemIDPolicy = resolvedReasoningPolicy
+		if err := r.saveResultToSession(
+			ctx,
+			InputItems(slices.Clone(sessionInputItemsForPersistence)),
+			initialPersist,
+			nil,
+		); err != nil {
+			return nil, err
+		}
+		sessionInputForPersistence = InputItems(nil)
+	}
 
 	var runResult *RunResult
 
@@ -592,6 +609,22 @@ func (r Runner) runWithStartingTurnAndState(
 			if len(resolvedItems) > 0 {
 				modelInputItems = append(modelInputItems, resolvedItems...)
 				sessionItems = append(sessionItems, resolvedItems...)
+				persistResumeItems := resolvedItems
+				resumeStateForPersistence := resumeState
+				if resumeState != nil && isResumedState && resumeState.CurrentTurnPersistedItemCount > 0 {
+					persistResumeItems = filterOutToolCallItems(persistResumeItems)
+					resumeStateForPersistence = nil
+				}
+				if err := r.saveTurnItemsIfNeeded(
+					ctx,
+					sessionPersistenceEnabled,
+					inputGuardrailResults,
+					persistResumeItems,
+					resolvedReasoningPolicy,
+					resumeStateForPersistence,
+				); err != nil {
+					return err
+				}
 			}
 			if len(toolInputResults) > 0 {
 				toolInputGuardrailResults = append(toolInputGuardrailResults, toolInputResults...)
@@ -614,6 +647,22 @@ func (r Runner) runWithStartingTurnAndState(
 			if len(resolvedItems) > 0 {
 				modelInputItems = append(modelInputItems, resolvedItems...)
 				sessionItems = append(sessionItems, resolvedItems...)
+				persistResumeItems := resolvedItems
+				resumeStateForPersistence := resumeState
+				if resumeState != nil && isResumedState && resumeState.CurrentTurnPersistedItemCount > 0 {
+					persistResumeItems = filterOutToolCallItems(persistResumeItems)
+					resumeStateForPersistence = nil
+				}
+				if err := r.saveTurnItemsIfNeeded(
+					ctx,
+					sessionPersistenceEnabled,
+					inputGuardrailResults,
+					persistResumeItems,
+					resolvedReasoningPolicy,
+					resumeStateForPersistence,
+				); err != nil {
+					return err
+				}
 			}
 
 			resolvedItems, pendingInterruptions, err = r.resolveShellInterruptionsOnResume(
@@ -631,6 +680,22 @@ func (r Runner) runWithStartingTurnAndState(
 			if len(resolvedItems) > 0 {
 				modelInputItems = append(modelInputItems, resolvedItems...)
 				sessionItems = append(sessionItems, resolvedItems...)
+				persistResumeItems := resolvedItems
+				resumeStateForPersistence := resumeState
+				if resumeState != nil && isResumedState && resumeState.CurrentTurnPersistedItemCount > 0 {
+					persistResumeItems = filterOutToolCallItems(persistResumeItems)
+					resumeStateForPersistence = nil
+				}
+				if err := r.saveTurnItemsIfNeeded(
+					ctx,
+					sessionPersistenceEnabled,
+					inputGuardrailResults,
+					persistResumeItems,
+					resolvedReasoningPolicy,
+					resumeStateForPersistence,
+				); err != nil {
+					return err
+				}
 			}
 
 			resolvedItems, pendingInterruptions, err = r.resolveComputerActionsOnResume(
@@ -646,6 +711,22 @@ func (r Runner) runWithStartingTurnAndState(
 			if len(resolvedItems) > 0 {
 				modelInputItems = append(modelInputItems, resolvedItems...)
 				sessionItems = append(sessionItems, resolvedItems...)
+				persistResumeItems := resolvedItems
+				resumeStateForPersistence := resumeState
+				if resumeState != nil && isResumedState && resumeState.CurrentTurnPersistedItemCount > 0 {
+					persistResumeItems = filterOutToolCallItems(persistResumeItems)
+					resumeStateForPersistence = nil
+				}
+				if err := r.saveTurnItemsIfNeeded(
+					ctx,
+					sessionPersistenceEnabled,
+					inputGuardrailResults,
+					persistResumeItems,
+					resolvedReasoningPolicy,
+					resumeStateForPersistence,
+				); err != nil {
+					return err
+				}
 			}
 
 			pendingInterruptions = filterPendingMCPInterruptions(pendingInterruptions, contextWrapper)
@@ -748,6 +829,14 @@ func (r Runner) runWithStartingTurnAndState(
 		defer cancel()
 
 		for {
+			if resumeState != nil && !isResumedState {
+				resumeState.CurrentTurnPersistedItemCount = 0
+			}
+			resumeStateForTurnPersistence := resumeState
+			if resumeState != nil && isResumedState && resumeState.CurrentTurnPersistedItemCount > 0 {
+				resumeStateForTurnPersistence = nil
+			}
+
 			allTools, err := r.getAllTools(childCtx, currentAgent)
 			if err != nil {
 				return err
@@ -850,7 +939,29 @@ func (r Runner) runWithStartingTurnAndState(
 				}
 				runResult.reasoningItemIDPolicy = resolvedReasoningPolicy
 				applyConversationTracking(runResult, serverConversationTracker)
-				if err := r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState); err != nil {
+
+				if sessionPersistenceEnabled {
+					unsaved := slices.Clone(sessionItems[savedSessionItemsCount:])
+					if resumeState != nil && includeInHistory {
+						unsaved = []RunItem{synthesizedItem}
+					}
+					if err := r.saveTurnItemsIfNeeded(
+						ctx,
+						true,
+						inputGuardrailResults,
+						unsaved,
+						resolvedReasoningPolicy,
+						resumeStateForTurnPersistence,
+					); err != nil {
+						return err
+					}
+					persistResult := &RunResult{
+						RawResponses: modelResponses,
+					}
+					if err := r.saveResultToSession(ctx, InputItems(nil), persistResult, nil); err != nil {
+						return err
+					}
+				} else if err := r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState); err != nil {
 					return err
 				}
 				return nil
@@ -932,9 +1043,35 @@ func (r Runner) runWithStartingTurnAndState(
 			modelResponses = append(modelResponses, turnResult.ModelResponse)
 			originalInput = turnResult.OriginalInput
 			modelInputItems = turnResult.GeneratedItems()
-			sessionItems = append(sessionItems, turnResult.StepSessionItems()...)
+			turnSessionItems := turnResult.StepSessionItems()
+			resumeStateForTurnPersistence = resumeState
+			turnSessionItemsToPersist := turnSessionItems
+			if resumeState != nil && isResumedState && resumeState.CurrentTurnPersistedItemCount > 0 {
+				turnSessionItemsToPersist = filterOutToolCallItems(turnSessionItemsToPersist)
+				// For resumed turns, tool_call items were already persisted in a prior run.
+				// Save only the remaining items for this turn without slicing by persisted count.
+				resumeStateForTurnPersistence = nil
+			}
+			sessionItems = append(sessionItems, turnSessionItems...)
 			toolInputGuardrailResults = append(toolInputGuardrailResults, turnResult.ToolInputGuardrailResults...)
 			toolOutputGuardrailResults = append(toolOutputGuardrailResults, turnResult.ToolOutputGuardrailResults...)
+
+			if _, isInterruption := turnResult.NextStep.(NextStepInterruption); !isInterruption {
+				if err := r.saveTurnItemsIfNeeded(
+					ctx,
+					sessionPersistenceEnabled,
+					inputGuardrailResults,
+					turnSessionItemsToPersist,
+					resolvedReasoningPolicy,
+					resumeStateForTurnPersistence,
+				); err != nil {
+					return err
+				}
+				if resumeState == nil {
+					savedSessionItemsCount = len(sessionItems)
+				}
+			}
+			isResumedState = false
 
 			switch nextStep := turnResult.NextStep.(type) {
 			case NextStepFinalOutput:
@@ -963,10 +1100,19 @@ func (r Runner) runWithStartingTurnAndState(
 				runResult.reasoningItemIDPolicy = resolvedReasoningPolicy
 				applyConversationTracking(runResult, serverConversationTracker)
 
-				// Save the conversation to session if enabled
-				err = r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState)
-				if err != nil {
-					return err
+				if sessionPersistenceEnabled {
+					persistResult := &RunResult{
+						RawResponses: modelResponses,
+					}
+					if err := r.saveResultToSession(ctx, InputItems(nil), persistResult, nil); err != nil {
+						return err
+					}
+				} else {
+					// Save the conversation to session if enabled
+					err = r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState)
+					if err != nil {
+						return err
+					}
 				}
 
 				return nil
@@ -997,9 +1143,32 @@ func (r Runner) runWithStartingTurnAndState(
 				runResult.reasoningItemIDPolicy = resolvedReasoningPolicy
 				applyConversationTracking(runResult, serverConversationTracker)
 
-				err = r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState)
-				if err != nil {
-					return err
+				if sessionPersistenceEnabled {
+					unsaved := turnSessionItemsToPersist
+					if resumeState == nil {
+						unsaved = slices.Clone(sessionItems[savedSessionItemsCount:])
+					}
+					if err := r.saveTurnItemsIfNeeded(
+						ctx,
+						true,
+						inputGuardrailResults,
+						unsaved,
+						resolvedReasoningPolicy,
+						resumeState,
+					); err != nil {
+						return err
+					}
+					persistResult := &RunResult{
+						RawResponses: modelResponses,
+					}
+					if err := r.saveResultToSession(ctx, InputItems(nil), persistResult, nil); err != nil {
+						return err
+					}
+				} else {
+					err = r.saveResultToSession(ctx, sessionInputForPersistence, runResult, resumeState)
+					if err != nil {
+						return err
+					}
 				}
 
 				return nil
@@ -2098,11 +2267,34 @@ func (r Runner) startStreaming(
 	if sessionInputItemsForPersistence != nil {
 		sessionInputForPersistence = InputItems(sessionInputItemsForPersistence)
 	}
+	sessionPersistenceEnabled := runConfig.Session != nil && serverConversationTracker == nil
+	savedSessionItemsCount := 0
+	if sessionPersistenceEnabled && resumeState == nil && len(sessionInputItemsForPersistence) > 0 {
+		initialPersist := &RunResult{}
+		initialPersist.reasoningItemIDPolicy = runConfig.ReasoningItemIDPolicy
+		if err := r.saveResultToSession(
+			ctx,
+			InputItems(slices.Clone(sessionInputItemsForPersistence)),
+			initialPersist,
+			nil,
+		); err != nil {
+			return err
+		}
+		sessionInputForPersistence = InputItems(nil)
+	}
 
 	// Update the streamed result with the prepared input
 	streamedResult.setInput(preparedInput)
 
 	for !streamedResult.IsComplete() {
+		if resumeState != nil && !isResumedState {
+			resumeState.CurrentTurnPersistedItemCount = 0
+		}
+		resumeStateForTurnPersistence := resumeState
+		if resumeState != nil && isResumedState && resumeState.CurrentTurnPersistedItemCount > 0 {
+			resumeStateForTurnPersistence = nil
+		}
+
 		if streamedResult.CancelMode() == CancelModeAfterTurn {
 			tempResult := &RunResult{
 				Input:                      streamedResult.Input(),
@@ -2117,7 +2309,25 @@ func (r Runner) startStreaming(
 				Interruptions:              streamedResult.Interruptions(),
 				LastAgent:                  currentAgent,
 			}
-			if len(tempResult.NewItems) > 0 || len(tempResult.RawResponses) > 0 {
+			if sessionPersistenceEnabled {
+				unsaved := slices.Clone(streamedResult.NewItems()[savedSessionItemsCount:])
+				if err := r.saveTurnItemsIfNeeded(
+					ctx,
+					true,
+					streamedResult.InputGuardrailResults(),
+					unsaved,
+					runConfig.ReasoningItemIDPolicy,
+					resumeStateForTurnPersistence,
+				); err != nil {
+					return err
+				}
+				persistResult := &RunResult{
+					RawResponses: tempResult.RawResponses,
+				}
+				if err := r.saveResultToSession(ctx, InputItems(nil), persistResult, nil); err != nil {
+					return err
+				}
+			} else if len(tempResult.NewItems) > 0 || len(tempResult.RawResponses) > 0 {
 				if err := r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState); err != nil {
 					return err
 				}
@@ -2243,7 +2453,28 @@ func (r Runner) startStreaming(
 				Interruptions:              streamedResult.Interruptions(),
 				LastAgent:                  currentAgent,
 			}
-			if err := r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState); err != nil {
+			if sessionPersistenceEnabled {
+				unsaved := slices.Clone(streamedResult.NewItems()[savedSessionItemsCount:])
+				if resumeState != nil && includeInHistory {
+					unsaved = []RunItem{synthesizedItem}
+				}
+				if err := r.saveTurnItemsIfNeeded(
+					ctx,
+					true,
+					streamedResult.InputGuardrailResults(),
+					unsaved,
+					runConfig.ReasoningItemIDPolicy,
+					resumeStateForTurnPersistence,
+				); err != nil {
+					return err
+				}
+				persistResult := &RunResult{
+					RawResponses: tempResult.RawResponses,
+				}
+				if err := r.saveResultToSession(ctx, InputItems(nil), persistResult, nil); err != nil {
+					return err
+				}
+			} else if err := r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState); err != nil {
 				return err
 			}
 
@@ -2286,10 +2517,32 @@ func (r Runner) startStreaming(
 		streamedResult.appendRawResponses(turnResult.ModelResponse)
 		streamedResult.setInput(turnResult.OriginalInput)
 		streamedResult.setModelInputItems(turnResult.GeneratedItems())
-		updatedSessionItems := append(streamedResult.NewItems(), turnResult.StepSessionItems()...)
+		turnSessionItems := turnResult.StepSessionItems()
+		turnSessionItemsToPersist := turnSessionItems
+		if resumeState != nil && isResumedState && resumeState.CurrentTurnPersistedItemCount > 0 {
+			turnSessionItemsToPersist = filterOutToolCallItems(turnSessionItemsToPersist)
+			resumeStateForTurnPersistence = nil
+		}
+		updatedSessionItems := append(streamedResult.NewItems(), turnSessionItems...)
 		streamedResult.setNewItems(updatedSessionItems)
 		streamedResult.appendToolInputGuardrailResults(turnResult.ToolInputGuardrailResults...)
 		streamedResult.appendToolOutputGuardrailResults(turnResult.ToolOutputGuardrailResults...)
+		if _, isInterruption := turnResult.NextStep.(NextStepInterruption); !isInterruption {
+			if err := r.saveTurnItemsIfNeeded(
+				ctx,
+				sessionPersistenceEnabled,
+				streamedResult.InputGuardrailResults(),
+				turnSessionItemsToPersist,
+				runConfig.ReasoningItemIDPolicy,
+				resumeStateForTurnPersistence,
+			); err != nil {
+				return err
+			}
+			if resumeState == nil {
+				savedSessionItemsCount = len(updatedSessionItems)
+			}
+		}
+		isResumedState = false
 
 		switch nextStep := turnResult.NextStep.(type) {
 		case NextStepFinalOutput:
@@ -2329,9 +2582,18 @@ func (r Runner) startStreaming(
 				Interruptions:              streamedResult.Interruptions(),
 				LastAgent:                  currentAgent,
 			}
-			err = r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState)
-			if err != nil {
-				return err
+			if sessionPersistenceEnabled {
+				persistResult := &RunResult{
+					RawResponses: tempResult.RawResponses,
+				}
+				if err := r.saveResultToSession(ctx, InputItems(nil), persistResult, nil); err != nil {
+					return err
+				}
+			} else {
+				err = r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState)
+				if err != nil {
+					return err
+				}
 			}
 
 			streamedResult.eventQueue.Put(queueCompleteSentinel{})
@@ -2348,7 +2610,7 @@ func (r Runner) startStreaming(
 				Type:     "agent_updated_stream_event",
 			})
 		case NextStepRunAgain:
-			// Nothing to do
+		// Nothing to do
 		case NextStepInterruption:
 			streamedResult.setInterruptions(slices.Clone(nextStep.Interruptions))
 			streamedResult.markAsComplete()
@@ -2365,9 +2627,32 @@ func (r Runner) startStreaming(
 				Interruptions:              streamedResult.Interruptions(),
 				LastAgent:                  currentAgent,
 			}
-			err = r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState)
-			if err != nil {
-				return err
+			if sessionPersistenceEnabled {
+				unsaved := turnSessionItemsToPersist
+				if resumeState == nil {
+					unsaved = slices.Clone(streamedResult.NewItems()[savedSessionItemsCount:])
+				}
+				if err := r.saveTurnItemsIfNeeded(
+					ctx,
+					true,
+					streamedResult.InputGuardrailResults(),
+					unsaved,
+					runConfig.ReasoningItemIDPolicy,
+					resumeStateForTurnPersistence,
+				); err != nil {
+					return err
+				}
+				persistResult := &RunResult{
+					RawResponses: tempResult.RawResponses,
+				}
+				if err := r.saveResultToSession(ctx, InputItems(nil), persistResult, nil); err != nil {
+					return err
+				}
+			} else {
+				err = r.saveResultToSession(ctx, sessionInputForPersistence, tempResult, resumeState)
+				if err != nil {
+					return err
+				}
 			}
 
 			streamedResult.eventQueue.Put(queueCompleteSentinel{})
@@ -3506,6 +3791,64 @@ func (r Runner) saveResultToSession(ctx context.Context, originalInput Input, re
 	}
 
 	return nil
+}
+
+func (r Runner) saveTurnItemsIfNeeded(
+	ctx context.Context,
+	sessionPersistenceEnabled bool,
+	inputGuardrailResults []InputGuardrailResult,
+	items []RunItem,
+	reasoningPolicy ReasoningItemIDPolicy,
+	resumeState *RunState,
+) error {
+	if !sessionPersistenceEnabled {
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	if inputGuardrailsTriggered(inputGuardrailResults) {
+		return nil
+	}
+	if resumeState != nil && resumeState.CurrentTurnPersistedItemCount > 0 {
+		return nil
+	}
+
+	result := &RunResult{
+		NewItems: slices.Clone(items),
+	}
+	result.reasoningItemIDPolicy = reasoningPolicy
+	return r.saveResultToSession(ctx, InputItems(nil), result, resumeState)
+}
+
+func filterOutToolCallItems(items []RunItem) []RunItem {
+	if len(items) == 0 {
+		return nil
+	}
+	filtered := make([]RunItem, 0, len(items))
+	for _, item := range items {
+		switch typed := item.(type) {
+		case ToolCallItem:
+			if typed.Type == "tool_call_item" {
+				continue
+			}
+		case *ToolCallItem:
+			if typed != nil && typed.Type == "tool_call_item" {
+				continue
+			}
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func inputGuardrailsTriggered(results []InputGuardrailResult) bool {
+	for _, result := range results {
+		if result.Output.TripwireTriggered {
+			return true
+		}
+	}
+	return false
 }
 
 func countSavedInputItems(newItems []TResponseInputItem, itemsToSave []TResponseInputItem, ignoreIDs bool) int {
