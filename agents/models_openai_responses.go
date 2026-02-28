@@ -550,6 +550,11 @@ func (conv responsesConverter) convertTool(
 			*includes = responses.ResponseIncludableFileSearchCallResults
 		}
 	case ComputerTool:
+		if t.Computer == nil {
+			return nil, nil, NewUserError(
+				"computer tool has no resolved computer. Call ResolveComputer/InitializeComputerTools before model conversion",
+			)
+		}
 		environment, err := t.Computer.Environment(ctx)
 		if err != nil {
 			return nil, nil, err

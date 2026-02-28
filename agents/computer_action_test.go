@@ -324,7 +324,13 @@ func TestPendingSafetyCheckAcknowledged(t *testing.T) {
 	}
 	agent := New("a").WithTools(tool)
 
-	results, err := RunImpl().ExecuteComputerActions(t.Context(), agent, []ToolRunComputerAction{runAction}, NoOpRunHooks{})
+	results, err := RunImpl().ExecuteComputerActions(
+		t.Context(),
+		agent,
+		[]ToolRunComputerAction{runAction},
+		NoOpRunHooks{},
+		NewRunContextWrapper[any](nil),
+	)
 	require.NoError(t, err)
 	assert.Equal(t, []RunItem{
 		ToolCallOutputItem{

@@ -704,6 +704,7 @@ func (r Runner) runWithStartingTurnAndState(
 				resumeState,
 				pendingInterruptions,
 				hooks,
+				contextWrapper,
 			)
 			if err != nil {
 				return err
@@ -818,6 +819,11 @@ func (r Runner) runWithStartingTurnAndState(
 				}
 			}
 
+			if disposeErr := DisposeResolvedComputers(ctx, contextWrapper); disposeErr != nil {
+				Logger().Warn("Failed to dispose computers after run",
+					slog.String("error", disposeErr.Error()))
+			}
+
 			if currentSpan != nil {
 				if e := currentSpan.Finish(ctx, true); e != nil {
 					err = errors.Join(err, e)
@@ -839,6 +845,9 @@ func (r Runner) runWithStartingTurnAndState(
 
 			allTools, err := r.getAllTools(childCtx, currentAgent)
 			if err != nil {
+				return err
+			}
+			if err := InitializeComputerTools(childCtx, allTools, contextWrapper); err != nil {
 				return err
 			}
 
@@ -1433,6 +1442,7 @@ func (r Runner) resolveComputerActionsOnResume(
 	resumeState *RunState,
 	interruptions []ToolApprovalItem,
 	hooks RunHooks,
+	contextWrapper *RunContextWrapper[any],
 ) ([]RunItem, []ToolApprovalItem, error) {
 	if resumeState == nil {
 		return nil, interruptions, nil
@@ -1474,7 +1484,7 @@ func (r Runner) resolveComputerActionsOnResume(
 		return nil, interruptions, nil
 	}
 
-	results, err := RunImpl().ExecuteComputerActions(ctx, agent, computerCalls, hooks)
+	results, err := RunImpl().ExecuteComputerActions(ctx, agent, computerCalls, hooks, contextWrapper)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2124,6 +2134,7 @@ func (r Runner) startStreaming(
 ) (err error) {
 	currentAgent := startingAgent
 	var currentSpan tracing.Span
+	var contextWrapper *RunContextWrapper[any]
 
 	defer func() {
 		// Recover from panics to ensure the queue is properly closed
@@ -2160,6 +2171,11 @@ func (r Runner) startStreaming(
 
 		if t := streamedResult.getInputGuardrailsTask(); t != nil && !t.IsDone() {
 			_ = t.Await()
+		}
+
+		if disposeErr := DisposeResolvedComputers(ctx, contextWrapper); disposeErr != nil {
+			Logger().Warn("Failed to dispose computers after streamed run",
+				slog.String("error", disposeErr.Error()))
 		}
 
 		if currentSpan != nil {
@@ -2212,7 +2228,7 @@ func (r Runner) startStreaming(
 	shouldRunAgentStartHooks := true
 	toolUseTracker := NewAgentToolUseTracker()
 	isResumedState := resumeState != nil
-	contextWrapper := NewRunContextWrapper[any](nil)
+	contextWrapper = NewRunContextWrapper[any](nil)
 	_, hasContextOverride := RunContextValueFromContext(ctx)
 	if hasContextOverride {
 		value, _ := RunContextValueFromContext(ctx)
@@ -2338,6 +2354,9 @@ func (r Runner) startStreaming(
 		}
 		allTools, err := r.getAllTools(ctx, currentAgent)
 		if err != nil {
+			return err
+		}
+		if err := InitializeComputerTools(ctx, allTools, contextWrapper); err != nil {
 			return err
 		}
 

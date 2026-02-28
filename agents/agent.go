@@ -47,6 +47,14 @@ type MCPConfig struct {
 	// This is a best-effort conversion, so some schemas may not be convertible.
 	// Defaults to false.
 	ConvertSchemasToStrict bool
+
+	// Optional error handling function for MCP tool invocation failures.
+	// If FailureErrorFunctionSet is true and FailureErrorFunction is nil,
+	// MCP tool errors are propagated (no fallback formatting).
+	FailureErrorFunction *ToolErrorFunction
+
+	// Whether FailureErrorFunction is explicitly configured.
+	FailureErrorFunctionSet bool
 }
 
 // An Agent is an AI model configured with instructions, tools, guardrails, handoffs and more.
@@ -258,7 +266,14 @@ func (a *Agent) GetPrompt(ctx context.Context) (responses.ResponsePromptParam, b
 
 // GetMCPTools fetches the available tools from the MCP servers.
 func (a *Agent) GetMCPTools(ctx context.Context) ([]Tool, error) {
-	return MCPUtil().GetAllFunctionTools(ctx, a.MCPServers, a.MCPConfig.ConvertSchemasToStrict, a)
+	return MCPUtil().getAllFunctionToolsWithFailure(
+		ctx,
+		a.MCPServers,
+		a.MCPConfig.ConvertSchemasToStrict,
+		a,
+		a.MCPConfig.FailureErrorFunctionSet,
+		a.MCPConfig.FailureErrorFunction,
+	)
 }
 
 // GetAllTools returns all agent tools, including MCP tools and function tools.

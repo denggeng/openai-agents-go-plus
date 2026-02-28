@@ -313,6 +313,7 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 			agent,
 			processedResponse.ComputerActions,
 			hooks,
+			contextWrapper,
 		)
 	}()
 	wg.Wait()
@@ -1643,11 +1644,23 @@ func (runImpl) ExecuteComputerActions(
 	agent *Agent,
 	actions []ToolRunComputerAction,
 	hooks RunHooks,
+	contextWrapper *RunContextWrapper[any],
 ) ([]RunItem, error) {
 	results := make([]RunItem, len(actions))
 
 	// Need to run these serially, because each action can affect the computer state
 	for i, action := range actions {
+		if contextWrapper != nil {
+			resolved, err := ResolveComputer(ctx, &action.ComputerTool, contextWrapper)
+			if err != nil {
+				return nil, err
+			}
+			action.ComputerTool.Computer = resolved
+		}
+		if action.ComputerTool.Computer == nil {
+			return nil, NewUserError("computer tool has no resolved computer")
+		}
+
 		var acknowledged []responses.ResponseInputItemComputerCallOutputAcknowledgedSafetyCheckParam
 		if len(action.ToolCall.PendingSafetyChecks) > 0 && action.ComputerTool.OnSafetyCheck != nil {
 			for _, check := range action.ToolCall.PendingSafetyChecks {

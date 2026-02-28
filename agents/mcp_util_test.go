@@ -173,7 +173,7 @@ type CrashingFakeMCPServer struct {
 	err error
 }
 
-func (s *CrashingFakeMCPServer) CallTool(context.Context, string, map[string]any) (*mcp.CallToolResult, error) {
+func (s *CrashingFakeMCPServer) CallTool(context.Context, string, map[string]any, map[string]any) (*mcp.CallToolResult, error) {
 	return nil, s.err
 }
 

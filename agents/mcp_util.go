@@ -84,6 +84,18 @@ type mcpUtil struct{}
 // MCPUtil provides a set of utilities for interop between MCP and Agents SDK tools.
 func MCPUtil() mcpUtil { return mcpUtil{} }
 
+type mcpNeedsApprovalProvider interface {
+	MCPNeedsApprovalForTool(tool *mcp.Tool, agent *Agent) FunctionToolNeedsApproval
+}
+
+type mcpFailureErrorFunctionProvider interface {
+	MCPFailureErrorFunctionOverride() (bool, *ToolErrorFunction)
+}
+
+type mcpToolMetaResolverProvider interface {
+	MCPResolveToolMeta(context.Context, MCPToolMetaContext) (map[string]any, error)
+}
+
 // GetAllFunctionTools returns all function tools from a list of MCP servers.
 func (u mcpUtil) GetAllFunctionTools(
 	ctx context.Context,
@@ -91,10 +103,35 @@ func (u mcpUtil) GetAllFunctionTools(
 	convertSchemasToStrict bool,
 	agent *Agent,
 ) ([]Tool, error) {
+	return u.getAllFunctionToolsWithFailure(
+		ctx,
+		servers,
+		convertSchemasToStrict,
+		agent,
+		false,
+		nil,
+	)
+}
+
+func (u mcpUtil) getAllFunctionToolsWithFailure(
+	ctx context.Context,
+	servers []MCPServer,
+	convertSchemasToStrict bool,
+	agent *Agent,
+	agentFailureSet bool,
+	agentFailureErrorFunction *ToolErrorFunction,
+) ([]Tool, error) {
 	var tools []Tool
 	toolNames := make(map[string]struct{})
 	for _, server := range servers {
-		serverTools, err := u.GetFunctionTools(ctx, server, convertSchemasToStrict, agent)
+		serverTools, err := u.getFunctionToolsWithFailure(
+			ctx,
+			server,
+			convertSchemasToStrict,
+			agent,
+			agentFailureSet,
+			agentFailureErrorFunction,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -121,6 +158,17 @@ func (u mcpUtil) GetFunctionTools(
 	convertSchemasToStrict bool,
 	agent *Agent,
 ) ([]Tool, error) {
+	return u.getFunctionToolsWithFailure(ctx, server, convertSchemasToStrict, agent, false, nil)
+}
+
+func (u mcpUtil) getFunctionToolsWithFailure(
+	ctx context.Context,
+	server MCPServer,
+	convertSchemasToStrict bool,
+	agent *Agent,
+	agentFailureSet bool,
+	agentFailureErrorFunction *ToolErrorFunction,
+) ([]Tool, error) {
 	var mcpTools []*mcp.Tool
 	err := tracing.MCPToolsSpan(
 		ctx, tracing.MCPToolsSpanParams{Server: server.Name()},
@@ -144,7 +192,14 @@ func (u mcpUtil) GetFunctionTools(
 
 	functionTools := make([]Tool, len(mcpTools))
 	for i, mcpTool := range mcpTools {
-		funcTool, err := u.ToFunctionTool(mcpTool, server, convertSchemasToStrict)
+		funcTool, err := u.toFunctionToolWithOptions(
+			mcpTool,
+			server,
+			convertSchemasToStrict,
+			agent,
+			agentFailureSet,
+			agentFailureErrorFunction,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -158,6 +213,17 @@ func (u mcpUtil) ToFunctionTool(
 	tool *mcp.Tool,
 	server MCPServer,
 	convertSchemasToStrict bool,
+) (FunctionTool, error) {
+	return u.toFunctionToolWithOptions(tool, server, convertSchemasToStrict, nil, false, nil)
+}
+
+func (u mcpUtil) toFunctionToolWithOptions(
+	tool *mcp.Tool,
+	server MCPServer,
+	convertSchemasToStrict bool,
+	agent *Agent,
+	agentFailureSet bool,
+	agentFailureErrorFunction *ToolErrorFunction,
 ) (FunctionTool, error) {
 	invokeFunc := func(ctx context.Context, arguments string) (any, error) {
 		return u.InvokeMCPTool(ctx, server, tool, arguments)
@@ -188,13 +254,29 @@ func (u mcpUtil) ToFunctionTool(
 		}
 	}
 
-	return FunctionTool{
+	functionTool := FunctionTool{
 		Name:             tool.Name,
 		Description:      tool.Description,
 		ParamsJSONSchema: schema,
 		OnInvokeTool:     invokeFunc,
 		StrictJSONSchema: param.NewOpt(isStrict),
-	}, nil
+	}
+
+	if provider, ok := server.(mcpNeedsApprovalProvider); ok {
+		functionTool.NeedsApproval = provider.MCPNeedsApprovalForTool(tool, agent)
+	}
+
+	if provider, ok := server.(mcpFailureErrorFunctionProvider); ok {
+		if hasOverride, override := provider.MCPFailureErrorFunctionOverride(); hasOverride {
+			functionTool.FailureErrorFunction = cloneToolErrorFunctionPointer(override)
+		} else if agentFailureSet {
+			functionTool.FailureErrorFunction = cloneToolErrorFunctionPointer(agentFailureErrorFunction)
+		}
+	} else if agentFailureSet {
+		functionTool.FailureErrorFunction = cloneToolErrorFunctionPointer(agentFailureErrorFunction)
+	}
+
+	return functionTool, nil
 }
 
 // InvokeMCPTool invokes an MCP tool and returns the result as a string.
@@ -203,6 +285,7 @@ func (mcpUtil) InvokeMCPTool(
 	server MCPServer,
 	tool *mcp.Tool,
 	jsonInput string,
+	meta ...map[string]any,
 ) (string, error) {
 	var jsonData map[string]any
 	if jsonInput != "" {
@@ -228,12 +311,40 @@ func (mcpUtil) InvokeMCPTool(
 			slog.String("input", jsonInput))
 	}
 
-	result, err := server.CallTool(ctx, tool.Name, jsonData)
+	var explicitMeta map[string]any
+	if len(meta) > 0 {
+		explicitMeta = meta[0]
+	}
+	resolvedMeta := map[string]any(nil)
+	if provider, ok := server.(mcpToolMetaResolverProvider); ok {
+		metaCtx := MCPToolMetaContext{
+			RunContext: resolveMCPRunContextFromContext(ctx),
+			ServerName: server.Name(),
+			ToolName:   tool.Name,
+			Arguments:  deepCopyMap(jsonData),
+		}
+		var err error
+		resolvedMeta, err = provider.MCPResolveToolMeta(ctx, metaCtx)
+		if err != nil {
+			Logger().Error("Error resolving MCP tool meta",
+				slog.String("toolName", tool.Name),
+				slog.String("error", err.Error()))
+			return "", AgentsErrorf("error resolving MCP tool meta %s: %w", tool.Name, err)
+		}
+	}
+
+	mergedMeta := mergeMCPMeta(resolvedMeta, explicitMeta)
+	result, err := server.CallTool(ctx, tool.Name, jsonData, mergedMeta)
 	if err != nil {
 		Logger().Error("Error invoking MCP tool",
 			slog.String("toolName", tool.Name),
 			slog.String("error", err.Error()))
-		return "", AgentsErrorf("error invoking MCP tool %s: %w", tool.Name, err)
+		return "", AgentsErrorf(
+			"error invoking MCP tool %s on server '%s': %w",
+			tool.Name,
+			server.Name(),
+			err,
+		)
 	}
 
 	if DontLogToolData {

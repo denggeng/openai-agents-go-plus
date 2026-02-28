@@ -41,7 +41,7 @@ func TestMCPServerWithClientSessionCaching(t *testing.T) {
 			require.NotContains(t, toolNames, "nop_tool")
 
 			// Tell the server to add the NOP tool.
-			_, err = server.CallTool(ctx, "add_nop_tool", nil)
+			_, err = server.CallTool(ctx, "add_nop_tool", nil, nil)
 			require.NoError(t, err)
 
 			// Tools should be cached, so the NOP tool must not be present yet.
@@ -78,7 +78,7 @@ func TestMCPServerWithClientSessionCaching(t *testing.T) {
 			require.NotContains(t, toolNames, "nop_tool")
 
 			// Tell the server to add the NOP tool.
-			_, err = server.CallTool(ctx, "add_nop_tool", nil)
+			_, err = server.CallTool(ctx, "add_nop_tool", nil, nil)
 			require.NoError(t, err)
 
 			// Tools should not be cached, so the NOP must be already present.
@@ -184,7 +184,7 @@ func TestMCPServerWithClientSessionErrors(t *testing.T) {
 		_, err := server.ListTools(ctx, agent)
 		assert.ErrorAs(t, err, &UserError{})
 
-		_, err = server.CallTool(ctx, "add_nop_tool", nil)
+		_, err = server.CallTool(ctx, "add_nop_tool", nil, nil)
 		assert.ErrorAs(t, err, &UserError{})
 	})
 }
