@@ -74,6 +74,9 @@ type RunResult struct {
 	// Whether automatic previous response tracking was enabled.
 	AutoPreviousResponseID bool
 
+	// Trace metadata captured for this run.
+	Trace *TraceState
+
 	reasoningItemIDPolicy ReasoningItemIDPolicy
 }
 

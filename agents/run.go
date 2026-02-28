@@ -546,9 +546,14 @@ func (r Runner) runWithStartingTurnAndState(
 		Metadata:     r.Config.TraceMetadata,
 		Disabled:     r.Config.TracingDisabled,
 	}
-	err = ManageTraceCtx(ctx, traceParams, func(ctx context.Context) (err error) {
+	err = ManageTraceCtx(ctx, traceParams, resumeState, func(ctx context.Context) (err error) {
 		currentTurn := startingTurn
 		originalInput := CopyInput(preparedInput)
+		defer func() {
+			if runResult != nil && runResult.Trace == nil {
+				runResult.Trace = TraceStateFromTrace(tracing.GetCurrentTrace(ctx))
+			}
+		}()
 
 		maxTurns := r.Config.MaxTurns
 		if maxTurns == 0 {
@@ -1885,13 +1890,18 @@ func (r Runner) runStreamedWithStartingTurnAndState(
 	var newTrace tracing.Trace
 	if tracing.GetCurrentTrace(ctx) == nil {
 		ctx = tracing.ContextWithClonedOrNewScope(ctx)
-		newTrace = tracing.NewTrace(ctx, tracing.TraceParams{
+		traceParams := applyResumeTraceDefaults(tracing.TraceParams{
 			WorkflowName: cmp.Or(r.Config.WorkflowName, DefaultWorkflowName),
 			TraceID:      r.Config.TraceID,
 			GroupID:      r.Config.GroupID,
 			Metadata:     r.Config.TraceMetadata,
 			Disabled:     r.Config.TracingDisabled,
-		})
+		}, resumeState)
+		if reattached := resolveReattachedTrace(traceParams, resumeState); reattached != nil {
+			newTrace = reattached
+		} else {
+			newTrace = tracing.NewTrace(ctx, traceParams)
+		}
 	}
 
 	if resumeState != nil && resumeState.Context != nil && resumeState.Context.Usage != nil {
@@ -2196,6 +2206,7 @@ func (r Runner) startStreaming(
 		if err != nil {
 			return err
 		}
+		markTraceIDStarted(trace.TraceID(), currentTracingAPIKeyHash())
 	}
 
 	conversationID, resolvedPreviousResponseID, autoPrevious := resolveConversationSettings(runConfig, resumeState)
@@ -2895,7 +2906,14 @@ func (r Runner) runSingleTurnStreamed(
 	err = model.StreamResponse(
 		ctx, modelResponseParams,
 		func(ctx context.Context, event TResponseStreamEvent) error {
-			if event.Type == "response.completed" {
+			if event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.incomplete" {
+				if reflect.ValueOf(event.Response).IsZero() {
+					streamedResult.eventQueue.Put(RawResponsesStreamEvent{
+						Data: event,
+						Type: "raw_response_event",
+					})
+					return nil
+				}
 				u := usage.NewUsage()
 				if !reflect.ValueOf(event.Response.Usage).IsZero() {
 					*u = usage.Usage{
@@ -2914,6 +2932,7 @@ func (r Runner) runSingleTurnStreamed(
 					Output:     event.Response.Output,
 					Usage:      u,
 					ResponseID: event.Response.ID,
+					RequestID:  modelRequestIDFromContext(ctx),
 				}
 				if contextUsage, _ := usage.FromContext(ctx); contextUsage != nil {
 					contextUsage.Add(u)

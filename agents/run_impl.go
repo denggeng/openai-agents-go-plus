@@ -2105,11 +2105,25 @@ func (runImpl) checkForFinalOutputFromTools(
 }
 
 // ManageTraceCtx creates a trace only if there is no current trace, and manages the trace lifecycle around the given function.
-func ManageTraceCtx(ctx context.Context, params tracing.TraceParams, fn func(context.Context) error) error {
+func ManageTraceCtx(
+	ctx context.Context,
+	params tracing.TraceParams,
+	resumeState *RunState,
+	fn func(context.Context) error,
+) error {
 	if ct := tracing.GetCurrentTrace(ctx); ct != nil {
 		return fn(ctx)
 	}
-	return tracing.RunTrace(ctx, params, func(ctx context.Context, _ tracing.Trace) error {
+
+	params = applyResumeTraceDefaults(params, resumeState)
+	if reattached := resolveReattachedTrace(params, resumeState); reattached != nil {
+		return reattached.Run(ctx, func(ctx context.Context, _ tracing.Trace) error {
+			return fn(ctx)
+		})
+	}
+
+	return tracing.RunTrace(ctx, params, func(ctx context.Context, trace tracing.Trace) error {
+		markTraceIDStarted(trace.TraceID(), currentTracingAPIKeyHash())
 		return fn(ctx)
 	})
 }

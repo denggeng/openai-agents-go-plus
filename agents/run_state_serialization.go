@@ -66,12 +66,13 @@ type RunStateContextMeta struct {
 
 // TraceState stores trace metadata for run-state persistence.
 type TraceState struct {
-	ObjectType    string         `json:"object,omitempty"`
-	TraceID       string         `json:"id,omitempty"`
-	WorkflowName  string         `json:"workflow_name,omitempty"`
-	GroupID       string         `json:"group_id,omitempty"`
-	Metadata      map[string]any `json:"metadata,omitempty"`
-	TracingAPIKey string         `json:"tracing_api_key,omitempty"`
+	ObjectType        string         `json:"object,omitempty"`
+	TraceID           string         `json:"id,omitempty"`
+	WorkflowName      string         `json:"workflow_name,omitempty"`
+	GroupID           string         `json:"group_id,omitempty"`
+	Metadata          map[string]any `json:"metadata,omitempty"`
+	TracingAPIKey     string         `json:"tracing_api_key,omitempty"`
+	TracingAPIKeyHash string         `json:"tracing_api_key_hash,omitempty"`
 }
 
 // RunStateCurrentStepState captures interruption state for run resumption.
@@ -190,6 +191,12 @@ func TraceStateFromMap(payload map[string]any) *TraceState {
 	}
 	if v, ok := payload["tracing_api_key"].(string); ok {
 		state.TracingAPIKey = v
+	}
+	if v, ok := payload["tracing_api_key_hash"].(string); ok {
+		state.TracingAPIKeyHash = v
+	}
+	if state.TracingAPIKeyHash == "" {
+		state.TracingAPIKeyHash = currentTracingAPIKeyHash()
 	}
 	return state
 }

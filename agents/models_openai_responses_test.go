@@ -17,6 +17,9 @@ package agents
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
@@ -27,6 +30,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func newResponsesTestClient(body string, headers map[string]string) OpenaiClient {
+	header := http.Header{"Content-Type": []string{"application/json"}}
+	for key, value := range headers {
+		header.Set(key, value)
+	}
+	return OpenaiClient{
+		Client: openai.NewClient(
+			option.WithMiddleware(func(_ *http.Request, _ option.MiddlewareNext) (*http.Response, error) {
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Body:          io.NopCloser(strings.NewReader(body)),
+					ContentLength: int64(len(body)),
+					Header:        header,
+				}, nil
+			}),
+		),
+	}
+}
 
 func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 	t.Run("with ModelSettings.CustomizeResponsesRequest nil", func(t *testing.T) {
@@ -223,4 +245,45 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 		assert.Equal(t, int64(2), params.TopLogprobs.Value)
 		assert.Contains(t, params.Include, responses.ResponseIncludableMessageOutputTextLogprobs)
 	})
+}
+
+func TestOpenAIResponsesModelGetResponseCapturesRequestID(t *testing.T) {
+	model := NewOpenAIResponsesModel(
+		"model-name",
+		newResponsesTestClient(`{"id":"resp-1","output":[]}`, map[string]string{
+			"X-Request-ID": "req_123",
+		}),
+	)
+
+	response, err := model.GetResponse(t.Context(), ModelResponseParams{
+		Input: InputString("hello"),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	assert.Equal(t, "req_123", response.RequestID)
+	assert.Equal(t, "resp-1", response.ResponseID)
+}
+
+func TestOpenAIResponsesModelStreamResponsePropagatesRequestIDInContext(t *testing.T) {
+	model := NewOpenAIResponsesModel(
+		"model-name",
+		newResponsesTestClient(`event: response.completed
+data: {"type":"response.completed","response":{"id":"resp-2","output":[]}}
+
+`, map[string]string{
+			"x-request-id": "req_stream_456",
+		}),
+	)
+
+	var callbackRequestID string
+	err := model.StreamResponse(t.Context(), ModelResponseParams{
+		Input: InputString("hello"),
+	}, func(ctx context.Context, event TResponseStreamEvent) error {
+		if event.Type == "response.completed" {
+			callbackRequestID = modelRequestIDFromContext(ctx)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "req_stream_456", callbackRequestID)
 }

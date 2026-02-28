@@ -15,6 +15,8 @@
 package agents
 
 import (
+	"context"
+	"errors"
 	"maps"
 	"strings"
 
@@ -47,6 +49,9 @@ type NewMultiProviderParams struct {
 	// use the default base URL.
 	OpenaiBaseURL param.Opt[string]
 
+	// Optional websocket base URL for OpenAI Responses websocket transport.
+	OpenaiWebsocketBaseURL param.Opt[string]
+
 	// Optional OpenAI client to use. If not provided, we will create a new
 	// OpenAI client using the OpenaiAPIKey and OpenaiBaseURL.
 	OpenaiClient *OpenaiClient
@@ -59,6 +64,9 @@ type NewMultiProviderParams struct {
 
 	// Whether to use the OpenAI responses API.
 	OpenaiUseResponses param.Opt[bool]
+
+	// Whether to use websocket transport for OpenAI responses API.
+	OpenaiUseResponsesWebsocket param.Opt[bool]
 }
 
 // NewMultiProvider creates a new OpenAI provider.
@@ -66,12 +74,14 @@ func NewMultiProvider(params NewMultiProviderParams) *MultiProvider {
 	return &MultiProvider{
 		ProviderMap: params.ProviderMap,
 		OpenAIProvider: NewOpenAIProvider(OpenAIProviderParams{
-			APIKey:       params.OpenaiAPIKey,
-			BaseURL:      params.OpenaiBaseURL,
-			OpenaiClient: params.OpenaiClient,
-			Organization: params.OpenaiOrganization,
-			Project:      params.OpenaiProject,
-			UseResponses: params.OpenaiUseResponses,
+			APIKey:                params.OpenaiAPIKey,
+			BaseURL:               params.OpenaiBaseURL,
+			OpenaiClient:          params.OpenaiClient,
+			Organization:          params.OpenaiOrganization,
+			Project:               params.OpenaiProject,
+			UseResponses:          params.OpenaiUseResponses,
+			WebsocketBaseURL:      params.OpenaiWebsocketBaseURL,
+			UseResponsesWebsocket: params.OpenaiUseResponsesWebsocket,
 		}),
 		fallbackProviders: make(map[string]ModelProvider),
 	}
@@ -130,6 +140,41 @@ func (mp *MultiProvider) GetModel(modelName string) (Model, error) {
 		return nil, err
 	}
 	return fp.GetModel(name)
+}
+
+// Aclose releases resources owned by underlying providers that expose lifecycle hooks.
+func (mp *MultiProvider) Aclose(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var closeErr error
+
+	if mp.OpenAIProvider != nil {
+		closeErr = errors.Join(closeErr, mp.OpenAIProvider.Aclose(ctx))
+	}
+
+	for _, provider := range mp.fallbackProviders {
+		closer, ok := provider.(ModelProviderCloser)
+		if !ok || closer == nil {
+			continue
+		}
+		if err := closer.Aclose(ctx); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
+	}
+	if mp.ProviderMap != nil {
+		for _, provider := range mp.ProviderMap.GetMapping() {
+			closer, ok := provider.(ModelProviderCloser)
+			if !ok || closer == nil {
+				continue
+			}
+			if err := closer.Aclose(ctx); err != nil {
+				closeErr = errors.Join(closeErr, err)
+			}
+		}
+	}
+
+	return closeErr
 }
 
 // MultiProviderMap is a map of model name prefixes to ModelProvider objects.

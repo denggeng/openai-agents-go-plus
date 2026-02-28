@@ -24,8 +24,9 @@ import (
 
 type OpenaiClient struct {
 	openai.Client
-	BaseURL param.Opt[string]
-	APIKey  param.Opt[string]
+	BaseURL          param.Opt[string]
+	WebsocketBaseURL param.Opt[string]
+	APIKey           param.Opt[string]
 }
 
 func NewOpenaiClient(baseURL, apiKey param.Opt[string], opts ...option.RequestOption) OpenaiClient {

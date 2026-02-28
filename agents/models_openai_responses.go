@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"reflect"
 	"slices"
 
@@ -52,6 +53,7 @@ func (m OpenAIResponsesModel) GetResponse(
 ) (*ModelResponse, error) {
 	var u *usage.Usage
 	var response *responses.Response
+	var rawResponse *http.Response
 
 	err := tracing.ResponseSpan(
 		ctx, tracing.ResponseSpanParams{Disabled: params.Tracing.IsDisabled()},
@@ -87,6 +89,7 @@ func (m OpenAIResponsesModel) GetResponse(
 			if err != nil {
 				return err
 			}
+			opts = append(opts, option.WithResponseInto(&rawResponse))
 
 			response, err = m.client.Responses.New(ctx, *body, opts...)
 			if err != nil {
@@ -129,6 +132,7 @@ func (m OpenAIResponsesModel) GetResponse(
 		Output:     response.Output,
 		Usage:      u,
 		ResponseID: response.ID,
+		RequestID:  requestIDFromHeaders(rawResponse),
 	}, nil
 }
 
@@ -173,6 +177,8 @@ func (m OpenAIResponsesModel) StreamResponse(
 			if err != nil {
 				return err
 			}
+			var rawResponse *http.Response
+			opts = append(opts, option.WithResponseInto(&rawResponse))
 
 			stream := m.client.Responses.NewStreaming(ctx, *body, opts...)
 			defer func() {
@@ -181,13 +187,14 @@ func (m OpenAIResponsesModel) StreamResponse(
 				}
 			}()
 
+			streamCtx := contextWithModelRequestID(ctx, requestIDFromHeaders(rawResponse))
 			var finalResponse *responses.Response
 			for stream.Next() {
 				chunk := stream.Current()
 				if chunk.Type == "response.completed" {
 					finalResponse = &chunk.Response
 				}
-				if err = yield(ctx, chunk); err != nil {
+				if err = yield(streamCtx, chunk); err != nil {
 					return err
 				}
 			}

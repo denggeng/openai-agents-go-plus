@@ -386,8 +386,8 @@ func (s *MCPServerWithClientSession) CachedTools() []*mcp.Tool {
 }
 
 // MCPNeedsApprovalForTool returns the approval policy for a specific MCP tool.
-func (s *MCPServerWithClientSession) MCPNeedsApprovalForTool(tool *mcp.Tool, _ *Agent) FunctionToolNeedsApproval {
-	return s.needsApprovalPolicy.forTool(tool)
+func (s *MCPServerWithClientSession) MCPNeedsApprovalForTool(tool *mcp.Tool, agent *Agent) FunctionToolNeedsApproval {
+	return s.needsApprovalPolicy.forTool(tool, agent)
 }
 
 // MCPFailureErrorFunctionOverride reports whether this server overrides MCP failure handling.

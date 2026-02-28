@@ -145,6 +145,7 @@ func (p *VoicePipeline) runSingleTurn(ctx context.Context, audioInput AudioInput
 			Metadata:     p.config.TraceMetadata,
 			Disabled:     p.config.TracingDisabled,
 		},
+		nil,
 		func(ctx context.Context) error {
 			inputText, err := p.processAudioInput(ctx, audioInput)
 			if err != nil {
@@ -193,6 +194,7 @@ func (p *VoicePipeline) runMultiTurn(ctx context.Context, audioInput StreamedAud
 			Metadata:     p.config.TraceMetadata,
 			Disabled:     p.config.TracingDisabled,
 		},
+		nil,
 		func(ctx context.Context) error {
 			output = NewStreamedAudioResult(p.ttsModel, p.config.TTSSettings, p.config)
 

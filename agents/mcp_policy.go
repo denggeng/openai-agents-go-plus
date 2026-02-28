@@ -44,9 +44,18 @@ type MCPToolMetaContext struct {
 // MCPToolMetaResolver computes request `_meta` values for MCP tool calls.
 type MCPToolMetaResolver func(context.Context, MCPToolMetaContext) (map[string]any, error)
 
+// MCPRequireApprovalFunc computes dynamic approval requirements for MCP tools.
+type MCPRequireApprovalFunc func(
+	ctx context.Context,
+	runContext *RunContextWrapper[any],
+	agent *Agent,
+	tool *mcp.Tool,
+) (bool, error)
+
 type mcpNeedsApprovalPolicy struct {
 	defaultNeedsApproval bool
 	toolNeedsApproval    map[string]bool
+	callable             MCPRequireApprovalFunc
 }
 
 func normalizeMCPNeedsApprovalPolicy(requireApproval any) mcpNeedsApprovalPolicy {
@@ -100,6 +109,13 @@ func normalizeMCPNeedsApprovalPolicy(requireApproval any) mcpNeedsApprovalPolicy
 			}
 		}
 		return mcpNeedsApprovalPolicy{toolNeedsApproval: mapped}
+	case MCPRequireApprovalFunc:
+		return mcpNeedsApprovalPolicy{callable: value}
+	case *MCPRequireApprovalFunc:
+		if value == nil {
+			return mcpNeedsApprovalPolicy{}
+		}
+		return mcpNeedsApprovalPolicy{callable: *value}
 	default:
 		return mcpNeedsApprovalPolicy{}
 	}
@@ -171,7 +187,22 @@ func extractToolNames(raw any) []string {
 	}
 }
 
-func (p mcpNeedsApprovalPolicy) forTool(tool *mcp.Tool) FunctionToolNeedsApproval {
+func (p mcpNeedsApprovalPolicy) forTool(tool *mcp.Tool, agent *Agent) FunctionToolNeedsApproval {
+	if p.callable != nil {
+		if agent == nil {
+			// Keep approval conservative when dynamic policy context is unavailable.
+			return FunctionToolNeedsApprovalEnabled()
+		}
+		return FunctionToolNeedsApprovalFunc(func(
+			ctx context.Context,
+			runContext *RunContextWrapper[any],
+			_ FunctionTool,
+			_ map[string]any,
+			_ string,
+		) (bool, error) {
+			return p.callable(ctx, runContext, agent, tool)
+		})
+	}
 	if tool != nil && len(p.toolNeedsApproval) > 0 {
 		if p.toolNeedsApproval[tool.Name] {
 			return FunctionToolNeedsApprovalEnabled()

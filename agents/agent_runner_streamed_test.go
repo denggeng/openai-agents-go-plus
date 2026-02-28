@@ -28,6 +28,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type terminalEventModel struct {
+	eventType string
+}
+
+func (m terminalEventModel) GetResponse(context.Context, agents.ModelResponseParams) (*agents.ModelResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m terminalEventModel) StreamResponse(
+	ctx context.Context,
+	_ agents.ModelResponseParams,
+	yield agents.ModelStreamResponseCallback,
+) error {
+	return yield(ctx, agents.TResponseStreamEvent{
+		Type: m.eventType,
+		Response: agentstesting.GetResponseObj(
+			[]agents.TResponseOutputItem{agentstesting.GetTextMessage("terminal")},
+			"resp_terminal",
+			nil,
+		),
+		SequenceNumber: 0,
+	})
+}
+
 func TestSimpleFirstRunStreamed(t *testing.T) {
 	model := agentstesting.NewFakeModel(false, nil)
 	agent := &agents.Agent{
@@ -74,6 +98,32 @@ func TestSimpleFirstRunStreamed(t *testing.T) {
 	assert.Equal(t, "second", result.FinalOutput())
 	assert.Len(t, result.RawResponses(), 1)
 	assert.Len(t, result.ToInputList(), 3, "should have original input and generated item")
+}
+
+func TestRunStreamedAcceptsFailedOrIncompleteTerminalEvents(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+	}{
+		{name: "failed", eventType: "response.failed"},
+		{name: "incomplete", eventType: "response.incomplete"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agents.Agent{
+				Name:  "test",
+				Model: param.NewOpt(agents.NewAgentModel(terminalEventModel{eventType: tc.eventType})),
+			}
+			result, err := agents.Runner{}.RunStreamed(t.Context(), agent, "hello")
+			require.NoError(t, err)
+			require.NoError(t, result.StreamEvents(func(agents.StreamEvent) error { return nil }))
+
+			assert.Equal(t, "terminal", result.FinalOutput())
+			require.Len(t, result.RawResponses(), 1)
+			assert.Equal(t, "resp_terminal", result.RawResponses()[0].ResponseID)
+		})
+	}
 }
 
 func TestSubsequentRunsStreamed(t *testing.T) {
