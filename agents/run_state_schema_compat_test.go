@@ -83,3 +83,14 @@ func TestRunStateModelResponseLegacyFieldsStillDecode(t *testing.T) {
 	assert.Equal(t, "resp_old", decoded.ModelResponses[0].ResponseID)
 	assert.Equal(t, "req_old", decoded.ModelResponses[0].RequestID)
 }
+
+func TestRunStateModelResponseLegacyMalformedFieldReturnsError(t *testing.T) {
+	_, err := agents.RunStateFromJSONString(`{
+		"$schemaVersion":"1.4",
+		"current_turn":1,
+		"max_turns":1,
+		"model_responses":[{"ResponseID":{"bad":"type"}}]
+	}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "legacy ModelResponse.ResponseID")
+}

@@ -37,6 +37,14 @@ func TestDefaultOpenAIResponsesTransportSettings(t *testing.T) {
 	assert.False(t, GetUseResponsesWebsocketByDefault())
 }
 
+func TestOpenAIResponsesTransportAliasFunctions(t *testing.T) {
+	ClearOpenaiSettings()
+	SetDefaultOpenaiResponsesTransport(OpenAIResponsesTransportWebsocket)
+	assert.Equal(t, OpenAIResponsesTransportWebsocket, GetDefaultOpenaiResponsesTransport())
+	SetDefaultOpenaiResponsesTransport(OpenAIResponsesTransportHTTP)
+	assert.Equal(t, OpenAIResponsesTransportHTTP, GetDefaultOpenaiResponsesTransport())
+}
+
 func TestOpenAIProviderReturnsCachedResponsesWSModel(t *testing.T) {
 	client := NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{})
 	provider := NewOpenAIProvider(OpenAIProviderParams{

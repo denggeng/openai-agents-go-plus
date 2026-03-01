@@ -17,6 +17,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -243,23 +244,36 @@ func deepCopyMap(input map[string]any) map[string]any {
 	if input == nil {
 		return nil
 	}
+
 	payload, err := json.Marshal(input)
-	if err != nil {
-		clone := make(map[string]any, len(input))
-		for key, value := range input {
-			clone[key] = value
+	if err == nil {
+		var output map[string]any
+		unmarshalErr := json.Unmarshal(payload, &output)
+		if unmarshalErr == nil {
+			return output
 		}
-		return clone
+		Logger().Warn(
+			"MCP meta deep copy fallback to shallow copy",
+			slog.String("reason", "unmarshal"),
+			slog.String("error", unmarshalErr.Error()),
+		)
+		return shallowCopyMap(input)
 	}
-	var output map[string]any
-	if err := json.Unmarshal(payload, &output); err != nil {
-		clone := make(map[string]any, len(input))
-		for key, value := range input {
-			clone[key] = value
-		}
-		return clone
+
+	Logger().Warn(
+		"MCP meta deep copy fallback to shallow copy",
+		slog.String("reason", "marshal"),
+		slog.String("error", err.Error()),
+	)
+	return shallowCopyMap(input)
+}
+
+func shallowCopyMap(input map[string]any) map[string]any {
+	clone := make(map[string]any, len(input))
+	for key, value := range input {
+		clone[key] = value
 	}
-	return output
+	return clone
 }
 
 func cloneToolErrorFunctionPointer(fn *ToolErrorFunction) *ToolErrorFunction {

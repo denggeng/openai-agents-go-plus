@@ -62,29 +62,36 @@ func (mr *ModelResponse) UnmarshalJSON(data []byte) error {
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil
+		return err
 	}
 	if mr.ResponseID == "" {
 		if legacy, ok := raw["ResponseID"]; ok {
-			_ = json.Unmarshal(legacy, &mr.ResponseID)
+			if err := json.Unmarshal(legacy, &mr.ResponseID); err != nil {
+				return fmt.Errorf("decode legacy ModelResponse.ResponseID: %w", err)
+			}
 		}
 	}
 	if mr.RequestID == "" {
 		if legacy, ok := raw["RequestID"]; ok {
-			_ = json.Unmarshal(legacy, &mr.RequestID)
+			if err := json.Unmarshal(legacy, &mr.RequestID); err != nil {
+				return fmt.Errorf("decode legacy ModelResponse.RequestID: %w", err)
+			}
 		}
 	}
 	if len(mr.Output) == 0 {
 		if legacy, ok := raw["Output"]; ok {
-			_ = json.Unmarshal(legacy, &mr.Output)
+			if err := json.Unmarshal(legacy, &mr.Output); err != nil {
+				return fmt.Errorf("decode legacy ModelResponse.Output: %w", err)
+			}
 		}
 	}
 	if mr.Usage == nil {
 		if legacy, ok := raw["Usage"]; ok {
 			var u usage.Usage
-			if err := json.Unmarshal(legacy, &u); err == nil {
-				mr.Usage = &u
+			if err := json.Unmarshal(legacy, &u); err != nil {
+				return fmt.Errorf("decode legacy ModelResponse.Usage: %w", err)
 			}
+			mr.Usage = &u
 		}
 	}
 	return nil

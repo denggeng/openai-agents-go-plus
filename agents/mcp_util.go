@@ -266,13 +266,14 @@ func (u mcpUtil) toFunctionToolWithOptions(
 		functionTool.NeedsApproval = provider.MCPNeedsApprovalForTool(tool, agent)
 	}
 
+	useAgentFailureFunc := agentFailureSet
 	if provider, ok := server.(mcpFailureErrorFunctionProvider); ok {
 		if hasOverride, override := provider.MCPFailureErrorFunctionOverride(); hasOverride {
 			functionTool.FailureErrorFunction = cloneToolErrorFunctionPointer(override)
-		} else if agentFailureSet {
-			functionTool.FailureErrorFunction = cloneToolErrorFunctionPointer(agentFailureErrorFunction)
+			useAgentFailureFunc = false
 		}
-	} else if agentFailureSet {
+	}
+	if useAgentFailureFunc {
 		functionTool.FailureErrorFunction = cloneToolErrorFunctionPointer(agentFailureErrorFunction)
 	}
 
