@@ -23,16 +23,15 @@ import (
 
 // OpenAIResponsesWSModel is the websocket-transport wrapper for the Responses API.
 //
-// The current implementation preserves provider-level lifecycle and caching semantics
-// while delegating request execution to the shared Responses model implementation.
+// Websocket execution is intentionally not implemented yet. The model returns
+// explicit errors instead of silently falling back to HTTP transport.
 type OpenAIResponsesWSModel struct {
-	delegate         OpenAIResponsesModel
 	websocketBaseURL string
 	closed           atomic.Bool
 }
 
 func NewOpenAIResponsesWSModel(
-	model openai.ChatModel,
+	_ openai.ChatModel,
 	client OpenaiClient,
 	websocketBaseURL string,
 ) *OpenAIResponsesWSModel {
@@ -40,30 +39,29 @@ func NewOpenAIResponsesWSModel(
 		websocketBaseURL = client.WebsocketBaseURL.Or("")
 	}
 	return &OpenAIResponsesWSModel{
-		delegate:         NewOpenAIResponsesModel(model, client),
 		websocketBaseURL: websocketBaseURL,
 	}
 }
 
 func (m *OpenAIResponsesWSModel) GetResponse(
-	ctx context.Context,
-	params ModelResponseParams,
+	_ context.Context,
+	_ ModelResponseParams,
 ) (*ModelResponse, error) {
 	if m.closed.Load() {
 		return nil, UserErrorf("responses websocket model is closed")
 	}
-	return m.delegate.GetResponse(ctx, params)
+	return nil, UserErrorf("responses websocket transport is not implemented; use HTTP transport")
 }
 
 func (m *OpenAIResponsesWSModel) StreamResponse(
-	ctx context.Context,
-	params ModelResponseParams,
-	yield ModelStreamResponseCallback,
+	_ context.Context,
+	_ ModelResponseParams,
+	_ ModelStreamResponseCallback,
 ) error {
 	if m.closed.Load() {
 		return UserErrorf("responses websocket model is closed")
 	}
-	return m.delegate.StreamResponse(ctx, params, yield)
+	return UserErrorf("responses websocket transport is not implemented; use HTTP transport")
 }
 
 func (m *OpenAIResponsesWSModel) WebsocketBaseURL() string {

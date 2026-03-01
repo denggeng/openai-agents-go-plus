@@ -51,6 +51,17 @@ func (c *lifecycleComputer) Move(context.Context, int64, int64) error        { r
 func (c *lifecycleComputer) Keypress(context.Context, []string) error        { return nil }
 func (c *lifecycleComputer) Drag(context.Context, []computer.Position) error { return nil }
 
+type methodValueComputerFactoryOwner struct {
+	label string
+}
+
+func (o *methodValueComputerFactoryOwner) CreateComputer(
+	context.Context,
+	*agents.RunContextWrapper[any],
+) (computer.Computer, error) {
+	return &lifecycleComputer{label: o.label}, nil
+}
+
 func TestResolveComputerPerRunContext(t *testing.T) {
 	counter := 0
 	tool := agents.ComputerTool{
@@ -167,4 +178,24 @@ func TestStreamedRunDisposesComputerAfterCompletion(t *testing.T) {
 	assert.Equal(t, 1, disposeCount)
 	assert.Same(t, createCtx, disposeCtx)
 	assert.Same(t, createdComp, disposedComp)
+}
+
+func TestResolveComputerFactoryMethodValueNoCacheCollision(t *testing.T) {
+	runContext := agents.NewRunContextWrapper[any](nil)
+
+	ownerA := &methodValueComputerFactoryOwner{label: "A"}
+	ownerB := &methodValueComputerFactoryOwner{label: "B"}
+	toolA := agents.ComputerTool{ComputerFactory: ownerA.CreateComputer}
+	toolB := agents.ComputerTool{ComputerFactory: ownerB.CreateComputer}
+
+	compA, err := agents.ResolveComputer(t.Context(), &toolA, runContext)
+	require.NoError(t, err)
+	compB, err := agents.ResolveComputer(t.Context(), &toolB, runContext)
+	require.NoError(t, err)
+
+	require.NotSame(t, compA, compB)
+	compAConcrete := compA.(*lifecycleComputer)
+	compBConcrete := compB.(*lifecycleComputer)
+	assert.Equal(t, "A", compAConcrete.label)
+	assert.Equal(t, "B", compBConcrete.label)
 }

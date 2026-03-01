@@ -17,8 +17,7 @@ package agents
 import (
 	"context"
 	"errors"
-	"fmt"
-	"reflect"
+	"strconv"
 	"sync"
 
 	"github.com/denggeng/openai-agents-go-plus/computer"
@@ -53,6 +52,9 @@ type ComputerTool struct {
 
 	// Optional callback to acknowledge computer tool safety checks.
 	OnSafetyCheck func(context.Context, ComputerToolSafetyCheckData) (bool, error)
+
+	// Internal stable identity used for per-run computer cache lookups.
+	cacheID string
 }
 
 func (t ComputerTool) ToolName() string {
@@ -81,6 +83,8 @@ type resolvedComputer struct {
 var (
 	computerResolutionMu  sync.Mutex
 	computersByRunContext = make(map[*RunContextWrapper[any]]map[string]resolvedComputer)
+	computerToolIDMu      sync.Mutex
+	nextComputerToolID    uint64
 )
 
 // ResolveComputer resolves a computer instance for the given run context.
@@ -218,20 +222,20 @@ func (t *ComputerTool) cacheKey() string {
 	if t == nil {
 		return ""
 	}
-	if t.ComputerProvider != nil {
-		return fmt.Sprintf("provider:%p", t.ComputerProvider)
+	id := t.ensureCacheID()
+	if id == "" {
+		return ""
 	}
-	if t.ComputerFactory != nil {
-		return fmt.Sprintf("factory:%x", reflect.ValueOf(t.ComputerFactory).Pointer())
+	return "tool:" + id
+}
+
+func (t *ComputerTool) ensureCacheID() string {
+	computerToolIDMu.Lock()
+	defer computerToolIDMu.Unlock()
+
+	if t.cacheID == "" {
+		nextComputerToolID++
+		t.cacheID = strconv.FormatUint(nextComputerToolID, 10)
 	}
-	if t.Computer == nil {
-		return "computer:nil"
-	}
-	value := reflect.ValueOf(t.Computer)
-	switch value.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
-		return fmt.Sprintf("computer:%T:%x", t.Computer, value.Pointer())
-	default:
-		return fmt.Sprintf("computer:%T:%v", t.Computer, t.Computer)
-	}
+	return t.cacheID
 }

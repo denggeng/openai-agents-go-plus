@@ -47,6 +47,8 @@ type MCPServerManagerParams struct {
 
 // MCPServerManager manages lifecycle and status of a group of MCP servers.
 type MCPServerManager struct {
+	stateMu sync.RWMutex
+
 	allServers    []MCPServer
 	activeServers []MCPServer
 
@@ -104,21 +106,29 @@ func NewMCPServerManager(servers []MCPServer, params MCPServerManagerParams) *MC
 
 // ActiveServers returns currently active servers.
 func (m *MCPServerManager) ActiveServers() []MCPServer {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	return slices.Clone(m.activeServers)
 }
 
 // AllServers returns all managed servers.
 func (m *MCPServerManager) AllServers() []MCPServer {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	return slices.Clone(m.allServers)
 }
 
 // FailedServers returns servers that most recently failed to connect/cleanup.
 func (m *MCPServerManager) FailedServers() []MCPServer {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	return slices.Clone(m.failedServers)
 }
 
 // Errors returns a copy of server lifecycle errors.
 func (m *MCPServerManager) Errors() map[MCPServer]error {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	out := make(map[MCPServer]error, len(m.errorsByServer))
 	for server, err := range m.errorsByServer {
 		out[server] = err
@@ -128,15 +138,15 @@ func (m *MCPServerManager) Errors() map[MCPServer]error {
 
 // ConnectAll attempts to connect all not-yet-connected servers.
 func (m *MCPServerManager) ConnectAll(ctx context.Context) ([]MCPServer, error) {
+	m.stateMu.Lock()
 	previousConnected := make(map[MCPServer]struct{}, len(m.connectedServers))
 	for server := range m.connectedServers {
 		previousConnected[server] = struct{}{}
 	}
 	previousActive := slices.Clone(m.activeServers)
 
-	m.failedServers = nil
-	m.failedServerSet = make(map[MCPServer]struct{})
-	m.errorsByServer = make(map[MCPServer]error)
+	m.clearFailureStateLocked()
+	m.stateMu.Unlock()
 
 	serversToConnect := m.serversToConnect(m.allServers)
 	connectedThisRound := make([]MCPServer, 0, len(serversToConnect))
@@ -151,7 +161,7 @@ func (m *MCPServerManager) ConnectAll(ctx context.Context) ([]MCPServer, error) 
 				connectErr = err
 				break
 			}
-			if _, failed := m.failedServerSet[server]; !failed {
+			if !m.hasFailedServer(server) {
 				connectedThisRound = append(connectedThisRound, server)
 			}
 		}
@@ -161,14 +171,16 @@ func (m *MCPServerManager) ConnectAll(ctx context.Context) ([]MCPServer, error) 
 		if m.connectInParallel {
 			_ = m.cleanupServers(ctx, serversToConnect)
 		} else {
-			serversToCleanup := m.uniqueServers(append(slices.Clone(connectedThisRound), m.failedServers...))
+			serversToCleanup := m.uniqueServers(append(slices.Clone(connectedThisRound), m.failedServersSnapshot()...))
 			_ = m.cleanupServers(ctx, serversToCleanup)
 		}
+		m.stateMu.Lock()
 		if m.dropFailedServers {
-			m.activeServers = m.filterActiveServers(previousConnected)
+			m.activeServers = m.filterActiveServersLocked(previousConnected)
 		} else {
 			m.activeServers = previousActive
 		}
+		m.stateMu.Unlock()
 		return m.ActiveServers(), connectErr
 	}
 
@@ -181,15 +193,15 @@ func (m *MCPServerManager) ConnectAll(ctx context.Context) ([]MCPServer, error) 
 func (m *MCPServerManager) Reconnect(ctx context.Context, failedOnly bool) ([]MCPServer, error) {
 	var serversToRetry []MCPServer
 	if failedOnly {
-		serversToRetry = m.uniqueServers(m.failedServers)
+		serversToRetry = m.uniqueServers(m.failedServersSnapshot())
 	} else {
 		if err := m.CleanupAll(ctx); err != nil {
 			return nil, err
 		}
+		m.stateMu.Lock()
 		serversToRetry = slices.Clone(m.allServers)
-		m.failedServers = nil
-		m.failedServerSet = make(map[MCPServer]struct{})
-		m.errorsByServer = make(map[MCPServer]error)
+		m.clearFailureStateLocked()
+		m.stateMu.Unlock()
 	}
 
 	serversToRetry = m.serversToConnect(serversToRetry)
@@ -210,8 +222,9 @@ func (m *MCPServerManager) Reconnect(ctx context.Context, failedOnly bool) ([]MC
 
 // CleanupAll cleans up all managed servers in reverse order.
 func (m *MCPServerManager) CleanupAll(ctx context.Context) error {
-	for i := len(m.allServers) - 1; i >= 0; i-- {
-		server := m.allServers[i]
+	allServers := m.AllServers()
+	for i := len(allServers) - 1; i >= 0; i-- {
+		server := allServers[i]
 		err := m.cleanupServer(ctx, server)
 		if err == nil {
 			continue
@@ -223,7 +236,9 @@ func (m *MCPServerManager) CleanupAll(ctx context.Context) error {
 			slog.String("serverName", server.Name()),
 			slog.String("error", err.Error()),
 		)
+		m.stateMu.Lock()
 		m.errorsByServer[server] = err
+		m.stateMu.Unlock()
 	}
 	return nil
 }
@@ -268,9 +283,10 @@ func (m *MCPServerManager) connectAllParallel(ctx context.Context, servers []MCP
 		}
 	}
 
-	if m.strict && len(m.failedServers) > 0 {
-		for _, server := range m.failedServers {
-			err := m.errorsByServer[server]
+	failedServers, errorsByServer := m.failureSnapshot()
+	if m.strict && len(failedServers) > 0 {
+		for _, server := range failedServers {
+			err := errorsByServer[server]
 			if err == nil {
 				continue
 			}
@@ -280,7 +296,7 @@ func (m *MCPServerManager) connectAllParallel(ctx context.Context, servers []MCP
 			return err
 		}
 		if !m.suppressCancelledError {
-			if err := m.errorsByServer[m.failedServers[0]]; err != nil {
+			if err := errorsByServer[failedServers[0]]; err != nil {
 				return err
 			}
 		}
@@ -291,11 +307,13 @@ func (m *MCPServerManager) connectAllParallel(ctx context.Context, servers []MCP
 func (m *MCPServerManager) attemptConnect(ctx context.Context, server MCPServer, raiseOnError bool) error {
 	err := m.runConnect(ctx, server)
 	if err == nil {
+		m.stateMu.Lock()
 		m.connectedServers[server] = struct{}{}
 		if _, failed := m.failedServerSet[server]; failed {
-			m.removeFailedServer(server)
+			m.removeFailedServerLocked(server)
 			delete(m.errorsByServer, server)
 		}
+		m.stateMu.Unlock()
 		return nil
 	}
 
@@ -332,28 +350,37 @@ func (m *MCPServerManager) cleanupServers(ctx context.Context, servers []MCPServ
 		if errors.Is(err, context.Canceled) && !m.suppressCancelledError {
 			return err
 		}
+		m.stateMu.Lock()
 		m.errorsByServer[server] = err
+		m.stateMu.Unlock()
 	}
 	return nil
 }
 
 func (m *MCPServerManager) cleanupServer(ctx context.Context, server MCPServer) error {
 	if m.connectInParallel {
+		m.stateMu.Lock()
 		worker, ok := m.workers[server]
 		if ok {
 			if worker.isDone() {
 				delete(m.workers, server)
 				delete(m.connectedServers, server)
+				m.stateMu.Unlock()
 				return nil
 			}
-			err := worker.cleanup(ctx)
 			delete(m.workers, server)
 			delete(m.connectedServers, server)
+			m.stateMu.Unlock()
+			err := worker.cleanup(ctx)
 			return err
 		}
+		m.stateMu.Unlock()
 	}
-	defer delete(m.connectedServers, server)
-	return runServerActionWithTimeout(ctx, m.cleanupTimeout, server.Cleanup)
+	err := runServerActionWithTimeout(ctx, m.cleanupTimeout, server.Cleanup)
+	m.stateMu.Lock()
+	delete(m.connectedServers, server)
+	m.stateMu.Unlock()
+	return err
 }
 
 func (m *MCPServerManager) recordFailure(server MCPServer, err error, phase string) {
@@ -362,6 +389,8 @@ func (m *MCPServerManager) recordFailure(server MCPServer, err error, phase stri
 		slog.String("serverName", server.Name()),
 		slog.String("error", err.Error()),
 	)
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
 	if _, ok := m.failedServerSet[server]; !ok {
 		m.failedServerSet[server] = struct{}{}
 		m.failedServers = append(m.failedServers, server)
@@ -370,14 +399,22 @@ func (m *MCPServerManager) recordFailure(server MCPServer, err error, phase stri
 }
 
 func (m *MCPServerManager) refreshActiveServers() {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
 	if !m.dropFailedServers {
 		m.activeServers = slices.Clone(m.allServers)
 		return
 	}
-	m.activeServers = m.filterActiveServers(nil)
+	m.activeServers = m.filterActiveServersLocked(nil)
 }
 
 func (m *MCPServerManager) filterActiveServers(allowed map[MCPServer]struct{}) []MCPServer {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.filterActiveServersLocked(allowed)
+}
+
+func (m *MCPServerManager) filterActiveServersLocked(allowed map[MCPServer]struct{}) []MCPServer {
 	active := make([]MCPServer, 0, len(m.allServers))
 	for _, server := range m.allServers {
 		if allowed != nil {
@@ -395,6 +432,8 @@ func (m *MCPServerManager) filterActiveServers(allowed map[MCPServer]struct{}) [
 }
 
 func (m *MCPServerManager) getWorker(server MCPServer) *mcpServerWorker {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
 	if worker, ok := m.workers[server]; ok && !worker.isDone() {
 		return worker
 	}
@@ -404,6 +443,12 @@ func (m *MCPServerManager) getWorker(server MCPServer) *mcpServerWorker {
 }
 
 func (m *MCPServerManager) removeFailedServer(server MCPServer) {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	m.removeFailedServerLocked(server)
+}
+
+func (m *MCPServerManager) removeFailedServerLocked(server MCPServer) {
 	delete(m.failedServerSet, server)
 	filtered := m.failedServers[:0]
 	for _, failed := range m.failedServers {
@@ -417,6 +462,8 @@ func (m *MCPServerManager) removeFailedServer(server MCPServer) {
 
 func (m *MCPServerManager) serversToConnect(servers []MCPServer) []MCPServer {
 	unique := m.uniqueServers(servers)
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	if len(m.connectedServers) == 0 {
 		return unique
 	}
@@ -441,6 +488,37 @@ func (m *MCPServerManager) uniqueServers(servers []MCPServer) []MCPServer {
 		unique = append(unique, server)
 	}
 	return unique
+}
+
+func (m *MCPServerManager) hasFailedServer(server MCPServer) bool {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	_, failed := m.failedServerSet[server]
+	return failed
+}
+
+func (m *MCPServerManager) failedServersSnapshot() []MCPServer {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return slices.Clone(m.failedServers)
+}
+
+func (m *MCPServerManager) failureSnapshot() ([]MCPServer, map[MCPServer]error) {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+
+	failedServers := slices.Clone(m.failedServers)
+	errorsByServer := make(map[MCPServer]error, len(m.errorsByServer))
+	for server, err := range m.errorsByServer {
+		errorsByServer[server] = err
+	}
+	return failedServers, errorsByServer
+}
+
+func (m *MCPServerManager) clearFailureStateLocked() {
+	m.failedServers = nil
+	m.failedServerSet = make(map[MCPServer]struct{})
+	m.errorsByServer = make(map[MCPServer]error)
 }
 
 type mcpServerCommand struct {

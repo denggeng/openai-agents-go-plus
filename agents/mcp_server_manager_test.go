@@ -156,6 +156,34 @@ func (*cancelledServer) GetPrompt(context.Context, string, map[string]string) (*
 	return &mcp.GetPromptResult{}, nil
 }
 
+type barrierConnectServer struct {
+	name    string
+	ready   *sync.WaitGroup
+	release <-chan struct{}
+}
+
+func (s *barrierConnectServer) Connect(context.Context) error {
+	s.ready.Done()
+	<-s.release
+	return nil
+}
+
+func (*barrierConnectServer) Cleanup(context.Context) error { return nil }
+func (s *barrierConnectServer) Name() string                { return s.name }
+func (*barrierConnectServer) UseStructuredContent() bool    { return false }
+func (*barrierConnectServer) ListTools(context.Context, *Agent) ([]*mcp.Tool, error) {
+	return nil, nil
+}
+func (*barrierConnectServer) CallTool(context.Context, string, map[string]any, map[string]any) (*mcp.CallToolResult, error) {
+	return nil, nil
+}
+func (*barrierConnectServer) ListPrompts(context.Context) (*mcp.ListPromptsResult, error) {
+	return &mcp.ListPromptsResult{}, nil
+}
+func (*barrierConnectServer) GetPrompt(context.Context, string, map[string]string) (*mcp.GetPromptResult, error) {
+	return &mcp.GetPromptResult{}, nil
+}
+
 func TestMCPServerManagerConnectAndCleanupSameWorkerGoroutine(t *testing.T) {
 	server := &taskBoundServer{name: "task-bound"}
 	manager := NewMCPServerManager([]MCPServer{server}, MCPServerManagerParams{
@@ -253,6 +281,37 @@ func TestMCPServerManagerParallelCancelledPropagatesWhenUnsuppressed(t *testing.
 	_, err := manager.ConnectAll(t.Context())
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestMCPServerManagerParallelConnectNoConcurrentMapWrite(t *testing.T) {
+	const serverCount = 32
+
+	release := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(serverCount)
+
+	servers := make([]MCPServer, 0, serverCount)
+	for i := range serverCount {
+		servers = append(servers, &barrierConnectServer{
+			name:    fmt.Sprintf("s-%d", i),
+			ready:   &ready,
+			release: release,
+		})
+	}
+
+	manager := NewMCPServerManager(servers, MCPServerManagerParams{ConnectInParallel: true})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.ConnectAll(t.Context())
+		done <- err
+	}()
+
+	ready.Wait()
+	close(release)
+
+	require.NoError(t, <-done)
+	assert.Len(t, manager.ActiveServers(), serverCount)
 }
 
 func currentGoroutineID() uint64 {
