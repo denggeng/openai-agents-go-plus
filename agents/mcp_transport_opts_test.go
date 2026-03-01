@@ -128,6 +128,26 @@ func TestMCPServerStreamableHTTPFactoryWithConfigApplied(t *testing.T) {
 	assert.Equal(t, client, transport.HTTPClient)
 }
 
+func TestMCPServerStreamableHTTPFactoryWithConfigSkipsHeaderWrapper(t *testing.T) {
+	baseTransport := &http.Transport{}
+	client := &http.Client{Transport: baseTransport}
+
+	server := NewMCPServerStreamableHTTP(MCPServerStreamableHTTPParams{
+		URL:     "http://example.com",
+		Headers: map[string]string{"Authorization": "Bearer token"},
+		HTTPClientFactoryWithConfig: func(headers map[string]string, timeout time.Duration) *http.Client {
+			return client
+		},
+	})
+
+	transport, ok := server.transport.(*mcp.StreamableClientTransport)
+	require.True(t, ok)
+	require.NotNil(t, transport.HTTPClient)
+	assert.Same(t, baseTransport, transport.HTTPClient.Transport)
+	_, wrapped := transport.HTTPClient.Transport.(*mcpHeaderTransport)
+	assert.False(t, wrapped)
+}
+
 func TestMCPServerStreamableHTTPHeadersInjected(t *testing.T) {
 	seenHeaders := make(http.Header)
 	baseTransport := roundTripFunc(func(req *http.Request) (*http.Response, error) {

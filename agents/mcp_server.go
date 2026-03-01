@@ -763,7 +763,7 @@ func NewMCPServerStreamableHTTP(params MCPServerStreamableHTTPParams) *MCPServer
 		transport.HTTPClient.Timeout = timeout
 	}
 
-	if len(params.Headers) > 0 {
+	if len(params.Headers) > 0 && params.HTTPClientFactoryWithConfig == nil {
 		transport.HTTPClient.Transport = &mcpHeaderTransport{
 			next:    transport.HTTPClient.Transport,
 			headers: maps.Clone(params.Headers),
