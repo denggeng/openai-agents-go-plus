@@ -2,3 +2,4 @@
 .DS_Store
 .upstream/
 .codex-watch/
+.agent/

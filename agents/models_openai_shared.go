@@ -23,13 +23,16 @@ import (
 )
 
 var (
-	defaultOpenaiKey      atomic.Pointer[string]
-	defaultOpenaiClient   atomic.Pointer[OpenaiClient]
-	useResponsesByDefault atomic.Bool
+	defaultOpenaiKey          atomic.Pointer[string]
+	defaultOpenaiClient       atomic.Pointer[OpenaiClient]
+	useResponsesByDefault     atomic.Bool
+	defaultResponsesTransport atomic.Pointer[OpenAIResponsesTransport]
 )
 
 func init() {
 	useResponsesByDefault.Store(true)
+	defaultTransport := OpenAIResponsesTransportHTTP
+	defaultResponsesTransport.Store(&defaultTransport)
 }
 
 // SetDefaultOpenaiKey sets the default OpenAI API key to use for LLM requests (and optionally tracing).
@@ -82,6 +85,61 @@ func GetUseResponsesByDefault() bool {
 	return useResponsesByDefault.Load()
 }
 
+// OpenAIResponsesTransport controls which transport is used for Responses API calls.
+type OpenAIResponsesTransport string
+
+const (
+	OpenAIResponsesTransportHTTP      OpenAIResponsesTransport = "http"
+	OpenAIResponsesTransportWebsocket OpenAIResponsesTransport = "websocket"
+)
+
+func SetDefaultOpenAIResponsesTransport(transport OpenAIResponsesTransport) {
+	setDefaultResponsesTransport(transport)
+}
+
+func GetDefaultOpenAIResponsesTransport() OpenAIResponsesTransport {
+	return getDefaultResponsesTransport()
+}
+
+// SetDefaultOpenaiResponsesTransport is the backwards-compatible alias.
+func SetDefaultOpenaiResponsesTransport(transport OpenAIResponsesTransport) {
+	setDefaultResponsesTransport(transport)
+}
+
+// GetDefaultOpenaiResponsesTransport is the backwards-compatible alias.
+func GetDefaultOpenaiResponsesTransport() OpenAIResponsesTransport {
+	return getDefaultResponsesTransport()
+}
+
+func setDefaultResponsesTransport(transport OpenAIResponsesTransport) {
+	switch transport {
+	case OpenAIResponsesTransportHTTP, OpenAIResponsesTransportWebsocket:
+		transportCopy := transport
+		defaultResponsesTransport.Store(&transportCopy)
+	default:
+		panic(fmt.Errorf("invalid OpenAIResponsesTransport value %q", transport))
+	}
+}
+
+func getDefaultResponsesTransport() OpenAIResponsesTransport {
+	if transport := defaultResponsesTransport.Load(); transport != nil {
+		return *transport
+	}
+	return OpenAIResponsesTransportHTTP
+}
+
+func SetUseResponsesWebsocketByDefault(useResponsesWebsocket bool) {
+	if useResponsesWebsocket {
+		SetDefaultOpenAIResponsesTransport(OpenAIResponsesTransportWebsocket)
+		return
+	}
+	SetDefaultOpenAIResponsesTransport(OpenAIResponsesTransportHTTP)
+}
+
+func GetUseResponsesWebsocketByDefault() bool {
+	return GetDefaultOpenAIResponsesTransport() == OpenAIResponsesTransportWebsocket
+}
+
 // SetDefaultOpenaiAPI set the default API to use for OpenAI LLM requests.
 // By default, we will use the responses API, but you can set this to use the
 // chat completions API instead.
@@ -107,4 +165,6 @@ func ClearOpenaiSettings() {
 	defaultOpenaiKey.Store(nil)
 	defaultOpenaiClient.Store(nil)
 	useResponsesByDefault.Store(true)
+	defaultTransport := OpenAIResponsesTransportHTTP
+	defaultResponsesTransport.Store(&defaultTransport)
 }

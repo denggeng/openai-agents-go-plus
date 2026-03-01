@@ -19,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +54,7 @@ type MCPServer interface {
 	ListTools(context.Context, *Agent) ([]*mcp.Tool, error)
 
 	// CallTool invokes a tool on the server.
-	CallTool(ctx context.Context, toolName string, arguments map[string]any) (*mcp.CallToolResult, error)
+	CallTool(ctx context.Context, toolName string, arguments map[string]any, meta map[string]any) (*mcp.CallToolResult, error)
 
 	// ListPrompts lists the prompts available on the server.
 	ListPrompts(ctx context.Context) (*mcp.ListPromptsResult, error)
@@ -86,6 +88,11 @@ type MCPServerWithClientSession struct {
 	maxRetryAttempts     int
 	retryBackoffBase     time.Duration
 	clientOptions        *mcp.ClientOptions
+	clientSessionTimeout time.Duration
+	needsApprovalPolicy  mcpNeedsApprovalPolicy
+	failureErrorFunction *ToolErrorFunction
+	failureErrorSet      bool
+	toolMetaResolver     MCPToolMetaResolver
 	cleanupHook          func()
 }
 
@@ -94,6 +101,10 @@ type MCPServerWithClientSessionParams struct {
 	Transport mcp.Transport
 	// Optional client options, including MCP message handlers.
 	ClientOptions *mcp.ClientOptions
+
+	// Optional per-request timeout used for MCP client session calls.
+	// Applies to ListTools/CallTool/ListPrompts/GetPrompt.
+	ClientSessionTimeout time.Duration
 
 	// Whether to cache the tools list. If `true`, the tools list will be
 	// cached and only fetched from the server once. If `false`, the tools list will be
@@ -118,6 +129,24 @@ type MCPServerWithClientSessionParams struct {
 
 	// Base delay for exponential backoff between retries.
 	RetryBackoffBase time.Duration
+
+	// Optional approval policy for tools in this MCP server.
+	// Supported forms:
+	// - bool
+	// - "always"/"never"
+	// - map[string]bool
+	// - map[string]string where values are "always"/"never"
+	// - MCPRequireApprovalObject
+	// - map[string]any using TS-style {always:{tool_names:[...]}, never:{tool_names:[...]}}
+	RequireApproval any
+
+	// Optional resolver for MCP request metadata (`_meta`) on tool calls.
+	ToolMetaResolver MCPToolMetaResolver
+
+	// Optional per-server override for MCP tool failure handling.
+	// Set FailureErrorFunctionSet=true with nil FailureErrorFunction to re-raise errors.
+	FailureErrorFunction    *ToolErrorFunction
+	FailureErrorFunctionSet bool
 }
 
 func NewMCPServerWithClientSession(params MCPServerWithClientSessionParams) *MCPServerWithClientSession {
@@ -132,6 +161,11 @@ func NewMCPServerWithClientSession(params MCPServerWithClientSessionParams) *MCP
 		maxRetryAttempts:     params.MaxRetryAttempts,
 		retryBackoffBase:     params.RetryBackoffBase,
 		clientOptions:        params.ClientOptions,
+		clientSessionTimeout: params.ClientSessionTimeout,
+		needsApprovalPolicy:  normalizeMCPNeedsApprovalPolicy(params.RequireApproval),
+		toolMetaResolver:     params.ToolMetaResolver,
+		failureErrorFunction: cloneToolErrorFunctionPointer(params.FailureErrorFunction),
+		failureErrorSet:      params.FailureErrorFunctionSet,
 	}
 }
 
@@ -196,7 +230,9 @@ func (s *MCPServerWithClientSession) ListTools(ctx context.Context, agent *Agent
 		var listToolsResults *mcp.ListToolsResult
 		err := s.runWithRetries(ctx, func() error {
 			var err error
-			listToolsResults, err = s.session.ListTools(ctx, nil)
+			attemptCtx, cancel := s.withSessionTimeout(ctx)
+			defer cancel()
+			listToolsResults, err = s.session.ListTools(attemptCtx, nil)
 			return err
 		})
 		if err != nil {
@@ -220,7 +256,12 @@ func (s *MCPServerWithClientSession) ListTools(ctx context.Context, agent *Agent
 	return filteredTools, nil
 }
 
-func (s *MCPServerWithClientSession) CallTool(ctx context.Context, toolName string, arguments map[string]any) (*mcp.CallToolResult, error) {
+func (s *MCPServerWithClientSession) CallTool(
+	ctx context.Context,
+	toolName string,
+	arguments map[string]any,
+	meta map[string]any,
+) (*mcp.CallToolResult, error) {
 	if s.session == nil {
 		return nil, NewUserError("server not initialized: make sure you call `Connect()` first")
 	}
@@ -230,10 +271,17 @@ func (s *MCPServerWithClientSession) CallTool(ctx context.Context, toolName stri
 	var result *mcp.CallToolResult
 	err := s.runWithRetries(ctx, func() error {
 		var err error
-		result, err = s.session.CallTool(ctx, &mcp.CallToolParams{
+		attemptCtx, cancel := s.withSessionTimeout(ctx)
+		defer cancel()
+
+		params := &mcp.CallToolParams{
 			Name:      toolName,
 			Arguments: arguments,
-		})
+		}
+		if len(meta) > 0 {
+			params.Meta = mcp.Meta(meta)
+		}
+		result, err = s.session.CallTool(attemptCtx, params)
 		return err
 	})
 	if err != nil {
@@ -320,18 +368,77 @@ func maxInt(a, b int) int {
 	return b
 }
 
+func (s *MCPServerWithClientSession) withSessionTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.clientSessionTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, s.clientSessionTimeout)
+}
+
+// CachedTools returns the latest cached tool list, if present.
+func (s *MCPServerWithClientSession) CachedTools() []*mcp.Tool {
+	if len(s.toolsList) == 0 {
+		return nil
+	}
+	return slices.Clone(s.toolsList)
+}
+
+// MCPNeedsApprovalForTool returns the approval policy for a specific MCP tool.
+func (s *MCPServerWithClientSession) MCPNeedsApprovalForTool(tool *mcp.Tool, agent *Agent) FunctionToolNeedsApproval {
+	return s.needsApprovalPolicy.forTool(tool, agent)
+}
+
+// MCPFailureErrorFunctionOverride reports whether this server overrides MCP failure handling.
+func (s *MCPServerWithClientSession) MCPFailureErrorFunctionOverride() (bool, *ToolErrorFunction) {
+	if !s.failureErrorSet {
+		return false, nil
+	}
+	if s.failureErrorFunction == nil {
+		var nilFn ToolErrorFunction
+		return true, &nilFn
+	}
+	return true, cloneToolErrorFunctionPointer(s.failureErrorFunction)
+}
+
+// MCPResolveToolMeta resolves `_meta` for an MCP tool call.
+func (s *MCPServerWithClientSession) MCPResolveToolMeta(
+	ctx context.Context,
+	metaContext MCPToolMetaContext,
+) (map[string]any, error) {
+	if s.toolMetaResolver == nil {
+		return nil, nil
+	}
+	// Resolver receives a deep copy so it cannot mutate invocation arguments.
+	metaContext.Arguments = deepCopyMap(metaContext.Arguments)
+	resolved, err := s.toolMetaResolver(ctx, metaContext)
+	if err != nil {
+		return nil, err
+	}
+	if resolved == nil {
+		return nil, nil
+	}
+	return deepCopyMap(resolved), nil
+}
+
 func (s *MCPServerWithClientSession) ListPrompts(ctx context.Context) (*mcp.ListPromptsResult, error) {
 	if s.session == nil {
 		return nil, NewUserError("server not initialized: make sure you call `Connect()` first")
 	}
-	return s.session.ListPrompts(ctx, nil)
+	attemptCtx, cancel := s.withSessionTimeout(ctx)
+	defer cancel()
+	return s.session.ListPrompts(attemptCtx, nil)
 }
 
 func (s *MCPServerWithClientSession) GetPrompt(ctx context.Context, name string, arguments map[string]string) (*mcp.GetPromptResult, error) {
 	if s.session == nil {
 		return nil, NewUserError("server not initialized: make sure you call `Connect()` first")
 	}
-	return s.session.GetPrompt(ctx, &mcp.GetPromptParams{
+	attemptCtx, cancel := s.withSessionTimeout(ctx)
+	defer cancel()
+	return s.session.GetPrompt(attemptCtx, &mcp.GetPromptParams{
 		Name:      name,
 		Arguments: arguments,
 	})
@@ -362,6 +469,9 @@ type MCPServerStdioParams struct {
 	// Optional client options, including MCP message handlers.
 	ClientOptions *mcp.ClientOptions
 
+	// Optional per-request timeout used for MCP client session calls.
+	ClientSessionTimeout time.Duration
+
 	// Whether to cache the tools list. If `true`, the tools list will be
 	// cached and only fetched from the server once. If `false`, the tools list will be
 	// fetched from the server on each call to `ListTools()`. The cache can be
@@ -388,6 +498,16 @@ type MCPServerStdioParams struct {
 
 	// Base delay for exponential backoff between retries.
 	RetryBackoffBase time.Duration
+
+	// Optional approval policy for MCP tools on this server.
+	RequireApproval any
+
+	// Optional resolver for MCP request metadata (`_meta`) on tool calls.
+	ToolMetaResolver MCPToolMetaResolver
+
+	// Optional per-server override for MCP tool failure handling.
+	FailureErrorFunction    *ToolErrorFunction
+	FailureErrorFunctionSet bool
 }
 
 // MCPServerStdio is an MCP server implementation that uses the stdio transport.
@@ -406,14 +526,19 @@ func NewMCPServerStdio(params MCPServerStdioParams) *MCPServerStdio {
 
 	return &MCPServerStdio{
 		MCPServerWithClientSession: NewMCPServerWithClientSession(MCPServerWithClientSessionParams{
-			Name:                 name,
-			Transport:            &mcp.CommandTransport{Command: params.Command},
-			CacheToolsList:       params.CacheToolsList,
-			ToolFilter:           params.ToolFilter,
-			UseStructuredContent: params.UseStructuredContent,
-			ClientOptions:        params.ClientOptions,
-			MaxRetryAttempts:     params.MaxRetryAttempts,
-			RetryBackoffBase:     params.RetryBackoffBase,
+			Name:                    name,
+			Transport:               &mcp.CommandTransport{Command: params.Command},
+			CacheToolsList:          params.CacheToolsList,
+			ToolFilter:              params.ToolFilter,
+			UseStructuredContent:    params.UseStructuredContent,
+			ClientOptions:           params.ClientOptions,
+			ClientSessionTimeout:    params.ClientSessionTimeout,
+			MaxRetryAttempts:        params.MaxRetryAttempts,
+			RetryBackoffBase:        params.RetryBackoffBase,
+			RequireApproval:         params.RequireApproval,
+			ToolMetaResolver:        params.ToolMetaResolver,
+			FailureErrorFunction:    params.FailureErrorFunction,
+			FailureErrorFunctionSet: params.FailureErrorFunctionSet,
 		}),
 	}
 }
@@ -424,6 +549,9 @@ type MCPServerSSEParams struct {
 
 	// Optional client options, including MCP message handlers.
 	ClientOptions *mcp.ClientOptions
+
+	// Optional per-request timeout used for MCP client session calls.
+	ClientSessionTimeout time.Duration
 
 	// Whether to cache the tools list. If `true`, the tools list will be
 	// cached and only fetched from the server once. If `false`, the tools list will be
@@ -451,6 +579,16 @@ type MCPServerSSEParams struct {
 
 	// Base delay for exponential backoff between retries.
 	RetryBackoffBase time.Duration
+
+	// Optional approval policy for MCP tools on this server.
+	RequireApproval any
+
+	// Optional resolver for MCP request metadata (`_meta`) on tool calls.
+	ToolMetaResolver MCPToolMetaResolver
+
+	// Optional per-server override for MCP tool failure handling.
+	FailureErrorFunction    *ToolErrorFunction
+	FailureErrorFunctionSet bool
 }
 
 // MCPServerSSE is an MCP server implementation that uses the HTTP with SSE transport.
@@ -486,14 +624,19 @@ func NewMCPServerSSE(params MCPServerSSEParams) *MCPServerSSE {
 	}
 	return &MCPServerSSE{
 		MCPServerWithClientSession: NewMCPServerWithClientSession(MCPServerWithClientSessionParams{
-			Name:                 name,
-			Transport:            transport,
-			CacheToolsList:       params.CacheToolsList,
-			ToolFilter:           params.ToolFilter,
-			UseStructuredContent: params.UseStructuredContent,
-			ClientOptions:        params.ClientOptions,
-			MaxRetryAttempts:     params.MaxRetryAttempts,
-			RetryBackoffBase:     params.RetryBackoffBase,
+			Name:                    name,
+			Transport:               transport,
+			CacheToolsList:          params.CacheToolsList,
+			ToolFilter:              params.ToolFilter,
+			UseStructuredContent:    params.UseStructuredContent,
+			ClientOptions:           params.ClientOptions,
+			ClientSessionTimeout:    params.ClientSessionTimeout,
+			MaxRetryAttempts:        params.MaxRetryAttempts,
+			RetryBackoffBase:        params.RetryBackoffBase,
+			RequireApproval:         params.RequireApproval,
+			ToolMetaResolver:        params.ToolMetaResolver,
+			FailureErrorFunction:    params.FailureErrorFunction,
+			FailureErrorFunctionSet: params.FailureErrorFunctionSet,
 		}),
 	}
 }
@@ -504,8 +647,29 @@ type MCPServerStreamableHTTPParams struct {
 	// Optional factory to build an HTTP client for Streamable HTTP transport.
 	HTTPClientFactory func() *http.Client
 
+	// Optional factory receiving resolved headers/timeout configuration.
+	HTTPClientFactoryWithConfig func(headers map[string]string, timeout time.Duration) *http.Client
+
+	// Optional static headers to attach to every Streamable HTTP request.
+	Headers map[string]string
+
+	// Optional request timeout for Streamable HTTP transport.
+	// Defaults to 5 seconds.
+	Timeout time.Duration
+
+	// Optional SSE read timeout setting for parity with Python configuration.
+	// Currently stored for observability; Go MCP transport does not expose a direct field.
+	SSEReadTimeout time.Duration
+
+	// Optional terminate-on-close behavior for parity with Python configuration.
+	// Currently stored for observability; Go MCP transport does not expose a direct field.
+	TerminateOnClose *bool
+
 	// Optional client options, including MCP message handlers.
 	ClientOptions *mcp.ClientOptions
+
+	// Optional per-request timeout used for MCP client session calls.
+	ClientSessionTimeout time.Duration
 
 	// Whether to cache the tools list. If `true`, the tools list will be
 	// cached and only fetched from the server once. If `false`, the tools list will be
@@ -533,6 +697,16 @@ type MCPServerStreamableHTTPParams struct {
 
 	// Base delay for exponential backoff between retries.
 	RetryBackoffBase time.Duration
+
+	// Optional approval policy for MCP tools on this server.
+	RequireApproval any
+
+	// Optional resolver for MCP request metadata (`_meta`) on tool calls.
+	ToolMetaResolver MCPToolMetaResolver
+
+	// Optional per-server override for MCP tool failure handling.
+	FailureErrorFunction    *ToolErrorFunction
+	FailureErrorFunctionSet bool
 }
 
 // MCPServerStreamableHTTP is an MCP server implementation that uses the Streamable HTTP transport.
@@ -540,12 +714,29 @@ type MCPServerStreamableHTTPParams struct {
 // See: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http
 type MCPServerStreamableHTTP struct {
 	*MCPServerWithClientSession
+	headers          map[string]string
+	timeout          time.Duration
+	sseReadTimeout   time.Duration
+	terminateOnClose bool
 }
 
 func NewMCPServerStreamableHTTP(params MCPServerStreamableHTTPParams) *MCPServerStreamableHTTP {
 	name := params.Name
 	if name == "" {
 		name = fmt.Sprintf("streamable_http: %s", params.URL)
+	}
+
+	timeout := params.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	sseReadTimeout := params.SSEReadTimeout
+	if sseReadTimeout <= 0 {
+		sseReadTimeout = 300 * time.Second
+	}
+	terminateOnClose := true
+	if params.TerminateOnClose != nil {
+		terminateOnClose = *params.TerminateOnClose
 	}
 
 	transport := &mcp.StreamableClientTransport{
@@ -558,19 +749,88 @@ func NewMCPServerStreamableHTTP(params MCPServerStreamableHTTPParams) *MCPServer
 			MaxRetries: params.TransportOpts.MaxRetries,
 		}
 	}
-	if transport.HTTPClient == nil && params.HTTPClientFactory != nil {
-		transport.HTTPClient = params.HTTPClientFactory()
+
+	if transport.HTTPClient == nil {
+		switch {
+		case params.HTTPClientFactoryWithConfig != nil:
+			transport.HTTPClient = params.HTTPClientFactoryWithConfig(maps.Clone(params.Headers), timeout)
+		case params.HTTPClientFactory != nil:
+			transport.HTTPClient = params.HTTPClientFactory()
+		default:
+			transport.HTTPClient = &http.Client{Timeout: timeout}
+		}
+	} else if timeout > 0 && transport.HTTPClient.Timeout == 0 {
+		transport.HTTPClient.Timeout = timeout
 	}
-	return &MCPServerStreamableHTTP{
+
+	if len(params.Headers) > 0 && params.HTTPClientFactoryWithConfig == nil {
+		transport.HTTPClient.Transport = &mcpHeaderTransport{
+			next:    transport.HTTPClient.Transport,
+			headers: maps.Clone(params.Headers),
+		}
+	}
+
+	server := &MCPServerStreamableHTTP{
 		MCPServerWithClientSession: NewMCPServerWithClientSession(MCPServerWithClientSessionParams{
-			Name:                 name,
-			Transport:            transport,
-			CacheToolsList:       params.CacheToolsList,
-			ToolFilter:           params.ToolFilter,
-			UseStructuredContent: params.UseStructuredContent,
-			ClientOptions:        params.ClientOptions,
-			MaxRetryAttempts:     params.MaxRetryAttempts,
-			RetryBackoffBase:     params.RetryBackoffBase,
+			Name:                    name,
+			Transport:               transport,
+			CacheToolsList:          params.CacheToolsList,
+			ToolFilter:              params.ToolFilter,
+			UseStructuredContent:    params.UseStructuredContent,
+			ClientOptions:           params.ClientOptions,
+			ClientSessionTimeout:    params.ClientSessionTimeout,
+			MaxRetryAttempts:        params.MaxRetryAttempts,
+			RetryBackoffBase:        params.RetryBackoffBase,
+			RequireApproval:         params.RequireApproval,
+			ToolMetaResolver:        params.ToolMetaResolver,
+			FailureErrorFunction:    params.FailureErrorFunction,
+			FailureErrorFunctionSet: params.FailureErrorFunctionSet,
 		}),
+		headers:          maps.Clone(params.Headers),
+		timeout:          timeout,
+		sseReadTimeout:   sseReadTimeout,
+		terminateOnClose: terminateOnClose,
 	}
+	return server
+}
+
+// Headers returns configured Streamable HTTP headers.
+func (s *MCPServerStreamableHTTP) Headers() map[string]string {
+	return maps.Clone(s.headers)
+}
+
+// Timeout returns configured Streamable HTTP request timeout.
+func (s *MCPServerStreamableHTTP) Timeout() time.Duration {
+	return s.timeout
+}
+
+// SSEReadTimeout returns configured Streamable HTTP SSE read timeout.
+func (s *MCPServerStreamableHTTP) SSEReadTimeout() time.Duration {
+	return s.sseReadTimeout
+}
+
+// TerminateOnClose reports configured Streamable HTTP terminate-on-close behavior.
+func (s *MCPServerStreamableHTTP) TerminateOnClose() bool {
+	return s.terminateOnClose
+}
+
+type mcpHeaderTransport struct {
+	next    http.RoundTripper
+	headers map[string]string
+}
+
+func (t *mcpHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	transport := t.next
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	clone := req.Clone(req.Context())
+	clone.Header = req.Header.Clone()
+	for key, value := range t.headers {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		clone.Header.Set(key, value)
+	}
+	return transport.RoundTrip(clone)
 }

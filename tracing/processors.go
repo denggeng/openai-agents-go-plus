@@ -22,12 +22,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/openai/openai-go/v3/packages/param"
 )
@@ -138,6 +142,181 @@ type exportableItem interface {
 	Export() map[string]any
 }
 
+const maxOpenAITracingFieldBytes = 100 * 1024
+
+func shouldSanitizeForOpenAITracingEndpoint(endpoint string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(endpoint))
+	return strings.Contains(normalized, "api.openai.com") && strings.Contains(normalized, "/v1/traces/ingest")
+}
+
+func sanitizeTracingItems(items []map[string]any) []map[string]any {
+	if len(items) == 0 {
+		return nil
+	}
+	sanitized := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		sanitized = append(sanitized, sanitizeTracingItem(item))
+	}
+	return sanitized
+}
+
+func sanitizeTracingItem(item map[string]any) map[string]any {
+	sanitizedAny := sanitizeTracingValue(item, make(map[uintptr]struct{}))
+	sanitized, ok := sanitizedAny.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	if spanData, ok := sanitized["span_data"].(map[string]any); ok {
+		if input, ok := spanData["input"]; ok {
+			spanData["input"] = truncateTracingField(input, maxOpenAITracingFieldBytes)
+		}
+		if output, ok := spanData["output"]; ok {
+			spanData["output"] = truncateTracingField(output, maxOpenAITracingFieldBytes)
+		}
+		if usage, ok := spanData["usage"].(map[string]any); ok {
+			spanData["usage"] = normalizeTracingUsage(usage)
+		}
+		sanitized["span_data"] = spanData
+	}
+	return sanitized
+}
+
+func normalizeTracingUsage(usage map[string]any) map[string]any {
+	if len(usage) == 0 {
+		return nil
+	}
+	out := make(map[string]any, 2)
+	details := make(map[string]any)
+	for key, value := range usage {
+		switch key {
+		case "input_tokens", "output_tokens":
+			out[key] = value
+		default:
+			details[key] = value
+		}
+	}
+	if len(details) > 0 {
+		out["details"] = details
+	}
+	return out
+}
+
+func truncateTracingField(value any, maxBytes int) any {
+	data, err := json.Marshal(value)
+	if err != nil || len(data) <= maxBytes {
+		return value
+	}
+	if asString, ok := value.(string); ok {
+		return truncateStringByBytes(asString, maxBytes)
+	}
+	preview := string(data[:maxBytes])
+	return map[string]any{
+		"truncated":      true,
+		"original_bytes": len(data),
+		"preview":        preview,
+	}
+}
+
+func truncateStringByBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+
+	byteLen := 0
+	end := 0
+	for i, r := range value {
+		runeLen := utf8.RuneLen(r)
+		if runeLen < 0 {
+			runeLen = 1
+		}
+		if byteLen+runeLen > maxBytes {
+			break
+		}
+		byteLen += runeLen
+		end = i + runeLen
+	}
+	return value[:end]
+}
+
+func sanitizeTracingValue(value any, seen map[uintptr]struct{}) any {
+	if value == nil {
+		return nil
+	}
+	v := reflect.ValueOf(value)
+	if !v.IsValid() {
+		return nil
+	}
+	switch v.Kind() {
+	case reflect.Float32, reflect.Float64:
+		f := v.Convert(reflect.TypeOf(float64(0))).Float()
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Sprintf("%v", f)
+		}
+		return value
+	case reflect.Map:
+		if v.IsNil() {
+			return nil
+		}
+		ptr := v.Pointer()
+		if ptr != 0 {
+			if _, exists := seen[ptr]; exists {
+				return "<cyclic>"
+			}
+			seen[ptr] = struct{}{}
+			defer delete(seen, ptr)
+		}
+		out := make(map[string]any, v.Len())
+		iter := v.MapRange()
+		for iter.Next() {
+			key := fmt.Sprint(iter.Key().Interface())
+			out[key] = sanitizeTracingValue(iter.Value().Interface(), seen)
+		}
+		return out
+	case reflect.Slice:
+		if v.IsNil() {
+			return nil
+		}
+		ptr := v.Pointer()
+		if ptr != 0 {
+			if _, exists := seen[ptr]; exists {
+				return "<cyclic>"
+			}
+			seen[ptr] = struct{}{}
+			defer delete(seen, ptr)
+		}
+		fallthrough
+	case reflect.Array:
+		out := make([]any, v.Len())
+		for i := 0; i < v.Len(); i++ {
+			out[i] = sanitizeTracingValue(v.Index(i).Interface(), seen)
+		}
+		return out
+	case reflect.Pointer:
+		if v.IsNil() {
+			return nil
+		}
+		ptr := v.Pointer()
+		if ptr != 0 {
+			if _, exists := seen[ptr]; exists {
+				return "<cyclic>"
+			}
+			seen[ptr] = struct{}{}
+			defer delete(seen, ptr)
+		}
+		return sanitizeTracingValue(v.Elem().Interface(), seen)
+	case reflect.Interface:
+		if v.IsNil() {
+			return nil
+		}
+		return sanitizeTracingValue(v.Elem().Interface(), seen)
+	default:
+		return value
+	}
+}
+
 func (b *BackendSpanExporter) Export(ctx context.Context, items []any) error {
 	if len(items) == 0 {
 		return nil
@@ -177,8 +356,12 @@ func (b *BackendSpanExporter) Export(ctx context.Context, items []any) error {
 			continue
 		}
 
+		payloadData := data
+		if shouldSanitizeForOpenAITracingEndpoint(b.Endpoint) {
+			payloadData = sanitizeTracingItems(payloadData)
+		}
 		payload := map[string]any{
-			"data": data,
+			"data": payloadData,
 		}
 
 		header := make(http.Header)
@@ -217,7 +400,7 @@ func (b *BackendSpanExporter) Export(ctx context.Context, items []any) error {
 				// If the response is successful, break out of the loop
 				if response.StatusCode < 300 {
 					_ = response.Body.Close()
-					Logger().Debug(fmt.Sprintf("Exported %d items", len(data)))
+					Logger().Debug(fmt.Sprintf("Exported %d items", len(payloadData)))
 					break
 				}
 

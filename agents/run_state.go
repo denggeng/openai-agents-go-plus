@@ -16,7 +16,10 @@ package agents
 
 import (
 	"fmt"
+	"maps"
 	"slices"
+	"sort"
+	"strings"
 
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
@@ -31,8 +34,18 @@ type toolApprovalStateRebuilder interface {
 	RebuildApprovals(map[string]ToolApprovalRecordState)
 }
 
-// CurrentRunStateSchemaVersion is the serialization schema version for RunState.
-const CurrentRunStateSchemaVersion = "1.0"
+const (
+	// CurrentRunStateSchemaVersion is the serialization schema version for RunState.
+	CurrentRunStateSchemaVersion = "1.4"
+)
+
+var supportedRunStateSchemaVersions = map[string]struct{}{
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+	"1.3": {},
+	"1.4": {},
+}
 
 // GuardrailFunctionOutputState is a JSON-friendly representation of GuardrailFunctionOutput.
 type GuardrailFunctionOutputState struct {
@@ -121,6 +134,7 @@ func NewRunStateFromResult(result RunResult, currentTurn uint64, maxTurns uint64
 		ConversationID:             result.ConversationID,
 		AutoPreviousResponseID:     result.AutoPreviousResponseID,
 		ReasoningItemIDPolicy:      result.reasoningItemIDPolicy,
+		Trace:                      cloneTraceState(result.Trace),
 		Interruptions:              slices.Clone(result.Interruptions),
 		InputGuardrailResults:      guardrailResultStatesFromInput(result.InputGuardrailResults),
 		OutputGuardrailResults:     guardrailResultStatesFromOutput(result.OutputGuardrailResults),
@@ -157,6 +171,7 @@ func NewRunStateFromStreaming(result *RunResultStreaming) RunState {
 		ConversationID:             result.ConversationID(),
 		AutoPreviousResponseID:     result.AutoPreviousResponseID(),
 		ReasoningItemIDPolicy:      result.reasoningItemIDPolicy,
+		Trace:                      TraceStateFromTrace(result.getTrace()),
 		Interruptions:              slices.Clone(result.Interruptions()),
 		InputGuardrailResults:      guardrailResultStatesFromInput(result.InputGuardrailResults()),
 		OutputGuardrailResults:     guardrailResultStatesFromOutput(result.OutputGuardrailResults()),
@@ -165,18 +180,39 @@ func NewRunStateFromStreaming(result *RunResultStreaming) RunState {
 	}
 }
 
+func cloneTraceState(state *TraceState) *TraceState {
+	if state == nil {
+		return nil
+	}
+	cloned := *state
+	cloned.Metadata = maps.Clone(state.Metadata)
+	return &cloned
+}
+
 // Validate checks schema compatibility.
 func (s RunState) Validate() error {
-	switch s.SchemaVersion {
-	case "", CurrentRunStateSchemaVersion:
+	switch version := s.SchemaVersion; version {
+	case "":
 		return nil
 	default:
+		if _, ok := supportedRunStateSchemaVersions[version]; ok {
+			return nil
+		}
 		return fmt.Errorf(
-			"unsupported run state schema version %q (supported: %q)",
+			"unsupported run state schema version %q (supported: %s)",
 			s.SchemaVersion,
-			CurrentRunStateSchemaVersion,
+			joinedSupportedRunStateSchemaVersions(),
 		)
 	}
+}
+
+func joinedSupportedRunStateSchemaVersions() string {
+	supported := make([]string, 0, len(supportedRunStateSchemaVersions))
+	for version := range supportedRunStateSchemaVersions {
+		supported = append(supported, version)
+	}
+	sort.Strings(supported)
+	return strings.Join(supported, ", ")
 }
 
 // ToJSON encodes RunState to JSON bytes.
@@ -294,6 +330,20 @@ func (s RunState) ResumeRunConfig(base RunConfig) RunConfig {
 	}
 	if cfg.ReasoningItemIDPolicy == "" && s.ReasoningItemIDPolicy != "" {
 		cfg.ReasoningItemIDPolicy = s.ReasoningItemIDPolicy
+	}
+	if s.Trace != nil {
+		if cfg.TraceID == "" && s.Trace.TraceID != "" {
+			cfg.TraceID = s.Trace.TraceID
+		}
+		if cfg.GroupID == "" && s.Trace.GroupID != "" {
+			cfg.GroupID = s.Trace.GroupID
+		}
+		if cfg.WorkflowName == "" && s.Trace.WorkflowName != "" {
+			cfg.WorkflowName = s.Trace.WorkflowName
+		}
+		if len(cfg.TraceMetadata) == 0 && len(s.Trace.Metadata) > 0 {
+			cfg.TraceMetadata = maps.Clone(s.Trace.Metadata)
+		}
 	}
 	return cfg
 }

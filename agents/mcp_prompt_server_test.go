@@ -65,7 +65,7 @@ func (s *fakeMCPPromptServer) ListTools(context.Context, *agents.Agent) ([]*mcp.
 	return nil, nil
 }
 
-func (s *fakeMCPPromptServer) CallTool(context.Context, string, map[string]any) (*mcp.CallToolResult, error) {
+func (s *fakeMCPPromptServer) CallTool(context.Context, string, map[string]any, map[string]any) (*mcp.CallToolResult, error) {
 	return nil, fmt.Errorf("fake server does not support tools")
 }
 

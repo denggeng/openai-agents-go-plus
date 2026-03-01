@@ -313,6 +313,7 @@ func (ri runImpl) ExecuteToolsAndSideEffects(
 			agent,
 			processedResponse.ComputerActions,
 			hooks,
+			contextWrapper,
 		)
 	}()
 	wg.Wait()
@@ -589,7 +590,12 @@ func (runImpl) ProcessModelResponse(
 		case FunctionTool:
 			functionMap[t.Name] = t
 		case ComputerTool:
-			computerTool = &t
+			toolCopy := t
+			computerTool = &toolCopy
+		case *ComputerTool:
+			if t != nil {
+				computerTool = t
+			}
 		case LocalShellTool:
 			localShellTool = &t
 		case ShellTool:
@@ -1643,11 +1649,23 @@ func (runImpl) ExecuteComputerActions(
 	agent *Agent,
 	actions []ToolRunComputerAction,
 	hooks RunHooks,
+	contextWrapper *RunContextWrapper[any],
 ) ([]RunItem, error) {
 	results := make([]RunItem, len(actions))
 
 	// Need to run these serially, because each action can affect the computer state
 	for i, action := range actions {
+		if contextWrapper != nil {
+			resolved, err := ResolveComputer(ctx, &action.ComputerTool, contextWrapper)
+			if err != nil {
+				return nil, err
+			}
+			action.ComputerTool.Computer = resolved
+		}
+		if action.ComputerTool.Computer == nil {
+			return nil, NewUserError("computer tool has no resolved computer")
+		}
+
 		var acknowledged []responses.ResponseInputItemComputerCallOutputAcknowledgedSafetyCheckParam
 		if len(action.ToolCall.PendingSafetyChecks) > 0 && action.ComputerTool.OnSafetyCheck != nil {
 			for _, check := range action.ToolCall.PendingSafetyChecks {
@@ -2092,11 +2110,25 @@ func (runImpl) checkForFinalOutputFromTools(
 }
 
 // ManageTraceCtx creates a trace only if there is no current trace, and manages the trace lifecycle around the given function.
-func ManageTraceCtx(ctx context.Context, params tracing.TraceParams, fn func(context.Context) error) error {
+func ManageTraceCtx(
+	ctx context.Context,
+	params tracing.TraceParams,
+	resumeState *RunState,
+	fn func(context.Context) error,
+) error {
 	if ct := tracing.GetCurrentTrace(ctx); ct != nil {
 		return fn(ctx)
 	}
-	return tracing.RunTrace(ctx, params, func(ctx context.Context, _ tracing.Trace) error {
+
+	params = applyResumeTraceDefaults(params, resumeState)
+	if reattached := resolveReattachedTrace(params, resumeState); reattached != nil {
+		return reattached.Run(ctx, func(ctx context.Context, _ tracing.Trace) error {
+			return fn(ctx)
+		})
+	}
+
+	return tracing.RunTrace(ctx, params, func(ctx context.Context, trace tracing.Trace) error {
+		markTraceIDStarted(trace.TraceID(), currentTracingAPIKeyHash())
 		return fn(ctx)
 	})
 }

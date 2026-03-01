@@ -86,3 +86,13 @@ type ModelProvider interface {
 	// GetModel returns a model by name.
 	GetModel(modelName string) (Model, error)
 }
+
+// ModelCloser is an optional lifecycle interface for models that hold resources.
+type ModelCloser interface {
+	Close() error
+}
+
+// ModelProviderCloser is an optional lifecycle interface for model providers.
+type ModelProviderCloser interface {
+	Aclose(context.Context) error
+}

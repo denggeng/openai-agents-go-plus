@@ -19,10 +19,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/stretchr/testify/assert"
@@ -477,4 +479,111 @@ func TestBackendSpanExporterUsesItemAPIKeys(t *testing.T) {
 	assert.Equal(t, "Bearer key-a", authByID["a"])
 	assert.Equal(t, "Bearer global-key", authByID["b"])
 	assert.Equal(t, "Bearer key-b", authByID["c"])
+}
+
+func TestBackendSpanExporterSanitizesOpenAITracingPayload(t *testing.T) {
+	rt := &capturingTransport{}
+	exporter := NewBackendSpanExporter(BackendSpanExporterParams{
+		APIKey:     "test_key",
+		Endpoint:   DefaultBackendSpanExporterEndpoint,
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	t.Cleanup(func() { exporter.Close() })
+
+	large := strings.Repeat("a", maxOpenAITracingFieldBytes+200)
+	items := []any{
+		apiKeyItem{
+			payload: map[string]any{
+				"object": "trace.span",
+				"span_data": map[string]any{
+					"input":  large,
+					"output": map[string]any{"body": large},
+					"usage": map[string]any{
+						"input_tokens":     10,
+						"output_tokens":    20,
+						"total_tokens":     30,
+						"reasoning_tokens": 5,
+					},
+					"score": math.NaN(),
+				},
+			},
+		},
+	}
+
+	require.NoError(t, exporter.Export(t.Context(), items))
+	require.Len(t, rt.bodies, 1)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(rt.bodies[0]), &payload))
+	data, ok := payload["data"].([]any)
+	require.True(t, ok)
+	require.Len(t, data, 1)
+
+	entry, ok := data[0].(map[string]any)
+	require.True(t, ok)
+	spanData, ok := entry["span_data"].(map[string]any)
+	require.True(t, ok)
+
+	inputValue, ok := spanData["input"].(string)
+	require.True(t, ok)
+	assert.LessOrEqual(t, len([]byte(inputValue)), maxOpenAITracingFieldBytes)
+
+	outputValue, ok := spanData["output"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, true, outputValue["truncated"])
+
+	usageValue, ok := spanData["usage"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, float64(10), usageValue["input_tokens"])
+	assert.Equal(t, float64(20), usageValue["output_tokens"])
+	details, ok := usageValue["details"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, float64(30), details["total_tokens"])
+
+	score, ok := spanData["score"].(string)
+	require.True(t, ok)
+	assert.Equal(t, "NaN", score)
+}
+
+func TestBackendSpanExporterDoesNotSanitizeNonOpenAIEndpoint(t *testing.T) {
+	rt := &capturingTransport{}
+	exporter := NewBackendSpanExporter(BackendSpanExporterParams{
+		APIKey:     "test_key",
+		Endpoint:   "https://example.com/v1/traces/ingest",
+		HTTPClient: &http.Client{Transport: rt},
+	})
+	t.Cleanup(func() { exporter.Close() })
+
+	items := []any{
+		apiKeyItem{
+			payload: map[string]any{
+				"span_data": map[string]any{
+					"score": math.NaN(),
+				},
+			},
+		},
+	}
+
+	err := exporter.Export(t.Context(), items)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "failed to JSON-marshal tracing payload")
+}
+
+func TestTruncateStringByBytesKeepsUTF8Boundary(t *testing.T) {
+	value := "🙂🙂🙂"
+	truncated := truncateStringByBytes(value, 5)
+	assert.Equal(t, "🙂", truncated)
+	assert.True(t, utf8.ValidString(truncated))
+}
+
+func TestTruncateStringByBytesHandlesNonPositiveLimit(t *testing.T) {
+	assert.Equal(t, "", truncateStringByBytes("hello", 0))
+	assert.Equal(t, "", truncateStringByBytes("hello", -1))
+}
+
+func BenchmarkTruncateStringByBytesLargeString(b *testing.B) {
+	value := strings.Repeat("🙂", 50_000)
+	for i := 0; i < b.N; i++ {
+		_ = truncateStringByBytes(value, maxOpenAITracingFieldBytes)
+	}
 }

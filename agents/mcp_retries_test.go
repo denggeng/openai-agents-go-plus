@@ -66,7 +66,7 @@ func TestMCPServerCallToolRetriesUntilSuccess(t *testing.T) {
 	})
 	server.session = session
 
-	_, err := server.CallTool(t.Context(), "tool", nil)
+	_, err := server.CallTool(t.Context(), "tool", nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 3, session.callAttempts)
 }
@@ -97,7 +97,7 @@ func TestMCPServerCallToolValidatesRequiredParameters(t *testing.T) {
 		},
 	}}
 
-	_, err := server.CallTool(t.Context(), "tool", map[string]any{})
+	_, err := server.CallTool(t.Context(), "tool", map[string]any{}, nil)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "missing required parameters")
 	assert.Equal(t, 0, session.callAttempts)
@@ -115,7 +115,7 @@ func TestMCPServerCallToolWithRequiredParametersCallsRemote(t *testing.T) {
 		},
 	}}
 
-	_, err := server.CallTool(t.Context(), "tool", map[string]any{"param_a": "value"})
+	_, err := server.CallTool(t.Context(), "tool", map[string]any{"param_a": "value"}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, session.callAttempts)
 }
@@ -126,7 +126,7 @@ func TestMCPServerCallToolSkipsValidationWhenToolMissing(t *testing.T) {
 	server.session = session
 	server.toolsList = []*mcp.Tool{{Name: "other_tool"}}
 
-	_, err := server.CallTool(t.Context(), "tool", map[string]any{})
+	_, err := server.CallTool(t.Context(), "tool", map[string]any{}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, session.callAttempts)
 }
@@ -140,7 +140,7 @@ func TestMCPServerCallToolSkipsValidationWhenRequiredAbsent(t *testing.T) {
 		InputSchema: &jsonschema.Schema{Type: "object"},
 	}}
 
-	_, err := server.CallTool(t.Context(), "tool", nil)
+	_, err := server.CallTool(t.Context(), "tool", nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, session.callAttempts)
 }
@@ -157,7 +157,7 @@ func TestMCPServerCallToolValidatesRequiredWhenArgsNil(t *testing.T) {
 		},
 	}}
 
-	_, err := server.CallTool(t.Context(), "tool", nil)
+	_, err := server.CallTool(t.Context(), "tool", nil, nil)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "missing required parameters")
 	assert.Equal(t, 0, session.callAttempts)
