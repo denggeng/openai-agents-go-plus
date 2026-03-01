@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/stretchr/testify/assert"
@@ -566,4 +567,23 @@ func TestBackendSpanExporterDoesNotSanitizeNonOpenAIEndpoint(t *testing.T) {
 	err := exporter.Export(t.Context(), items)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "failed to JSON-marshal tracing payload")
+}
+
+func TestTruncateStringByBytesKeepsUTF8Boundary(t *testing.T) {
+	value := "🙂🙂🙂"
+	truncated := truncateStringByBytes(value, 5)
+	assert.Equal(t, "🙂", truncated)
+	assert.True(t, utf8.ValidString(truncated))
+}
+
+func TestTruncateStringByBytesHandlesNonPositiveLimit(t *testing.T) {
+	assert.Equal(t, "", truncateStringByBytes("hello", 0))
+	assert.Equal(t, "", truncateStringByBytes("hello", -1))
+}
+
+func BenchmarkTruncateStringByBytesLargeString(b *testing.B) {
+	value := strings.Repeat("🙂", 50_000)
+	for i := 0; i < b.N; i++ {
+		_ = truncateStringByBytes(value, maxOpenAITracingFieldBytes)
+	}
 }

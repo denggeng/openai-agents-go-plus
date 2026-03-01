@@ -199,3 +199,40 @@ func TestResolveComputerFactoryMethodValueNoCacheCollision(t *testing.T) {
 	assert.Equal(t, "A", compAConcrete.label)
 	assert.Equal(t, "B", compBConcrete.label)
 }
+
+func TestRunnerReusesComputerFactoryInstanceAcrossTurnsForValueTool(t *testing.T) {
+	createCount := 0
+	computerTool := agents.ComputerTool{
+		ComputerFactory: func(context.Context, *agents.RunContextWrapper[any]) (computer.Computer, error) {
+			createCount++
+			return &lifecycleComputer{label: "shared"}, nil
+		},
+	}
+
+	noopTool := agents.FunctionTool{
+		Name:        "noop",
+		Description: "noop tool",
+		ParamsJSONSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		},
+		OnInvokeTool: func(context.Context, string) (any, error) {
+			return "ok", nil
+		},
+	}
+
+	model := agentstesting.NewFakeModel(false, nil)
+	model.AddMultipleTurnOutputs([]agentstesting.FakeModelTurnOutput{
+		{Value: []agents.TResponseOutputItem{agentstesting.GetFunctionToolCall("noop", "{}")}},
+		{Value: []agents.TResponseOutputItem{agentstesting.GetTextMessage("done")}},
+	})
+
+	agent := agents.New("ComputerAgent").
+		WithModelInstance(model).
+		WithTools(computerTool, noopTool)
+
+	result, err := agents.Run(t.Context(), agent, "hello")
+	require.NoError(t, err)
+	assert.Equal(t, "done", result.FinalOutput)
+	assert.Equal(t, 1, createCount)
+}

@@ -590,7 +590,12 @@ func (runImpl) ProcessModelResponse(
 		case FunctionTool:
 			functionMap[t.Name] = t
 		case ComputerTool:
-			computerTool = &t
+			toolCopy := t
+			computerTool = &toolCopy
+		case *ComputerTool:
+			if t != nil {
+				computerTool = t
+			}
 		case LocalShellTool:
 			localShellTool = &t
 		case ShellTool:

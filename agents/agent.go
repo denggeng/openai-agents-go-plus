@@ -276,8 +276,26 @@ func (a *Agent) GetMCPTools(ctx context.Context) ([]Tool, error) {
 	)
 }
 
+func normalizeToolForAgentStorage(tool Tool) Tool {
+	switch current := tool.(type) {
+	case ComputerTool:
+		toolCopy := current
+		return &toolCopy
+	default:
+		return tool
+	}
+}
+
+func (a *Agent) normalizeToolsForLifecycle() {
+	for i, tool := range a.Tools {
+		a.Tools[i] = normalizeToolForAgentStorage(tool)
+	}
+}
+
 // GetAllTools returns all agent tools, including MCP tools and function tools.
 func (a *Agent) GetAllTools(ctx context.Context) ([]Tool, error) {
+	a.normalizeToolsForLifecycle()
+
 	mcpTools, err := a.GetMCPTools(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get MCP tools: %w", err)

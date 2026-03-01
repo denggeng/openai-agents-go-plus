@@ -31,6 +31,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/openai/openai-go/v3/packages/param"
 )
@@ -206,11 +207,7 @@ func truncateTracingField(value any, maxBytes int) any {
 		return value
 	}
 	if asString, ok := value.(string); ok {
-		truncated := asString
-		for len(truncated) > 0 && len([]byte(truncated)) > maxBytes {
-			truncated = truncated[:len(truncated)-1]
-		}
-		return truncated
+		return truncateStringByBytes(asString, maxBytes)
 	}
 	preview := string(data[:maxBytes])
 	return map[string]any{
@@ -218,6 +215,30 @@ func truncateTracingField(value any, maxBytes int) any {
 		"original_bytes": len(data),
 		"preview":        preview,
 	}
+}
+
+func truncateStringByBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+
+	byteLen := 0
+	end := 0
+	for i, r := range value {
+		runeLen := utf8.RuneLen(r)
+		if runeLen < 0 {
+			runeLen = 1
+		}
+		if byteLen+runeLen > maxBytes {
+			break
+		}
+		byteLen += runeLen
+		end = i + runeLen
+	}
+	return value[:end]
 }
 
 func sanitizeTracingValue(value any, seen map[uintptr]struct{}) any {

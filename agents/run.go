@@ -1460,8 +1460,14 @@ func (r Runner) resolveComputerActionsOnResume(
 
 	var computerTool *ComputerTool
 	for _, tool := range allTools {
-		if t, ok := tool.(ComputerTool); ok {
-			computerTool = &t
+		switch t := tool.(type) {
+		case ComputerTool:
+			toolCopy := t
+			computerTool = &toolCopy
+		case *ComputerTool:
+			computerTool = t
+		}
+		if computerTool != nil {
 			break
 		}
 	}

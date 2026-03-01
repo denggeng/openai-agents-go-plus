@@ -483,8 +483,13 @@ func (conv responsesConverter) ConvertTools(ctx context.Context, ts []Tool, hand
 
 	var computerTools []ComputerTool
 	for _, tool := range ts {
-		if ct, ok := tool.(ComputerTool); ok {
+		switch ct := tool.(type) {
+		case ComputerTool:
 			computerTools = append(computerTools, ct)
+		case *ComputerTool:
+			if ct != nil {
+				computerTools = append(computerTools, *ct)
+			}
 		}
 	}
 	if len(computerTools) > 1 {
@@ -581,6 +586,11 @@ func (conv responsesConverter) convertTool(
 			},
 		}
 		includes = nil
+	case *ComputerTool:
+		if t == nil {
+			return nil, nil, NewUserError("computer tool is nil")
+		}
+		return conv.convertTool(ctx, *t)
 	case HostedMCPTool:
 		convertedTool = &responses.ToolUnionParam{
 			OfMcp: &t.ToolConfig,

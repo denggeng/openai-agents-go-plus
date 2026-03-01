@@ -107,13 +107,17 @@ func (a *Agent) WithModelSettings(settings modelsettings.ModelSettings) *Agent {
 
 // WithTools sets the list of tools available to the agent.
 func (a *Agent) WithTools(t ...Tool) *Agent {
-	a.Tools = append([]Tool{}, t...)
+	normalized := make([]Tool, 0, len(t))
+	for _, tool := range t {
+		normalized = append(normalized, normalizeToolForAgentStorage(tool))
+	}
+	a.Tools = normalized
 	return a
 }
 
 // AddTool appends a tool to the agent's tool list.
 func (a *Agent) AddTool(t Tool) *Agent {
-	a.Tools = append(a.Tools, t)
+	a.Tools = append(a.Tools, normalizeToolForAgentStorage(t))
 	return a
 }
 

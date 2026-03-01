@@ -182,12 +182,13 @@ func InitializeComputerTools(
 	for i, tool := range tools {
 		switch current := tool.(type) {
 		case ComputerTool:
-			resolved, err := ResolveComputer(ctx, &current, runContext)
+			toolCopy := current
+			resolved, err := ResolveComputer(ctx, &toolCopy, runContext)
 			if err != nil {
 				return err
 			}
-			current.Computer = resolved
-			tools[i] = current
+			toolCopy.Computer = resolved
+			tools[i] = &toolCopy
 		case *ComputerTool:
 			resolved, err := ResolveComputer(ctx, current, runContext)
 			if err != nil {
