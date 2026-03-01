@@ -201,6 +201,9 @@ func TestRunStateFromJSONRejectsUnsupportedSchemaVersion(t *testing.T) {
 	_, err := agents.RunStateFromJSONString(`{"$schemaVersion":"9.9"}`)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "unsupported run state schema version")
+	for _, version := range []string{"1.0", "1.1", "1.2", "1.3", "1.4"} {
+		assert.ErrorContains(t, err, version)
+	}
 }
 
 func TestRunStateRoundTripToolApprovals(t *testing.T) {

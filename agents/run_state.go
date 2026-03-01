@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sort"
+	"strings"
 
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
@@ -197,10 +199,20 @@ func (s RunState) Validate() error {
 			return nil
 		}
 		return fmt.Errorf(
-			"unsupported run state schema version %q (supported: 1.0, 1.1, 1.2, 1.3, 1.4)",
+			"unsupported run state schema version %q (supported: %s)",
 			s.SchemaVersion,
+			joinedSupportedRunStateSchemaVersions(),
 		)
 	}
+}
+
+func joinedSupportedRunStateSchemaVersions() string {
+	supported := make([]string, 0, len(supportedRunStateSchemaVersions))
+	for version := range supportedRunStateSchemaVersions {
+		supported = append(supported, version)
+	}
+	sort.Strings(supported)
+	return strings.Join(supported, ", ")
 }
 
 // ToJSON encodes RunState to JSON bytes.

@@ -22,6 +22,7 @@ import (
 	"maps"
 	"net/http"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -382,7 +383,7 @@ func (s *MCPServerWithClientSession) CachedTools() []*mcp.Tool {
 	if len(s.toolsList) == 0 {
 		return nil
 	}
-	return slicesClonePointers(s.toolsList)
+	return slices.Clone(s.toolsList)
 }
 
 // MCPNeedsApprovalForTool returns the approval policy for a specific MCP tool.
@@ -420,12 +421,6 @@ func (s *MCPServerWithClientSession) MCPResolveToolMeta(
 		return nil, nil
 	}
 	return deepCopyMap(resolved), nil
-}
-
-func slicesClonePointers[T any](values []*T) []*T {
-	out := make([]*T, len(values))
-	copy(out, values)
-	return out
 }
 
 func (s *MCPServerWithClientSession) ListPrompts(ctx context.Context) (*mcp.ListPromptsResult, error) {
