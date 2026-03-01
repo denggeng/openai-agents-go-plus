@@ -94,6 +94,24 @@ const (
 )
 
 func SetDefaultOpenAIResponsesTransport(transport OpenAIResponsesTransport) {
+	setDefaultResponsesTransport(transport)
+}
+
+func GetDefaultOpenAIResponsesTransport() OpenAIResponsesTransport {
+	return getDefaultResponsesTransport()
+}
+
+// SetDefaultOpenaiResponsesTransport is the backwards-compatible alias.
+func SetDefaultOpenaiResponsesTransport(transport OpenAIResponsesTransport) {
+	setDefaultResponsesTransport(transport)
+}
+
+// GetDefaultOpenaiResponsesTransport is the backwards-compatible alias.
+func GetDefaultOpenaiResponsesTransport() OpenAIResponsesTransport {
+	return getDefaultResponsesTransport()
+}
+
+func setDefaultResponsesTransport(transport OpenAIResponsesTransport) {
 	switch transport {
 	case OpenAIResponsesTransportHTTP, OpenAIResponsesTransportWebsocket:
 		transportCopy := transport
@@ -103,21 +121,11 @@ func SetDefaultOpenAIResponsesTransport(transport OpenAIResponsesTransport) {
 	}
 }
 
-func GetDefaultOpenAIResponsesTransport() OpenAIResponsesTransport {
+func getDefaultResponsesTransport() OpenAIResponsesTransport {
 	if transport := defaultResponsesTransport.Load(); transport != nil {
 		return *transport
 	}
 	return OpenAIResponsesTransportHTTP
-}
-
-// SetDefaultOpenaiResponsesTransport is the backwards-compatible alias.
-func SetDefaultOpenaiResponsesTransport(transport OpenAIResponsesTransport) {
-	SetDefaultOpenAIResponsesTransport(transport)
-}
-
-// GetDefaultOpenaiResponsesTransport is the backwards-compatible alias.
-func GetDefaultOpenaiResponsesTransport() OpenAIResponsesTransport {
-	return GetDefaultOpenAIResponsesTransport()
 }
 
 func SetUseResponsesWebsocketByDefault(useResponsesWebsocket bool) {
