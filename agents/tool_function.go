@@ -33,6 +33,15 @@ type FunctionTool struct {
 	// A description of the tool, as shown to the LLM.
 	Description string
 
+	// Optional namespace metadata for OpenAI Responses tool-search surfaces.
+	// Namespaced tools are serialized under a `type:"namespace"` wrapper and
+	// dispatched using a namespace-qualified lookup key.
+	Namespace string
+
+	// Shared namespace description used when this tool is grouped under a
+	// namespace wrapper on the OpenAI Responses API.
+	NamespaceDescription string
+
 	// The JSON schema for the tool's parameters.
 	ParamsJSONSchema map[string]any
 
@@ -85,6 +94,12 @@ type FunctionTool struct {
 
 func (t FunctionTool) ToolName() string {
 	return t.Name
+}
+
+// QualifiedName returns the namespace-qualified display name for the tool when
+// a namespace is configured.
+func (t FunctionTool) QualifiedName() string {
+	return toolTraceName(t.Name, t.Namespace)
 }
 
 func (t FunctionTool) isTool() {}

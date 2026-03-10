@@ -1014,7 +1014,16 @@ func assistantContentAsAnySlice(asst *openai.ChatCompletionAssistantMessageParam
 func (chatCmplConverter) ToolToOpenai(tool Tool) (*openai.ChatCompletionToolUnionParam, error) {
 	functionTool, ok := tool.(FunctionTool)
 	if !ok {
+		if pointer, isPointer := tool.(*FunctionTool); isPointer && pointer != nil {
+			functionTool = *pointer
+			ok = true
+		}
+	}
+	if !ok {
 		return nil, UserErrorf("hosted tools are not supported with the ChatCompletions API. Got tool %#v", tool)
+	}
+	if err := ensureFunctionToolSupportsResponsesOnlyFeatures(functionTool, "the ChatCompletions API"); err != nil {
+		return nil, err
 	}
 
 	var description param.Opt[string]

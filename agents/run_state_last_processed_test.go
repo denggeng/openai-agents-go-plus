@@ -63,6 +63,43 @@ func TestRunStateToJSONIncludesToolCallFromLastProcessedResponse(t *testing.T) {
 	assert.Equal(t, "test_tool", rawItem["name"])
 }
 
+func TestRunStatePreservesNamespacedFunctionToolCall(t *testing.T) {
+	var toolCall responses.ResponseFunctionToolCall
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"type":"function_call",
+		"name":"lookup_account",
+		"call_id":"call_1",
+		"arguments":"{}",
+		"namespace":"billing"
+	}`), &toolCall))
+
+	item := agents.ToolCallItem{
+		Agent:   &agents.Agent{Name: "agent"},
+		RawItem: agents.ResponseFunctionToolCall(toolCall),
+		Type:    "tool_call_item",
+	}
+	processed := agents.ProcessedResponse{NewItems: []agents.RunItem{item}}
+	state := agents.RunState{
+		SchemaVersion:         agents.CurrentRunStateSchemaVersion,
+		LastProcessedResponse: &processed,
+	}
+
+	raw, err := state.ToJSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"namespace":"billing"`)
+
+	restored, err := agents.RunStateFromJSON(raw)
+	require.NoError(t, err)
+	require.NotNil(t, restored.LastProcessedResponse)
+	require.Len(t, restored.LastProcessedResponse.NewItems, 1)
+
+	restoredItem, ok := restored.LastProcessedResponse.NewItems[0].(agents.ToolCallItem)
+	require.True(t, ok)
+	inputRaw, err := json.Marshal(restoredItem.ToInputItem())
+	require.NoError(t, err)
+	assert.Contains(t, string(inputRaw), `"namespace":"billing"`)
+}
+
 func TestRunStateToJSONDeduplicatesGeneratedAndLastProcessed(t *testing.T) {
 	toolCall := responses.ResponseFunctionToolCall{
 		Type:      constant.ValueOf[constant.FunctionCall](),

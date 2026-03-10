@@ -481,6 +481,10 @@ func (conv responsesConverter) ConvertTools(ctx context.Context, ts []Tool, hand
 	var convertedTools []responses.ToolUnionParam
 	var includes []responses.ResponseIncludable
 
+	if err := validateFunctionToolLookupConfiguration(ts); err != nil {
+		return nil, err
+	}
+
 	var computerTools []ComputerTool
 	for _, tool := range ts {
 		switch ct := tool.(type) {
@@ -496,7 +500,37 @@ func (conv responsesConverter) ConvertTools(ctx context.Context, ts []Tool, hand
 		return nil, UserErrorf("you can only provide one computer tool, got %d", len(computerTools))
 	}
 
+	namespaceIndexByName := make(map[string]int)
+	namespaceToolsByName := make(map[string][]map[string]any)
+	namespaceDescriptions := make(map[string]string)
+
 	for _, tool := range ts {
+		functionTool, ok := asFunctionTool(tool)
+		if ok && functionTool.Namespace != "" {
+			if _, exists := namespaceIndexByName[functionTool.Namespace]; exists {
+				expectedDescription := namespaceDescriptions[functionTool.Namespace]
+				if expectedDescription != functionTool.NamespaceDescription {
+					return nil, UserErrorf(
+						"all tools in namespace %q must share the same description",
+						functionTool.Namespace,
+					)
+				}
+				namespaceToolsByName[functionTool.Namespace] = append(
+					namespaceToolsByName[functionTool.Namespace],
+					functionToolResponsesPayload(functionTool),
+				)
+				continue
+			}
+
+			namespaceIndexByName[functionTool.Namespace] = len(convertedTools)
+			namespaceDescriptions[functionTool.Namespace] = functionTool.NamespaceDescription
+			namespaceToolsByName[functionTool.Namespace] = []map[string]any{
+				functionToolResponsesPayload(functionTool),
+			}
+			convertedTools = append(convertedTools, responses.ToolUnionParam{})
+			continue
+		}
+
 		convertedTool, include, err := conv.convertTool(ctx, tool)
 		if err != nil {
 			return nil, err
@@ -505,6 +539,18 @@ func (conv responsesConverter) ConvertTools(ctx context.Context, ts []Tool, hand
 		if include != nil {
 			includes = append(includes, *include)
 		}
+	}
+
+	for namespaceName, index := range namespaceIndexByName {
+		namespaceTool, err := responsesNamespaceToolParam(
+			namespaceName,
+			namespaceDescriptions[namespaceName],
+			namespaceToolsByName[namespaceName],
+		)
+		if err != nil {
+			return nil, err
+		}
+		convertedTools[index] = namespaceTool
 	}
 
 	for _, handoff := range handoffs {
@@ -537,6 +583,11 @@ func (conv responsesConverter) convertTool(
 			},
 		}
 		includes = nil
+	case *FunctionTool:
+		if t == nil {
+			return nil, nil, NewUserError("function tool is nil")
+		}
+		return conv.convertTool(ctx, *t)
 	case WebSearchTool:
 		convertedTool = &responses.ToolUnionParam{
 			OfWebSearch: &responses.WebSearchToolParam{
@@ -656,5 +707,33 @@ func (responsesConverter) convertHandoffTool(handoff Handoff) responses.ToolUnio
 			Description: param.NewOpt(handoff.ToolDescription),
 			Type:        constant.ValueOf[constant.Function](),
 		},
+	}
+}
+
+func responsesNamespaceToolParam(
+	name string,
+	description string,
+	tools []map[string]any,
+) (responses.ToolUnionParam, error) {
+	payload := map[string]any{
+		"type":        "namespace",
+		"name":        name,
+		"description": description,
+		"tools":       tools,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return responses.ToolUnionParam{}, fmt.Errorf("marshal namespace tool payload: %w", err)
+	}
+	return param.Override[responses.ToolUnionParam](json.RawMessage(data)), nil
+}
+
+func functionToolResponsesPayload(tool FunctionTool) map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        tool.Name,
+		"description": tool.Description,
+		"parameters":  materializeJSONMap(tool.ParamsJSONSchema),
+		"strict":      tool.StrictJSONSchema.Or(true),
 	}
 }

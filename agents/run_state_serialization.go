@@ -1132,6 +1132,12 @@ func serializeToolActionsFunction(actions []ToolRunFunction) []map[string]any {
 		meta := map[string]any{
 			"name": tool.Name,
 		}
+		if tool.Namespace != "" {
+			meta["namespace"] = tool.Namespace
+		}
+		if tool.NamespaceDescription != "" {
+			meta["namespaceDescription"] = tool.NamespaceDescription
+		}
 		if tool.Description != "" {
 			meta["description"] = tool.Description
 		}
@@ -1305,9 +1311,26 @@ func deserializeFunctionActions(entries []map[string]any) []ToolRunFunction {
 		if toolName == "" {
 			continue
 		}
-		tool := FunctionTool{Name: toolName, Description: description, ParamsJSONSchema: schema}
+		namespace := extractToolMetadataString(entry, "tool", "namespace")
+		namespaceDescription := extractToolMetadataString(entry, "tool", "namespaceDescription")
 		if call, ok := decodeRawToResponseFunctionToolCall(entry["tool_call"]); ok {
-			out = append(out, ToolRunFunction{ToolCall: call, FunctionTool: tool})
+			if namespace == "" {
+				namespace = functionToolCallNamespace(call)
+			}
+			tool := FunctionTool{
+				Name:                 toolName,
+				Description:          description,
+				Namespace:            namespace,
+				NamespaceDescription: namespaceDescription,
+				ParamsJSONSchema:     schema,
+			}
+			lookupKey, _ := getFunctionToolLookupKey(tool.Name, namespace)
+			out = append(out, ToolRunFunction{
+				ToolCall:      call,
+				FunctionTool:  tool,
+				ToolLookupKey: lookupKey,
+				ToolNamespace: namespace,
+			})
 		}
 	}
 	return out
@@ -1450,6 +1473,15 @@ func extractToolMetadata(entry map[string]any, key string) (string, string, map[
 		schema = rawSchema
 	}
 	return name, desc, schema
+}
+
+func extractToolMetadataString(entry map[string]any, key string, field string) string {
+	toolEntry, ok := entry[key].(map[string]any)
+	if !ok {
+		return ""
+	}
+	value, _ := toolEntry[field].(string)
+	return value
 }
 
 func extractSchemaVersionFromRaw(raw map[string]json.RawMessage) (string, error) {
@@ -1641,6 +1673,12 @@ func marshalToMapping(value any) (map[string]any, bool) {
 func normalizeJSONValue(value any) any {
 	if value == nil {
 		return nil
+	}
+	if raw := rawJSONFromValue(value); raw != "" {
+		var out any
+		if err := json.Unmarshal([]byte(raw), &out); err == nil {
+			return out
+		}
 	}
 	b, err := json.Marshal(value)
 	if err != nil {

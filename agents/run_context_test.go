@@ -15,9 +15,11 @@
 package agents_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/denggeng/openai-agents-go-plus/agents"
+	"github.com/openai/openai-go/v3/responses"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -140,6 +142,24 @@ func TestRunContextGetApprovalStatusFallbackToolName(t *testing.T) {
 	assert.True(t, approved)
 }
 
+func TestRunContextNamespacedApprovalDoesNotFallbackToBareToolDecision(t *testing.T) {
+	ctx := agents.NewRunContextWrapper[any](nil)
+	bareApproval := agents.ToolApprovalItem{
+		ToolName: "lookup_account",
+		RawItem:  namespacedApprovalRaw(t, "lookup_account", "call-bare", ""),
+	}
+	namespacedApproval := agents.ToolApprovalItem{
+		ToolName: "lookup_account",
+		RawItem:  namespacedApprovalRaw(t, "lookup_account", "call-billing", "billing"),
+	}
+
+	ctx.ApproveTool(bareApproval, true)
+
+	approved, known := ctx.GetApprovalStatus("lookup_account", "call-billing-2", &namespacedApproval)
+	assert.False(t, known)
+	assert.False(t, approved)
+}
+
 func TestRunContextSerializeAndRebuildApprovals(t *testing.T) {
 	ctx := agents.NewRunContextWrapper[any](nil)
 	ctx.ApproveTool(agents.ToolApprovalItem{
@@ -164,4 +184,27 @@ func TestRunContextSerializeAndRebuildApprovals(t *testing.T) {
 	approved, known = restored.IsToolApproved("tool_2", "any")
 	require.True(t, known)
 	assert.False(t, approved)
+}
+
+func namespacedApprovalRaw(
+	t *testing.T,
+	name string,
+	callID string,
+	namespace string,
+) responses.ResponseFunctionToolCall {
+	t.Helper()
+	payload := map[string]any{
+		"type":      "function_call",
+		"name":      name,
+		"call_id":   callID,
+		"arguments": "{}",
+	}
+	if namespace != "" {
+		payload["namespace"] = namespace
+	}
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	var toolCall responses.ResponseFunctionToolCall
+	require.NoError(t, json.Unmarshal(raw, &toolCall))
+	return toolCall
 }

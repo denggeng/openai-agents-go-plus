@@ -123,8 +123,10 @@ type ToolRunHandoff struct {
 }
 
 type ToolRunFunction struct {
-	ToolCall     ResponseFunctionToolCall
-	FunctionTool FunctionTool
+	ToolCall      ResponseFunctionToolCall
+	FunctionTool  FunctionTool
+	ToolLookupKey FunctionToolLookupKey
+	ToolNamespace string
 }
 
 type ToolRunComputerAction struct {
@@ -582,13 +584,14 @@ func (runImpl) ProcessModelResponse(
 		handoffMap[handoff.ToolName] = handoff
 	}
 
-	functionMap := make(map[string]FunctionTool)
+	functionMap, err := buildFunctionToolLookupMap(allTools)
+	if err != nil {
+		return nil, err
+	}
 	hostedMCPServerMap := make(map[string]HostedMCPTool)
 
 	for _, tool := range allTools {
 		switch t := tool.(type) {
-		case FunctionTool:
-			functionMap[t.Name] = t
 		case ComputerTool:
 			toolCopy := t
 			computerTool = &toolCopy
@@ -1047,38 +1050,56 @@ func (runImpl) ProcessModelResponse(
 				}
 			}
 
-			toolsUsed = append(toolsUsed, output.Name)
-
-			// Handoffs
-			if handoff, ok := handoffMap[output.Name]; ok {
-				items = append(items, HandoffCallItem{
-					Agent:   agent,
-					RawItem: output,
-					Type:    "handoff_call_item",
-				})
-				runHandoffs = append(runHandoffs, ToolRunHandoff{
-					Handoff:  handoff,
-					ToolCall: ResponseFunctionToolCall(output),
-				})
-			} else { // Regular function tool call
-				functionTool, ok := functionMap[output.Name]
-				if !ok {
-					AttachErrorToCurrentSpan(ctx, tracing.SpanError{
-						Message: "Tool not found",
-						Data:    map[string]any{"tool_name": output.Name},
-					})
-					return nil, ModelBehaviorErrorf("tool %s not found in agent %s", output.Name, agent.Name)
-				}
-				items = append(items, ToolCallItem{
-					Agent:   agent,
-					RawItem: ResponseFunctionToolCall(output),
-					Type:    "tool_call_item",
-				})
-				functions = append(functions, ToolRunFunction{
-					ToolCall:     ResponseFunctionToolCall(output),
-					FunctionTool: functionTool,
-				})
+			toolNamespace := functionToolCallNamespace(output)
+			displayToolName := toolTraceName(output.Name, toolNamespace)
+			if displayToolName == "" {
+				displayToolName = output.Name
 			}
+			toolsUsed = append(toolsUsed, displayToolName)
+
+			// Handoffs are only addressable by bare tool name.
+			if toolNamespace == "" {
+				if handoff, ok := handoffMap[output.Name]; ok {
+					items = append(items, HandoffCallItem{
+						Agent:   agent,
+						RawItem: output,
+						Type:    "handoff_call_item",
+					})
+					runHandoffs = append(runHandoffs, ToolRunHandoff{
+						Handoff:  handoff,
+						ToolCall: ResponseFunctionToolCall(output),
+					})
+					continue
+				}
+			}
+
+			lookupKey, ok := getFunctionToolLookupKey(output.Name, toolNamespace)
+			if !ok {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+					Message: "Tool not found",
+					Data:    map[string]any{"tool_name": displayToolName},
+				})
+				return nil, ModelBehaviorErrorf("tool %s not found in agent %s", displayToolName, agent.Name)
+			}
+			functionTool, ok := functionMap[lookupKey.ApprovalKey()]
+			if !ok {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+					Message: "Tool not found",
+					Data:    map[string]any{"tool_name": displayToolName},
+				})
+				return nil, ModelBehaviorErrorf("tool %s not found in agent %s", displayToolName, agent.Name)
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ResponseFunctionToolCall(output),
+				Type:    "tool_call_item",
+			})
+			functions = append(functions, ToolRunFunction{
+				ToolCall:      ResponseFunctionToolCall(output),
+				FunctionTool:  functionTool,
+				ToolLookupKey: lookupKey,
+				ToolNamespace: toolNamespace,
+			})
 		default:
 			Logger().Warn(fmt.Sprintf("unexpected output type, ignoring %q", outputUnion.Type))
 		}
@@ -1130,9 +1151,14 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 
 	runSingleTool := func(
 		ctx context.Context,
-		funcTool FunctionTool,
-		toolCall ResponseFunctionToolCall,
+		toolRun ToolRunFunction,
 	) (any, []ToolInputGuardrailResult, []ToolOutputGuardrailResult, []ToolApprovalItem, error) {
+		funcTool := toolRun.FunctionTool
+		toolCall := toolRun.ToolCall
+		toolDisplayName := toolTraceName(funcTool.Name, toolRun.ToolNamespace)
+		if toolDisplayName == "" {
+			toolDisplayName = funcTool.Name
+		}
 		var result any
 		var approvalItems []ToolApprovalItem
 		var toolInputGuardrailResults []ToolInputGuardrailResult
@@ -1146,13 +1172,15 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 		}
 
 		err := tracing.FunctionSpan(
-			ctx, tracing.FunctionSpanParams{Name: funcTool.Name},
+			ctx, tracing.FunctionSpanParams{Name: toolDisplayName},
 			func(ctx context.Context, spanFn tracing.Span) (err error) {
 				ctx = ContextWithToolData(ctx, toolCall.CallID, responses.ResponseFunctionToolCall(toolCall))
 				toolContextData := ToolContextData{
-					ToolName:      toolCall.Name,
-					ToolCallID:    toolCall.CallID,
-					ToolArguments: toolCall.Arguments,
+					ToolName:          toolCall.Name,
+					ToolNamespace:     toolRun.ToolNamespace,
+					QualifiedToolName: toolDisplayName,
+					ToolCallID:        toolCall.CallID,
+					ToolArguments:     toolCall.Arguments,
 				}
 				if traceIncludeSensitiveData {
 					spanFn.SpanData().(*tracing.FunctionSpanData).Input = toolCall.Arguments
@@ -1162,7 +1190,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 					if err != nil {
 						AttachErrorToCurrentSpan(ctx, tracing.SpanError{
 							Message: "Error running tool",
-							Data:    map[string]any{"tool_name": funcTool.Name, "error": err.Error()},
+							Data:    map[string]any{"tool_name": toolDisplayName, "error": err.Error()},
 						})
 					}
 				}()
@@ -1193,11 +1221,11 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 					}
 					if needsApproval {
 						pending := ToolApprovalItem{
-							ToolName: funcTool.Name,
+							ToolName: toolCall.Name,
 							RawItem:  responses.ResponseFunctionToolCall(toolCall),
 						}
-						approved, known := contextWrapper.GetApprovalStatus(
-							funcTool.Name,
+						approved, known := contextWrapper.getApprovalStatusForLookupKey(
+							toolRun.ToolLookupKey,
 							toolCall.CallID,
 							&pending,
 						)
@@ -1206,13 +1234,13 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 								contextWrapper,
 								config,
 								"function",
-								funcTool.Name,
+								toolDisplayName,
 								toolCall.CallID,
 							)
 							AttachErrorToCurrentSpan(ctx, tracing.SpanError{
 								Message: rejectionMessage,
 								Data: map[string]any{
-									"tool_name": funcTool.Name,
+									"tool_name": toolDisplayName,
 									"error": fmt.Sprintf(
 										"Tool execution for %s was manually rejected by user.",
 										toolCall.CallID,
@@ -1291,16 +1319,16 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 
 				if toolError != nil {
 					if errorFn == nil {
-						return fmt.Errorf("error running tool %s: %w", funcTool.Name, toolError)
+						return fmt.Errorf("error running tool %s: %w", toolDisplayName, toolError)
 					}
 					result, err = errorFn(ctx, toolError)
 					if err != nil {
-						return fmt.Errorf("error running tool %s: %w", funcTool.Name, err)
+						return fmt.Errorf("error running tool %s: %w", toolDisplayName, err)
 					}
 					AttachErrorToCurrentSpan(ctx, tracing.SpanError{
 						Message: "Error running tool (non-fatal)",
 						Data: map[string]any{
-							"tool_name": funcTool.Name,
+							"tool_name": toolDisplayName,
 							"error":     toolError.Error(),
 						},
 					})
@@ -1390,7 +1418,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 				perToolInputGuardrailResults[i],
 				perToolOutputGuardrailResults[i],
 				perToolApprovalItems[i],
-				resultErrors[i] = runSingleTool(ctx, toolRun.FunctionTool, toolRun.ToolCall)
+				resultErrors[i] = runSingleTool(ctx, toolRun)
 			if resultErrors[i] != nil {
 				cancel()
 			}

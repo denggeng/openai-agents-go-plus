@@ -16,6 +16,7 @@ package agents_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -258,6 +259,57 @@ func TestConvertToolsBasicTypesAndIncludes(t *testing.T) {
 		_, err = agents.ResponsesConverter().ConvertTools(t.Context(), []agents.Tool{compTool, compTool}, nil)
 		assert.ErrorAs(t, err, &agents.UserError{})
 	})
+}
+
+func TestConvertToolsGroupsNamespacedFunctionTools(t *testing.T) {
+	crmTools, err := agents.ToolNamespace(
+		"crm",
+		"CRM tools",
+		testFunctionTool("lookup_account", "Lookup account"),
+		testFunctionTool("update_account", "Update account"),
+	)
+	require.NoError(t, err)
+
+	converted, err := agents.ResponsesConverter().ConvertTools(
+		t.Context(),
+		[]agents.Tool{crmTools[0], crmTools[1], testFunctionTool("bare_tool", "Bare tool")},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Empty(t, converted.Includes)
+
+	raw, err := json.Marshal(converted.Tools)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[
+		{
+			"type": "namespace",
+			"name": "crm",
+			"description": "CRM tools",
+			"tools": [
+				{
+					"type": "function",
+					"name": "lookup_account",
+					"description": "Lookup account",
+					"parameters": {"type":"object","properties":{}},
+					"strict": true
+				},
+				{
+					"type": "function",
+					"name": "update_account",
+					"description": "Update account",
+					"parameters": {"type":"object","properties":{}},
+					"strict": true
+				}
+			]
+		},
+		{
+			"type": "function",
+			"name": "bare_tool",
+			"description": "Bare tool",
+			"parameters": {"type":"object","properties":{}},
+			"strict": true
+		}
+	]`, string(raw))
 }
 
 func TestConvertToolsIncludesHandoffs(t *testing.T) {
