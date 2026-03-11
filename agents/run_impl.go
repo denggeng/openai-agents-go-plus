@@ -1340,7 +1340,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					result, toolError = funcTool.OnInvokeTool(ctx, toolCall.Arguments)
+					result, toolError = funcTool.Invoke(ctx, toolCall.Arguments)
 					if toolError != nil && errorFn == nil {
 						cancel()
 					}
@@ -1353,6 +1353,10 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 				}
 
 				if toolError != nil {
+					var timeoutErr ToolTimeoutError
+					if errors.As(toolError, &timeoutErr) {
+						return toolError
+					}
 					if errorFn == nil {
 						return fmt.Errorf("error running tool %s: %w", toolDisplayName, toolError)
 					}

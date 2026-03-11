@@ -7,6 +7,7 @@ Compared against `.upstream/openai-agents-python` HEAD `e00f377a` (`0.11.1`). Fo
 - Responses tool-search parity is now aligned. Go has `ToolSearchTool`, `tool_namespace(...)`, `FunctionTool.DeferLoading`, collision-safe lookup keys, namespace-aware approvals/tool context, tool-search call/output run items, deferred hosted MCP payloads, prompt-managed opaque tool-search allowance, and OpenAI Responses conversion/validation in `agents/tool_search.go`, `agents/tool_identity.go`, `agents/run_context.go`, `agents/tool_context.go`, `agents/run_impl.go`, and `agents/models_openai_responses.go`.
 - RunState schema compatibility is aligned to current Python. Go now emits and accepts schema `1.5`, preserves namespaced function calls and tool-search run items through serialization/deserialization, and keeps resumed approval/dispatch data compatible with current Python snapshots.
 - Responses computer-tool wire-shape selection is aligned. `agents/models_openai_responses.go` now picks GA `computer` vs preview `computer_use_preview` from the effective request model/tool choice while keeping the runtime `ToolName()` compatibility alias.
+- Function-tool timeout semantics are aligned. `agents/tool_function_invoke.go`, `agents/run_impl.go`, and `agents/realtime/session.go` now enforce `timeout_seconds`, `timeout_behavior`, and `timeout_error_function`, including timeout-as-result vs raise-exception behavior in runner and realtime flows.
 
 ## P0 gaps
 - Responses websocket transport is scaffolded but still non-functional in Go.
@@ -16,9 +17,6 @@ Compared against `.upstream/openai-agents-python` HEAD `e00f377a` (`0.11.1`). Fo
   - Impact: `UseResponsesWebsocket` and `NewResponsesWebSocketSession()` are effectively unusable in Go.
 
 ## P1 gaps
-- Function-tool timeout semantics are missing.
-  - Python `FunctionTool` supports `timeout_seconds`, `timeout_behavior`, and `timeout_error_function`, enforced in `src/agents/tool.py::invoke_function_tool`.
-  - Go now exposes matching fields/types in `agents/tool_function.go` / `agents/errors.go`, but `agents/run_impl.go::runSingleTool` still invokes handlers without timeout enforcement or timeout-as-result handling.
 - MCP display metadata fallback/persistence lags.
   - Python `src/agents/_mcp_tool_metadata.py` falls back model-facing description to title when description is empty, stores `_mcp_title`, and persists `ToolCallItem.title` / `description` through run-state serialization.
   - Go `agents/mcp_util.go` uses only `tool.Description`, ignores title fallback, and `agents/run_state_serialization.go` has no `title` field for run items or interruptions.
@@ -28,5 +26,4 @@ Compared against `.upstream/openai-agents-python` HEAD `e00f377a` (`0.11.1`). Fo
 
 ## Suggested implementation order
 1. Replace the websocket stubs in `agents/models_openai_responses_ws.go` with a real transport; then harden `ResponsesWebSocketSession` around the live provider/model lifecycle.
-2. Add function-tool timeout semantics in `agents/run_impl.go`, including timeout-as-result vs raise-exception behavior and tests.
-3. Finish parity cleanup: MCP title/description fallback + RunState persistence, then stricter trace-reattach matching.
+2. Finish parity cleanup: MCP title/description fallback + RunState persistence, then stricter trace-reattach matching.

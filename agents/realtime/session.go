@@ -494,7 +494,7 @@ func (s *RealtimeSession) runFunctionToolCall(
 		Info:      s.eventInfo,
 	})
 
-	result, err := functionTool.OnInvokeTool(ctx, event.Arguments)
+	result, err := functionTool.Invoke(ctx, event.Arguments)
 	if err != nil {
 		errorFn := agents.DefaultToolErrorFunction
 		if functionTool.FailureErrorFunction != nil {
