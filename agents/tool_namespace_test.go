@@ -99,6 +99,66 @@ func TestProcessModelResponseDoesNotFallbackFromNamespacedCallToBareTool(t *test
 	require.ErrorContains(t, err, "billing.lookup_account")
 }
 
+func TestProcessModelResponseUsesInternalLookupKeyForDeferredTopLevelCalls(t *testing.T) {
+	visibleTool := testFunctionTool("lookup_account.lookup_account", "Visible dotted tool")
+	deferredTool := testFunctionTool("lookup_account", "Deferred tool")
+	deferredTool.DeferLoading = true
+
+	processed, err := agents.RunImpl().ProcessModelResponse(
+		t.Context(),
+		&agents.Agent{Name: "agent"},
+		[]agents.Tool{visibleTool, deferredTool},
+		agents.ModelResponse{
+			Output: []responses.ResponseOutputItemUnion{
+				mustFunctionCallOutputItem(t, "lookup_account", "call-deferred", "lookup_account"),
+			},
+		},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, processed.Functions, 1)
+
+	assert.Equal(t, "lookup_account", processed.Functions[0].FunctionTool.Name)
+	assert.True(t, processed.Functions[0].FunctionTool.DeferLoading)
+	assert.Equal(t, []string{"lookup_account"}, processed.ToolsUsed)
+
+	callItem, ok := processed.NewItems[0].(agents.ToolCallItem)
+	require.True(t, ok)
+	raw, err := json.Marshal(callItem.ToInputItem())
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"namespace":"lookup_account"`)
+}
+
+func TestProcessModelResponsePrefersVisibleTopLevelFunctionOverDeferredPeer(t *testing.T) {
+	visibleTool := testFunctionTool("lookup_account", "Visible tool")
+	deferredTool := testFunctionTool("lookup_account", "Deferred tool")
+	deferredTool.DeferLoading = true
+
+	processed, err := agents.RunImpl().ProcessModelResponse(
+		t.Context(),
+		&agents.Agent{Name: "agent"},
+		[]agents.Tool{visibleTool, deferredTool},
+		agents.ModelResponse{
+			Output: []responses.ResponseOutputItemUnion{
+				mustFunctionCallOutputItem(t, "lookup_account", "call-visible", ""),
+			},
+		},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, processed.Functions, 1)
+
+	assert.Equal(t, "Visible tool", processed.Functions[0].FunctionTool.Description)
+	assert.False(t, processed.Functions[0].FunctionTool.DeferLoading)
+	assert.Equal(t, []string{"lookup_account"}, processed.ToolsUsed)
+
+	callItem, ok := processed.NewItems[0].(agents.ToolCallItem)
+	require.True(t, ok)
+	raw, err := json.Marshal(callItem.ToInputItem())
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), `"namespace"`)
+}
+
 func testFunctionTool(name, description string) agents.FunctionTool {
 	return agents.FunctionTool{
 		Name:             name,

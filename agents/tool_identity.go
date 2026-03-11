@@ -24,16 +24,17 @@ import (
 type FunctionToolLookupKeyKind string
 
 const (
-	functionToolLookupKeyBare       FunctionToolLookupKeyKind = "bare"
-	functionToolLookupKeyNamespaced FunctionToolLookupKeyKind = "namespaced"
+	functionToolLookupKeyBare             FunctionToolLookupKeyKind = "bare"
+	functionToolLookupKeyNamespaced       FunctionToolLookupKeyKind = "namespaced"
+	functionToolLookupKeyDeferredTopLevel FunctionToolLookupKeyKind = "deferred_top_level"
 )
 
 // FunctionToolLookupKey identifies a function tool without colliding with other
 // tools that share the same public name.
 type FunctionToolLookupKey struct {
-	Kind      FunctionToolLookupKeyKind
-	Name      string
-	Namespace string
+	Kind      FunctionToolLookupKeyKind `json:"kind"`
+	Name      string                    `json:"name"`
+	Namespace string                    `json:"namespace,omitempty"`
 }
 
 func (k FunctionToolLookupKey) IsZero() bool {
@@ -44,6 +45,11 @@ func (k FunctionToolLookupKey) ApprovalKey() string {
 	switch k.Kind {
 	case functionToolLookupKeyNamespaced:
 		return toolQualifiedName(k.Name, k.Namespace)
+	case functionToolLookupKeyDeferredTopLevel:
+		if strings.TrimSpace(k.Name) == "" {
+			return ""
+		}
+		return "deferred_top_level:" + k.Name
 	case functionToolLookupKeyBare:
 		return k.Name
 	default:
@@ -101,6 +107,12 @@ func getFunctionToolLookupKey(toolName, namespace string) (FunctionToolLookupKey
 	if toolName == "" {
 		return FunctionToolLookupKey{}, false
 	}
+	if isReservedSyntheticToolNamespace(toolName, namespace) {
+		return FunctionToolLookupKey{
+			Kind: functionToolLookupKeyDeferredTopLevel,
+			Name: toolName,
+		}, true
+	}
 	if namespace != "" {
 		return FunctionToolLookupKey{
 			Kind:      functionToolLookupKeyNamespaced,
@@ -115,7 +127,25 @@ func getFunctionToolLookupKey(toolName, namespace string) (FunctionToolLookupKey
 }
 
 func getFunctionToolLookupKeyForTool(tool FunctionTool) (FunctionToolLookupKey, bool) {
+	if isDeferredTopLevelFunctionTool(tool) {
+		return FunctionToolLookupKey{
+			Kind: functionToolLookupKeyDeferredTopLevel,
+			Name: strings.TrimSpace(tool.Name),
+		}, strings.TrimSpace(tool.Name) != ""
+	}
 	return getFunctionToolLookupKey(tool.Name, tool.Namespace)
+}
+
+func getFunctionToolLookupKeysForTool(tool FunctionTool) []FunctionToolLookupKey {
+	lookupKey, ok := getFunctionToolLookupKeyForTool(tool)
+	if !ok {
+		return nil
+	}
+	return []FunctionToolLookupKey{lookupKey}
+}
+
+func isDeferredTopLevelFunctionTool(tool FunctionTool) bool {
+	return tool.DeferLoading && strings.TrimSpace(tool.Namespace) == "" && strings.TrimSpace(tool.Name) != ""
 }
 
 func validateFunctionToolNamespaceShape(toolName, namespace string) error {
@@ -141,6 +171,7 @@ func validateFunctionToolLookupConfiguration(tools []Tool) error {
 	}
 
 	qualifiedNameOwners := make(map[string]qualifiedOwner)
+	deferredTopLevelOwners := make(map[string]struct{})
 	for _, tool := range tools {
 		functionTool, ok := asFunctionTool(tool)
 		if !ok {
@@ -148,6 +179,16 @@ func validateFunctionToolLookupConfiguration(tools []Tool) error {
 		}
 		if err := validateFunctionToolNamespaceShape(functionTool.Name, functionTool.Namespace); err != nil {
 			return err
+		}
+		if isDeferredTopLevelFunctionTool(functionTool) {
+			deferredName := strings.TrimSpace(functionTool.Name)
+			if _, exists := deferredTopLevelOwners[deferredName]; exists {
+				return UserErrorf(
+					"Ambiguous function tool configuration: the deferred top-level tool name `%s` is used by multiple tools. Rename one of the deferred-loading top-level function tools to avoid ambiguous dispatch.",
+					deferredName,
+				)
+			}
+			deferredTopLevelOwners[deferredName] = struct{}{}
 		}
 
 		qualifiedName := toolQualifiedName(functionTool.Name, functionTool.Namespace)
@@ -185,17 +226,22 @@ func buildFunctionToolLookupMap(tools []Tool) (map[string]FunctionTool, error) {
 		if !ok {
 			continue
 		}
-		lookupKey, ok := getFunctionToolLookupKeyForTool(functionTool)
-		if !ok {
-			continue
+		for _, lookupKey := range getFunctionToolLookupKeysForTool(functionTool) {
+			out[lookupKey.ApprovalKey()] = functionTool
 		}
-		out[lookupKey.ApprovalKey()] = functionTool
 	}
 	return out, nil
 }
 
 func ensureFunctionToolSupportsResponsesOnlyFeatures(tool FunctionTool, backendName string) error {
-	if strings.TrimSpace(tool.Namespace) == "" {
+	unsupportedFeatures := make([]string, 0, 2)
+	if strings.TrimSpace(tool.Namespace) != "" {
+		unsupportedFeatures = append(unsupportedFeatures, "tool_namespace()")
+	}
+	if tool.DeferLoading {
+		unsupportedFeatures = append(unsupportedFeatures, "defer_loading=True")
+	}
+	if len(unsupportedFeatures) == 0 {
 		return nil
 	}
 	toolName := tool.QualifiedName()
@@ -203,7 +249,8 @@ func ensureFunctionToolSupportsResponsesOnlyFeatures(tool FunctionTool, backendN
 		toolName = tool.Name
 	}
 	return UserErrorf(
-		"The following function-tool features are only supported with OpenAI Responses models: tool_namespace(). Tool `%s` cannot be used with %s.",
+		"The following function-tool features are only supported with OpenAI Responses models: %s. Tool `%s` cannot be used with %s.",
+		strings.Join(unsupportedFeatures, ", "),
 		toolName,
 		backendName,
 	)

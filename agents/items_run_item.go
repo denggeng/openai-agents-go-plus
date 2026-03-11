@@ -48,6 +48,66 @@ func (item MessageOutputItem) ToInputItem() TResponseInputItem {
 	return openaitypes.ResponseInputItemUnionParamFromResponseOutputMessage(item.RawItem)
 }
 
+type ToolSearchCallRawItem map[string]any
+
+type ToolSearchOutputRawItem map[string]any
+
+// ToolSearchCallItem represents a Responses API tool search request emitted by the model.
+type ToolSearchCallItem struct {
+	// The agent whose run caused this item to be generated.
+	Agent *Agent
+
+	// The raw tool_search call payload.
+	RawItem ToolSearchCallRawItem
+
+	// Always `tool_search_call_item`.
+	Type string
+}
+
+func (ToolSearchCallItem) isRunItem() {}
+
+func (item ToolSearchCallItem) ToInputItem() TResponseInputItem {
+	return toolSearchInputItemFromRawItem(item.RawItem)
+}
+
+// ToolSearchOutputItem represents the output of a Responses API tool search.
+type ToolSearchOutputItem struct {
+	// The agent whose run caused this item to be generated.
+	Agent *Agent
+
+	// The raw tool_search output payload.
+	RawItem ToolSearchOutputRawItem
+
+	// Always `tool_search_output_item`.
+	Type string
+}
+
+func (ToolSearchOutputItem) isRunItem() {}
+
+func (item ToolSearchOutputItem) ToInputItem() TResponseInputItem {
+	return toolSearchInputItemFromRawItem(item.RawItem)
+}
+
+func toolSearchInputItemFromRawItem(raw map[string]any) TResponseInputItem {
+	if len(raw) == 0 {
+		return TResponseInputItem{}
+	}
+
+	payload := make(map[string]any, len(raw))
+	for key, value := range raw {
+		if key == "created_by" {
+			continue
+		}
+		payload[key] = value
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return TResponseInputItem{}
+	}
+	return param.Override[responses.ResponseInputItemUnionParam](json.RawMessage(data))
+}
+
 // HandoffCallItem represents a tool call for a handoff from one agent to another.
 type HandoffCallItem struct {
 	// The agent whose run caused this item to be generated.

@@ -100,6 +100,62 @@ func TestRunStatePreservesNamespacedFunctionToolCall(t *testing.T) {
 	assert.Contains(t, string(inputRaw), `"namespace":"billing"`)
 }
 
+func TestRunStatePreservesToolSearchRunItems(t *testing.T) {
+	callItem := agents.ToolSearchCallItem{
+		Agent: &agents.Agent{Name: "agent"},
+		RawItem: agents.ToolSearchCallRawItem{
+			"id":         "tsc_1",
+			"type":       "tool_search_call",
+			"execution":  "server",
+			"status":     "completed",
+			"created_by": "server",
+			"arguments": map[string]any{
+				"query": "profile",
+			},
+		},
+		Type: "tool_search_call_item",
+	}
+	outputItem := agents.ToolSearchOutputItem{
+		Agent: &agents.Agent{Name: "agent"},
+		RawItem: agents.ToolSearchOutputRawItem{
+			"id":         "tso_1",
+			"type":       "tool_search_output",
+			"execution":  "server",
+			"status":     "completed",
+			"created_by": "server",
+			"tools":      []map[string]any{{"type": "function", "name": "lookup_account"}},
+		},
+		Type: "tool_search_output_item",
+	}
+	processed := agents.ProcessedResponse{
+		NewItems: []agents.RunItem{callItem, outputItem},
+	}
+	state := agents.RunState{
+		SchemaVersion:         agents.CurrentRunStateSchemaVersion,
+		LastProcessedResponse: &processed,
+	}
+
+	raw, err := state.ToJSON()
+	require.NoError(t, err)
+
+	restored, err := agents.RunStateFromJSON(raw)
+	require.NoError(t, err)
+	require.NotNil(t, restored.LastProcessedResponse)
+	require.Len(t, restored.LastProcessedResponse.NewItems, 2)
+
+	restoredCall, ok := restored.LastProcessedResponse.NewItems[0].(agents.ToolSearchCallItem)
+	require.True(t, ok)
+	inputRaw, err := json.Marshal(restoredCall.ToInputItem())
+	require.NoError(t, err)
+	assert.NotContains(t, string(inputRaw), `"created_by"`)
+
+	restoredOutput, ok := restored.LastProcessedResponse.NewItems[1].(agents.ToolSearchOutputItem)
+	require.True(t, ok)
+	outputRaw, err := json.Marshal(restoredOutput.ToInputItem())
+	require.NoError(t, err)
+	assert.NotContains(t, string(outputRaw), `"created_by"`)
+}
+
 func TestRunStateToJSONDeduplicatesGeneratedAndLastProcessed(t *testing.T) {
 	toolCall := responses.ResponseFunctionToolCall{
 		Type:      constant.ValueOf[constant.FunctionCall](),

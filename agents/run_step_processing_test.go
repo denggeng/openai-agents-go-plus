@@ -958,6 +958,93 @@ func TestProcessModelResponseHandlesCompactionItem(t *testing.T) {
 	assert.False(t, hasCreatedBy)
 }
 
+func TestProcessModelResponseClassifiesToolSearchItems(t *testing.T) {
+	agent := &Agent{Name: "tool-search-agent"}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustOutputItem(t, map[string]any{
+				"id":        "tsc_123",
+				"type":      "tool_search_call",
+				"arguments": map[string]any{"paths": []string{"crm"}, "query": "profile"},
+				"execution": "server",
+				"status":    "completed",
+			}),
+			mustOutputItem(t, map[string]any{
+				"id":         "tso_123",
+				"type":       "tool_search_output",
+				"execution":  "server",
+				"status":     "completed",
+				"created_by": "server",
+				"tools": []map[string]any{
+					{
+						"type":        "function",
+						"name":        "get_customer_profile",
+						"description": "Fetch a CRM customer profile.",
+						"parameters": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"customer_id": map[string]any{"type": "string"},
+							},
+							"required": []string{"customer_id"},
+						},
+						"defer_loading": true,
+					},
+				},
+			}),
+		},
+		Usage: usage.NewUsage(),
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, processed.NewItems, 2)
+
+	_, ok := processed.NewItems[0].(ToolSearchCallItem)
+	require.True(t, ok)
+	outputItem, ok := processed.NewItems[1].(ToolSearchOutputItem)
+	require.True(t, ok)
+	assert.Equal(t, []string{"tool_search", "tool_search"}, processed.ToolsUsed)
+
+	inputRaw, err := json.Marshal(outputItem.ToInputItem())
+	require.NoError(t, err)
+	assert.NotContains(t, string(inputRaw), `"created_by"`)
+}
+
+func TestProcessModelResponseRejectsClientExecutedToolSearchCall(t *testing.T) {
+	agent := &Agent{Name: "tool-search-agent"}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustOutputItem(t, map[string]any{
+				"id":        "tsc_client",
+				"type":      "tool_search_call",
+				"arguments": map[string]any{"query": "profile"},
+				"execution": "client",
+				"status":    "completed",
+			}),
+		},
+		Usage: usage.NewUsage(),
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	_, err = RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.ErrorContains(t, err, "Client-executed tool_search calls are not supported")
+}
+
 type noopApplyPatchEditor struct{}
 
 func (noopApplyPatchEditor) CreateFile(ApplyPatchOperation) (any, error) { return nil, nil }

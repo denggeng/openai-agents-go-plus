@@ -589,6 +589,20 @@ func runItemToState(item RunItem) (RunStateRunItemState, bool) {
 			return RunStateRunItemState{}, false
 		}
 		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+	case ToolSearchCallItem:
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+	case *ToolSearchCallItem:
+		if v == nil {
+			return RunStateRunItemState{}, false
+		}
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+	case ToolSearchOutputItem:
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+	case *ToolSearchOutputItem:
+		if v == nil {
+			return RunStateRunItemState{}, false
+		}
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
 	case ToolCallOutputItem:
 		return runItemStateFrom(v.Agent, v.RawItem, v.Type, v.Output, nil, nil, "", ""), true
 	case *ToolCallOutputItem:
@@ -703,6 +717,18 @@ func runItemFromState(state RunStateRunItemState) (RunItem, bool) {
 			return nil, false
 		}
 		return ToolCallItem{Agent: agent, RawItem: raw, Type: state.Type}, true
+	case "tool_search_call_item":
+		raw, ok := decodeRawToToolSearchRawItem(state.RawItem, "tool_search_call")
+		if !ok {
+			return nil, false
+		}
+		return ToolSearchCallItem{Agent: agent, RawItem: ToolSearchCallRawItem(raw), Type: state.Type}, true
+	case "tool_search_output_item":
+		raw, ok := decodeRawToToolSearchRawItem(state.RawItem, "tool_search_output")
+		if !ok {
+			return nil, false
+		}
+		return ToolSearchOutputItem{Agent: agent, RawItem: ToolSearchOutputRawItem(raw), Type: state.Type}, true
 	case "tool_call_output_item":
 		raw, ok := decodeToolCallOutputRaw(state.RawItem)
 		if !ok {
@@ -867,6 +893,17 @@ func decodeRawToResponseInputItemUnion(raw any) (responses.ResponseInputItemUnio
 		return responses.ResponseInputItemUnionParam{}, false
 	}
 	return out, true
+}
+
+func decodeRawToToolSearchRawItem(raw any, expectedType string) (map[string]any, bool) {
+	payload, ok := coerceToMap(raw)
+	if !ok || payload == nil {
+		return nil, false
+	}
+	if rawType := stringFieldFromRaw(payload, "type"); rawType != "" && rawType != expectedType {
+		return nil, false
+	}
+	return payload, true
 }
 
 func decodeRawToStruct(raw any, out any) bool {

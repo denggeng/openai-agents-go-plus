@@ -689,6 +689,28 @@ func (runImpl) ProcessModelResponse(
 				RawItem: CompactionItemRawItem(rawItem),
 				Type:    "compaction_item",
 			})
+		case "tool_search_call":
+			rawItem := outputItemUnionRawMap(outputUnion)
+			if execution, _ := rawItem["execution"].(string); execution == string(ToolSearchExecutionClient) {
+				return nil, NewModelBehaviorError(
+					"Client-executed tool_search calls are not supported by the standard agent runner. " +
+						"Handle the tool_search_call yourself and return a matching tool_search_output item with the same call_id.",
+				)
+			}
+			items = append(items, ToolSearchCallItem{
+				Agent:   agent,
+				RawItem: ToolSearchCallRawItem(rawItem),
+				Type:    "tool_search_call_item",
+			})
+			toolsUsed = append(toolsUsed, "tool_search")
+		case "tool_search_output":
+			rawItem := outputItemUnionRawMap(outputUnion)
+			items = append(items, ToolSearchOutputItem{
+				Agent:   agent,
+				RawItem: ToolSearchOutputRawItem(rawItem),
+				Type:    "tool_search_output_item",
+			})
+			toolsUsed = append(toolsUsed, "tool_search")
 		case "computer_call":
 			output := responses.ResponseComputerToolCall{
 				ID:                  outputUnion.ID,
@@ -1128,6 +1150,19 @@ type FunctionToolResult struct {
 
 	// The run item that was produced as a result of the tool call.
 	RunItem RunItem
+}
+
+func outputItemUnionRawMap(outputUnion responses.ResponseOutputItemUnion) map[string]any {
+	if outputUnion.RawJSON() != "" {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(outputUnion.RawJSON()), &payload); err == nil && payload != nil {
+			return payload
+		}
+	}
+	if payload, ok := coerceToMap(outputUnion); ok && payload != nil {
+		return payload
+	}
+	return map[string]any{"type": outputUnion.Type}
 }
 
 func (ri runImpl) ExecuteFunctionToolCalls(

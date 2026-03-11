@@ -36,7 +36,7 @@ type toolApprovalStateRebuilder interface {
 
 const (
 	// CurrentRunStateSchemaVersion is the serialization schema version for RunState.
-	CurrentRunStateSchemaVersion = "1.4"
+	CurrentRunStateSchemaVersion = "1.5"
 )
 
 var supportedRunStateSchemaVersions = map[string]struct{}{
@@ -45,6 +45,7 @@ var supportedRunStateSchemaVersions = map[string]struct{}{
 	"1.2": {},
 	"1.3": {},
 	"1.4": {},
+	"1.5": {},
 }
 
 // GuardrailFunctionOutputState is a JSON-friendly representation of GuardrailFunctionOutput.

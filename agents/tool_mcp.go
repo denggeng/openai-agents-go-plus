@@ -41,6 +41,9 @@ type HostedMCPTool struct {
 	// The MCP tool config, which includes the server URL and other settings.
 	ToolConfig responses.ToolMcpParam
 
+	// Whether this hosted MCP surface should be loaded lazily through ToolSearchTool().
+	DeferLoading bool
+
 	// An optional function that will be called if approval is requested for an MCP tool.
 	// If not provided, you will need to manually add approvals/rejections to the input and call
 	// `Run(...)` again.
