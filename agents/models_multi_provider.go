@@ -23,6 +23,20 @@ import (
 	"github.com/openai/openai-go/v3/packages/param"
 )
 
+type MultiProviderOpenAIPrefixMode string
+
+const (
+	MultiProviderOpenAIPrefixModeAlias   MultiProviderOpenAIPrefixMode = "alias"
+	MultiProviderOpenAIPrefixModeModelID MultiProviderOpenAIPrefixMode = "model_id"
+)
+
+type MultiProviderUnknownPrefixMode string
+
+const (
+	MultiProviderUnknownPrefixModeError   MultiProviderUnknownPrefixMode = "error"
+	MultiProviderUnknownPrefixModeModelID MultiProviderUnknownPrefixMode = "model_id"
+)
+
 // MultiProvider is a ModelProvider that maps to a Model based on the prefix of the model name.
 // By default, the mapping is:
 // - "openai/" prefix or no prefix -> OpenAIProvider. e.g. "openai/gpt-4.1", "gpt-4.1"
@@ -33,6 +47,8 @@ type MultiProvider struct {
 	ProviderMap       *MultiProviderMap
 	OpenAIProvider    *OpenAIProvider
 	fallbackProviders map[string]ModelProvider
+	openaiPrefixMode  MultiProviderOpenAIPrefixMode
+	unknownPrefixMode MultiProviderUnknownPrefixMode
 }
 
 type NewMultiProviderParams struct {
@@ -67,10 +83,29 @@ type NewMultiProviderParams struct {
 
 	// Whether to use websocket transport for OpenAI responses API.
 	OpenaiUseResponsesWebsocket param.Opt[bool]
+
+	// Controls how `openai/<model>` strings are interpreted.
+	// `alias` strips the prefix before delegating to OpenAIProvider.
+	// `model_id` preserves the full model id for OpenAI-compatible endpoints.
+	OpenaiPrefixMode MultiProviderOpenAIPrefixMode
+
+	// Controls how unknown `<prefix>/<model>` strings are handled.
+	// `error` preserves fail-fast behavior.
+	// `model_id` preserves the full model id and delegates to OpenAIProvider.
+	UnknownPrefixMode MultiProviderUnknownPrefixMode
 }
 
 // NewMultiProvider creates a new OpenAI provider.
 func NewMultiProvider(params NewMultiProviderParams) *MultiProvider {
+	openaiPrefixMode, err := validateOpenAIPrefixMode(params.OpenaiPrefixMode)
+	if err != nil {
+		panic(err)
+	}
+	unknownPrefixMode, err := validateUnknownPrefixMode(params.UnknownPrefixMode)
+	if err != nil {
+		panic(err)
+	}
+
 	return &MultiProvider{
 		ProviderMap: params.ProviderMap,
 		OpenAIProvider: NewOpenAIProvider(OpenAIProviderParams{
@@ -84,6 +119,8 @@ func NewMultiProvider(params NewMultiProviderParams) *MultiProvider {
 			UseResponsesWebsocket: params.OpenaiUseResponsesWebsocket,
 		}),
 		fallbackProviders: make(map[string]ModelProvider),
+		openaiPrefixMode:  openaiPrefixMode,
+		unknownPrefixMode: unknownPrefixMode,
 	}
 }
 
@@ -107,6 +144,34 @@ func (mp *MultiProvider) createFallbackProvider(prefix string) (ModelProvider, e
 	}
 }
 
+func validateOpenAIPrefixMode(mode MultiProviderOpenAIPrefixMode) (MultiProviderOpenAIPrefixMode, error) {
+	if mode == "" {
+		return MultiProviderOpenAIPrefixModeAlias, nil
+	}
+	switch mode {
+	case MultiProviderOpenAIPrefixModeAlias, MultiProviderOpenAIPrefixModeModelID:
+		return mode, nil
+	default:
+		return "", UserErrorf(
+			"MultiProvider openai_prefix_mode must be one of: 'alias', 'model_id'.",
+		)
+	}
+}
+
+func validateUnknownPrefixMode(mode MultiProviderUnknownPrefixMode) (MultiProviderUnknownPrefixMode, error) {
+	if mode == "" {
+		return MultiProviderUnknownPrefixModeError, nil
+	}
+	switch mode {
+	case MultiProviderUnknownPrefixModeError, MultiProviderUnknownPrefixModeModelID:
+		return mode, nil
+	default:
+		return "", UserErrorf(
+			"MultiProvider unknown_prefix_mode must be one of: 'error', 'model_id'.",
+		)
+	}
+}
+
 func (mp *MultiProvider) getFallbackProvider(prefix string) (ModelProvider, error) {
 	if prefix == "" || prefix == "openai" {
 		return mp.OpenAIProvider, nil
@@ -123,23 +188,52 @@ func (mp *MultiProvider) getFallbackProvider(prefix string) (ModelProvider, erro
 	return fp, nil
 }
 
+func (mp *MultiProvider) resolvePrefixedModel(
+	originalModelName string,
+	prefix string,
+	strippedModelName string,
+) (ModelProvider, string, error) {
+	// Explicit provider_map entries always win and receive the stripped model name.
+	if mp.ProviderMap != nil {
+		if provider, ok := mp.ProviderMap.GetProvider(prefix); ok {
+			return provider, strippedModelName, nil
+		}
+	}
+
+	if prefix == "litellm" {
+		provider, err := mp.getFallbackProvider(prefix)
+		return provider, strippedModelName, err
+	}
+
+	if prefix == "openai" {
+		if mp.openaiPrefixMode == MultiProviderOpenAIPrefixModeAlias {
+			return mp.OpenAIProvider, strippedModelName, nil
+		}
+		return mp.OpenAIProvider, originalModelName, nil
+	}
+
+	if mp.unknownPrefixMode == MultiProviderUnknownPrefixModeModelID {
+		return mp.OpenAIProvider, originalModelName, nil
+	}
+
+	return nil, "", UserErrorf("Unknown prefix: %s", prefix)
+}
+
 // GetModel returns a Model based on the model name. The model name can have a prefix, ending with
 // a "/", which will be used to look up the ModelProvider. If there is no prefix, we will use
 // the OpenAI provider.
 func (mp *MultiProvider) GetModel(modelName string) (Model, error) {
 	prefix, name := mp.getPrefixAndModelName(modelName)
 
-	if prefix != "" && mp.ProviderMap != nil {
-		if provider, ok := mp.ProviderMap.GetProvider(prefix); ok {
-			return provider.GetModel(name)
-		}
+	if prefix == "" {
+		return mp.OpenAIProvider.GetModel(name)
 	}
 
-	fp, err := mp.getFallbackProvider(prefix)
+	provider, resolvedModelName, err := mp.resolvePrefixedModel(modelName, prefix, name)
 	if err != nil {
 		return nil, err
 	}
-	return fp.GetModel(name)
+	return provider.GetModel(resolvedModelName)
 }
 
 // Aclose releases resources owned by underlying providers that expose lifecycle hooks.

@@ -1,5 +1,10 @@
 Compared against `.upstream/openai-agents-python` HEAD `e00f377a` (`0.11.1`). Focus was runtime behavior and function logic, not just exported API shape.
 
+Method:
+- audited upstream `tests/` and `src/agents/` against current Go packages/tests
+- manually reviewed low-confidence filename mismatches instead of relying on name matching alone
+- treated Python-only ergonomics/integration tests separately from actionable Go parity gaps
+
 ## Aligned
 - HTTP Responses request/stream behavior is mostly aligned for non-websocket transport. Go now captures `request_id` in `agents/models_openai_responses.go`, persists `ModelResponse.RequestID` in `agents/items.go`, and finalizes streamed runs on `response.completed`, `response.failed`, and `response.incomplete` in `agents/run.go`, matching current Python `models/openai_responses.py` / `run.py`.
 - Tracing export sanitation is aligned. `tracing/processors.go` now sanitizes JSON-incompatible payloads and truncates oversized `span_data.input` / `span_data.output` before OpenAI trace ingest, matching Python `tracing/processors.py`.
@@ -11,6 +16,7 @@ Compared against `.upstream/openai-agents-python` HEAD `e00f377a` (`0.11.1`). Fo
 - MCP display metadata fallback/persistence is aligned. Local MCP tools now carry title/description fallback through `agents/mcp_util.go` and `agents/run_impl.go`, hosted MCP calls recover display metadata from prior `mcp_list_tools` history, and RunState now round-trips `ToolCallItem` titles/descriptions.
 - Trace reattach semantics are aligned. `agents/trace_resume.go` now reattaches only when trace id, workflow name, group id, metadata, and tracing API key/hash all match the effective resumed settings; disabled runs no longer reattach, reattached traces preserve the live tracing key/hash, and the started-trace cache is now bounded like upstream Python.
 - Responses websocket transport is aligned. `agents/models_openai_responses_ws.go` now uses a real websocket transport with persistent connection reuse, request serialization, explicit websocket base URL support, typed event parsing, request timeout handling, terminal-response consumption for `GetResponse()`, and provider/session lifecycle cleanup, matching current Python `models/openai_responses.py` behavior for the supported Go surface.
+- Multi-provider prefix routing is aligned. `agents/models_multi_provider.go` now supports Python-equivalent `openai_prefix_mode={"alias","model_id"}` and `unknown_prefix_mode={"error","model_id"}`, preserves explicit provider-map precedence, and keeps websocket-base-url passthrough behavior covered by translated tests from upstream `tests/models/test_map.py`.
 
 ## P0 gaps
 - none
@@ -18,6 +24,12 @@ Compared against `.upstream/openai-agents-python` HEAD `e00f377a` (`0.11.1`). Fo
 ## P1 gaps
 - none
 
+## P2 notes
+- Most remaining filename mismatches are not real runtime gaps. They fall into one of three buckets:
+  - covered by differently named Go tests, e.g. MCP caching/filtering, shell serialization, reasoning/logprobs, voice STT/TTS, Gemini thought signatures, handoff history, Twilio SIP, and tracing API-key behavior
+  - Python-only tests that do not translate directly to Go, e.g. `test_asyncio_progress.py`, `test_pr_labels.py`, `tests/models/test_litellm_logging_patch.py`, `tests/tracing/test_import_side_effects.py`, `tests/tracing/test_setup.py`, and `tests/utils/test_json.py`
+  - API-shape differences where Go already covers the underlying behavior through different constructors/surfaces, e.g. `tests/test_source_compat_constructors.py`
+
 ## Suggested implementation order
-1. Rerun a full Python-vs-Go audit before merge/release to confirm no new upstream drift.
+1. Re-run `go test ./...` and a final Python-vs-Go audit before merge/release to confirm no new upstream drift.
 2. If the audit stays clean, this branch is ready to merge.
