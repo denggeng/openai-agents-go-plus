@@ -108,6 +108,7 @@ type RunStateRunItemState struct {
 	TargetAgent *RunStateAgentState `json:"target_agent,omitempty"`
 	ToolName    string              `json:"tool_name,omitempty"`
 	Description string              `json:"description,omitempty"`
+	Title       string              `json:"title,omitempty"`
 }
 
 // RunStateProcessedResponseState stores serialized processed-response data.
@@ -576,89 +577,89 @@ func runItemsToInputItems(items []RunItem) []TResponseInputItem {
 func runItemToState(item RunItem) (RunStateRunItemState, bool) {
 	switch v := item.(type) {
 	case MessageOutputItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *MessageOutputItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case ToolCallItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", v.Description, v.Title), true
 	case *ToolCallItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", v.Description, v.Title), true
 	case ToolSearchCallItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *ToolSearchCallItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case ToolSearchOutputItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *ToolSearchOutputItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case ToolCallOutputItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, v.Output, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, v.Output, nil, nil, "", "", ""), true
 	case *ToolCallOutputItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, v.Output, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, v.Output, nil, nil, "", "", ""), true
 	case HandoffCallItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *HandoffCallItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case HandoffOutputItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, v.SourceAgent, v.TargetAgent, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, v.SourceAgent, v.TargetAgent, "", "", ""), true
 	case *HandoffOutputItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, v.SourceAgent, v.TargetAgent, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, v.SourceAgent, v.TargetAgent, "", "", ""), true
 	case ReasoningItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *ReasoningItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case CompactionItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *CompactionItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case MCPListToolsItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *MCPListToolsItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case MCPApprovalRequestItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *MCPApprovalRequestItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case MCPApprovalResponseItem:
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	case *MCPApprovalResponseItem:
 		if v == nil {
 			return RunStateRunItemState{}, false
 		}
-		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", ""), true
+		return runItemStateFrom(v.Agent, v.RawItem, v.Type, nil, nil, nil, "", "", ""), true
 	default:
 		raw, itemType := runItemRawAndType(item)
 		if raw == nil && itemType == "" {
@@ -672,7 +673,7 @@ func runItemToState(item RunItem) (RunStateRunItemState, bool) {
 	}
 }
 
-func runItemStateFrom(agent *Agent, raw any, itemType string, output any, source *Agent, target *Agent, toolName string, description string) RunStateRunItemState {
+func runItemStateFrom(agent *Agent, raw any, itemType string, output any, source *Agent, target *Agent, toolName string, description string, title string) RunStateRunItemState {
 	state := RunStateRunItemState{
 		Type:        itemType,
 		RawItem:     normalizeJSONValue(raw),
@@ -682,6 +683,7 @@ func runItemStateFrom(agent *Agent, raw any, itemType string, output any, source
 		TargetAgent: agentStateFromAgent(target),
 		ToolName:    toolName,
 		Description: description,
+		Title:       title,
 	}
 	if output == nil {
 		state.Output = nil
@@ -691,6 +693,9 @@ func runItemStateFrom(agent *Agent, raw any, itemType string, output any, source
 	}
 	if description == "" {
 		state.Description = ""
+	}
+	if title == "" {
+		state.Title = ""
 	}
 	return state
 }
@@ -716,7 +721,13 @@ func runItemFromState(state RunStateRunItemState) (RunItem, bool) {
 		if !ok {
 			return nil, false
 		}
-		return ToolCallItem{Agent: agent, RawItem: raw, Type: state.Type}, true
+		return ToolCallItem{
+			Agent:       agent,
+			RawItem:     raw,
+			Description: state.Description,
+			Title:       state.Title,
+			Type:        state.Type,
+		}, true
 	case "tool_search_call_item":
 		raw, ok := decodeRawToToolSearchRawItem(state.RawItem, "tool_search_call")
 		if !ok {
@@ -1178,6 +1189,9 @@ func serializeToolActionsFunction(actions []ToolRunFunction) []map[string]any {
 		if tool.Description != "" {
 			meta["description"] = tool.Description
 		}
+		if tool.Title != "" {
+			meta["title"] = tool.Title
+		}
 		if len(tool.ParamsJSONSchema) > 0 {
 			meta["paramsJsonSchema"] = tool.ParamsJSONSchema
 		}
@@ -1348,6 +1362,7 @@ func deserializeFunctionActions(entries []map[string]any) []ToolRunFunction {
 		if toolName == "" {
 			continue
 		}
+		title := extractToolMetadataString(entry, "tool", "title")
 		namespace := extractToolMetadataString(entry, "tool", "namespace")
 		namespaceDescription := extractToolMetadataString(entry, "tool", "namespaceDescription")
 		if call, ok := decodeRawToResponseFunctionToolCall(entry["tool_call"]); ok {
@@ -1357,6 +1372,7 @@ func deserializeFunctionActions(entries []map[string]any) []ToolRunFunction {
 			tool := FunctionTool{
 				Name:                 toolName,
 				Description:          description,
+				Title:                title,
 				Namespace:            namespace,
 				NamespaceDescription: namespaceDescription,
 				ParamsJSONSchema:     schema,

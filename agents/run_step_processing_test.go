@@ -21,11 +21,33 @@ import (
 
 	"github.com/denggeng/openai-agents-go-plus/computer"
 	"github.com/denggeng/openai-agents-go-plus/usage"
+	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type processModelResponseMCPServer struct{}
+
+func (processModelResponseMCPServer) Connect(context.Context) error { return nil }
+func (processModelResponseMCPServer) Cleanup(context.Context) error { return nil }
+func (processModelResponseMCPServer) Name() string                  { return "test_mcp_server" }
+func (processModelResponseMCPServer) UseStructuredContent() bool    { return false }
+func (processModelResponseMCPServer) ListTools(context.Context, *Agent) ([]*mcp.Tool, error) {
+	return nil, nil
+}
+func (processModelResponseMCPServer) CallTool(context.Context, string, map[string]any, map[string]any) (*mcp.CallToolResult, error) {
+	return &mcp.CallToolResult{}, nil
+}
+func (processModelResponseMCPServer) ListPrompts(context.Context) (*mcp.ListPromptsResult, error) {
+	return &mcp.ListPromptsResult{}, nil
+}
+func (processModelResponseMCPServer) GetPrompt(context.Context, string, map[string]string) (*mcp.GetPromptResult, error) {
+	return &mcp.GetPromptResult{}, nil
+}
 
 func TestEmptyResponse(t *testing.T) {
 	agent := &Agent{Name: "test"}
@@ -381,6 +403,108 @@ func TestFunctionWebSearchToolCallParsedCorrectly(t *testing.T) {
 
 	assert.Empty(t, result.Functions)
 	assert.Empty(t, result.Handoffs)
+}
+
+func TestProcessModelResponseSetsTitleForLocalMCPFunctionTool(t *testing.T) {
+	agent := &Agent{Name: "local-mcp"}
+	mcpTool := &mcp.Tool{
+		Name:        "search_docs",
+		InputSchema: &jsonschema.Schema{Type: "object"},
+		Title:       "Search Docs",
+	}
+	functionTool, err := MCPUtil().ToFunctionTool(
+		mcpTool,
+		processModelResponseMCPServer{},
+		false,
+	)
+	require.NoError(t, err)
+
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			outputItemFromMap(t, map[string]any{
+				"type":      "function_call",
+				"name":      "search_docs",
+				"call_id":   "call_search_docs",
+				"status":    "completed",
+				"arguments": `{}`,
+			}),
+		},
+		Usage: usage.NewUsage(),
+	}
+
+	result, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		[]Tool{functionTool},
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, result.NewItems, 1)
+
+	item, ok := result.NewItems[0].(ToolCallItem)
+	require.True(t, ok)
+	assert.Equal(t, "Search Docs", item.Description)
+	assert.Equal(t, "Search Docs", item.Title)
+}
+
+func TestProcessModelResponseUsesMCPListToolsMetadataForHostedMCPCalls(t *testing.T) {
+	agent := &Agent{Name: "hosted-mcp"}
+	hostedTool := HostedMCPTool{
+		ToolConfig: responses.ToolMcpParam{
+			ServerLabel: "docs_server",
+			ServerURL:   param.NewOpt("https://example.com/mcp"),
+			Type:        constant.ValueOf[constant.Mcp](),
+		},
+	}
+
+	var listTools responses.ResponseOutputItemMcpListTools
+	rawListTools, err := json.Marshal(map[string]any{
+		"id":           "mcp_list_tools_1",
+		"server_label": "docs_server",
+		"type":         "mcp_list_tools",
+		"tools": []map[string]any{{
+			"name":        "search_docs",
+			"description": "Search the docs.",
+			"title":       "Search Docs",
+			"annotations": map[string]any{"title": "Search Docs"},
+			"input_schema": map[string]any{
+				"type": "object",
+			},
+		}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(rawListTools, &listTools))
+
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			outputItemFromMap(t, map[string]any{
+				"id":           "mcp_call_1",
+				"arguments":    `{}`,
+				"name":         "search_docs",
+				"server_label": "docs_server",
+				"type":         "mcp_call",
+				"status":       "completed",
+			}),
+		},
+		Usage: usage.NewUsage(),
+	}
+
+	result, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		[]Tool{hostedTool},
+		response,
+		nil,
+		[]RunItem{MCPListToolsItem{Agent: agent, RawItem: listTools, Type: "mcp_list_tools_item"}},
+	)
+	require.NoError(t, err)
+	require.Len(t, result.NewItems, 1)
+
+	item, ok := result.NewItems[0].(ToolCallItem)
+	require.True(t, ok)
+	assert.Equal(t, "Search the docs.", item.Description)
+	assert.Equal(t, "Search Docs", item.Title)
 }
 
 func TestReasoningItemParsedCorrectly(t *testing.T) {

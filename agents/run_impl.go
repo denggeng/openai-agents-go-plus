@@ -561,6 +561,7 @@ func (runImpl) ProcessModelResponse(
 	allTools []Tool,
 	response ModelResponse,
 	handoffs []Handoff,
+	existingItems ...any,
 ) (*ProcessedResponse, error) {
 	var (
 		items               []RunItem
@@ -589,6 +590,19 @@ func (runImpl) ProcessModelResponse(
 		return nil, err
 	}
 	hostedMCPServerMap := make(map[string]HostedMCPTool)
+	hostedMCPMetadata := map[mcpToolMetadataKey]mcpToolMetadata{}
+	for _, existing := range existingItems {
+		switch typed := existing.(type) {
+		case []RunItem:
+			for key, value := range collectMCPListToolsMetadata(typed) {
+				hostedMCPMetadata[key] = value
+			}
+		case []TResponseInputItem:
+			for key, value := range collectMCPListToolsMetadataFromInputItems(typed) {
+				hostedMCPMetadata[key] = value
+			}
+		}
+	}
 
 	for _, tool := range allTools {
 		switch t := tool.(type) {
@@ -779,6 +793,7 @@ func (runImpl) ProcessModelResponse(
 				RawItem: output,
 				Type:    "mcp_list_tools_item",
 			})
+			collectMCPListToolsMetadataFromRawItem(output, hostedMCPMetadata)
 		case "mcp_call":
 			output := responses.ResponseOutputItemMcpCall{
 				ID:          outputUnion.ID,
@@ -789,10 +804,16 @@ func (runImpl) ProcessModelResponse(
 				Error:       outputUnion.Error,
 				Output:      outputUnion.Output.OfString,
 			}
+			metadata := hostedMCPMetadata[mcpToolMetadataKey{
+				ServerLabel: output.ServerLabel,
+				Name:        output.Name,
+			}]
 			items = append(items, ToolCallItem{
-				Agent:   agent,
-				RawItem: ResponseOutputItemMcpCall(output),
-				Type:    "tool_call_item",
+				Agent:       agent,
+				RawItem:     ResponseOutputItemMcpCall(output),
+				Description: metadata.Description,
+				Title:       metadata.Title,
+				Type:        "tool_call_item",
 			})
 			toolsUsed = append(toolsUsed, "mcp")
 		case "image_generation_call":
@@ -1112,9 +1133,11 @@ func (runImpl) ProcessModelResponse(
 				return nil, ModelBehaviorErrorf("tool %s not found in agent %s", displayToolName, agent.Name)
 			}
 			items = append(items, ToolCallItem{
-				Agent:   agent,
-				RawItem: ResponseFunctionToolCall(output),
-				Type:    "tool_call_item",
+				Agent:       agent,
+				RawItem:     ResponseFunctionToolCall(output),
+				Description: functionTool.Description,
+				Title:       functionTool.Title,
+				Type:        "tool_call_item",
 			})
 			functions = append(functions, ToolRunFunction{
 				ToolCall:      ResponseFunctionToolCall(output),

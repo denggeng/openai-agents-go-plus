@@ -158,6 +158,12 @@ type ToolCallItem struct {
 	// The raw tool call item.
 	RawItem ToolCallItemType
 
+	// Optional tool description if known at item creation time.
+	Description string
+
+	// Optional short display title if known at item creation time.
+	Title string
+
 	// Always `tool_call_item`.
 	Type string
 }

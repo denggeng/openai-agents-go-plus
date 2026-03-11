@@ -22,6 +22,7 @@ import (
 	"github.com/denggeng/openai-agents-go-plus/agents"
 	"github.com/denggeng/openai-agents-go-plus/agentstesting"
 	"github.com/denggeng/openai-agents-go-plus/usage"
+	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"
@@ -486,4 +487,87 @@ func TestRunStateResumeGuardrailResultHelpers(t *testing.T) {
 	require.Len(t, toolOutputResults, 1)
 	assert.Equal(t, "tool_output_guard", toolOutputResults[0].Guardrail.GetName())
 	assert.Equal(t, agents.ToolGuardrailBehaviorTypeAllow, toolOutputResults[0].Output.BehaviorType())
+}
+
+func TestRunStatePreservesToolCallDisplayMetadata(t *testing.T) {
+	agent := &agents.Agent{Name: "TestAgent"}
+	toolCall := responses.ResponseFunctionToolCall{
+		Type:      constant.ValueOf[constant.FunctionCall](),
+		Name:      "my_tool",
+		CallID:    "call_1",
+		Status:    responses.ResponseFunctionToolCallStatusCompleted,
+		Arguments: `{"arg":"val"}`,
+	}
+	otherToolCall := responses.ResponseFunctionToolCall{
+		Type:      constant.ValueOf[constant.FunctionCall](),
+		Name:      "other_tool",
+		CallID:    "call_2",
+		Status:    responses.ResponseFunctionToolCallStatusCompleted,
+		Arguments: `{}`,
+	}
+
+	state := agents.RunState{
+		SchemaVersion:    agents.CurrentRunStateSchemaVersion,
+		CurrentTurn:      1,
+		MaxTurns:         3,
+		CurrentAgentName: agent.Name,
+		Context:          &agents.RunStateContextState{},
+		GeneratedRunItems: []agents.RunItem{
+			agents.MessageOutputItem{
+				Agent: agent,
+				RawItem: responses.ResponseOutputMessage{
+					ID:   "msg_1",
+					Type: constant.ValueOf[constant.Message](),
+					Role: constant.ValueOf[constant.Assistant](),
+					Content: []responses.ResponseOutputMessageContentUnion{{
+						Type: "output_text",
+						Text: "Hello",
+					}},
+					Status: responses.ResponseOutputMessageStatusCompleted,
+				},
+				Type: "message_output_item",
+			},
+			agents.ToolCallItem{
+				Agent:       agent,
+				RawItem:     agents.ResponseFunctionToolCall(toolCall),
+				Description: "My tool description",
+				Title:       "My tool title",
+				Type:        "tool_call_item",
+			},
+			agents.ToolCallItem{
+				Agent:   agent,
+				RawItem: agents.ResponseFunctionToolCall(otherToolCall),
+				Type:    "tool_call_item",
+			},
+			agents.ToolCallOutputItem{
+				Agent: agent,
+				RawItem: agents.ResponseInputItemFunctionCallOutputParam{
+					CallID: "call_1",
+					Output: responses.ResponseInputItemFunctionCallOutputOutputUnionParam{
+						OfString: param.NewOpt("result"),
+					},
+					Type: constant.ValueOf[constant.FunctionCallOutput](),
+				},
+				Output: "result",
+				Type:   "tool_call_output_item",
+			},
+		},
+	}
+
+	encoded, err := state.ToJSON()
+	require.NoError(t, err)
+
+	restored, err := agents.RunStateFromJSON(encoded)
+	require.NoError(t, err)
+	require.Len(t, restored.GeneratedRunItems, 4)
+
+	firstTool, ok := restored.GeneratedRunItems[1].(agents.ToolCallItem)
+	require.True(t, ok)
+	assert.Equal(t, "My tool description", firstTool.Description)
+	assert.Equal(t, "My tool title", firstTool.Title)
+
+	secondTool, ok := restored.GeneratedRunItems[2].(agents.ToolCallItem)
+	require.True(t, ok)
+	assert.Empty(t, secondTool.Description)
+	assert.Empty(t, secondTool.Title)
 }

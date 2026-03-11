@@ -200,7 +200,11 @@ func TestFunctionToolTimeoutReturnsErrorAsResult(t *testing.T) {
 
 	items := result.GeneratedItems()
 	require.Len(t, items, 2)
-	assertItemIsFunctionToolCall(t, items[0], agent, "slow_tool", `{}`, "")
+	toolCallItem, ok := items[0].(ToolCallItem)
+	require.True(t, ok)
+	assert.Equal(t, agent, toolCallItem.Agent)
+	assert.Equal(t, "slow_tool", toolCallItem.RawItem.(ResponseFunctionToolCall).Name)
+	assert.Equal(t, "slow", toolCallItem.Description)
 	outputItem, ok := items[1].(ToolCallOutputItem)
 	require.True(t, ok)
 	assert.Contains(t, outputItem.Output.(string), "timed out")

@@ -727,3 +727,32 @@ func TestCreateMCPStaticToolFilter(t *testing.T) {
 		}, result)
 	})
 }
+
+func TestMCPUtilToFunctionToolPreservesMCPTitleMetadata(t *testing.T) {
+	server := agentstesting.NewFakeMCPServer(nil, nil, "")
+	tool := &mcp.Tool{
+		Name:        "search_docs",
+		InputSchema: &jsonschema.Schema{Type: "object"},
+		Description: "Search the docs.",
+		Title:       "Search Docs",
+	}
+
+	functionTool, err := agents.MCPUtil().ToFunctionTool(tool, server, false)
+	require.NoError(t, err)
+	assert.Equal(t, "Search the docs.", functionTool.Description)
+	assert.Equal(t, "Search Docs", functionTool.Title)
+}
+
+func TestMCPUtilToFunctionToolDescriptionFallsBackToMCPTitle(t *testing.T) {
+	server := agentstesting.NewFakeMCPServer(nil, nil, "")
+	tool := &mcp.Tool{
+		Name:        "search_docs",
+		InputSchema: &jsonschema.Schema{Type: "object"},
+		Title:       "Search Docs",
+	}
+
+	functionTool, err := agents.MCPUtil().ToFunctionTool(tool, server, false)
+	require.NoError(t, err)
+	assert.Equal(t, "Search Docs", functionTool.Description)
+	assert.Equal(t, "Search Docs", functionTool.Title)
+}
