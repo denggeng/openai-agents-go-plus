@@ -75,29 +75,17 @@ func TestOpenAIProviderReturnsCachedResponsesWSModel(t *testing.T) {
 	assert.True(t, ws3.closed.Load())
 }
 
-func TestOpenAIResponsesWSModelGetResponseReturnsExplicitUnsupportedError(t *testing.T) {
-	client := NewOpenaiClient(param.NewOpt("http://127.0.0.1:1"), param.NewOpt("FAKE_KEY"))
-	provider := NewOpenAIProvider(OpenAIProviderParams{
-		OpenaiClient:          &client,
-		UseResponses:          param.NewOpt(true),
-		UseResponsesWebsocket: param.NewOpt(true),
-	})
-
-	model, err := provider.GetModel("gpt-4.1")
-	require.NoError(t, err)
-
-	_, err = model.GetResponse(t.Context(), ModelResponseParams{})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not implemented")
-	assert.Contains(t, err.Error(), "websocket")
-}
-
-func TestOpenAIResponsesWSModelStreamResponseReturnsExplicitUnsupportedError(t *testing.T) {
+func TestOpenAIResponsesWSModelCloseMarksModelClosed(t *testing.T) {
 	client := NewOpenaiClient(param.NewOpt("http://127.0.0.1:1"), param.NewOpt("FAKE_KEY"))
 	model := NewOpenAIResponsesWSModel("gpt-4.1", client, "")
 
-	err := model.StreamResponse(t.Context(), ModelResponseParams{}, nil)
+	require.NoError(t, model.Close())
+
+	_, err := model.GetResponse(t.Context(), ModelResponseParams{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not implemented")
-	assert.Contains(t, err.Error(), "websocket")
+	assert.Contains(t, err.Error(), "closed")
+
+	err = model.StreamResponse(t.Context(), ModelResponseParams{}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "closed")
 }

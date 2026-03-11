@@ -174,10 +174,29 @@ func (provider *OpenAIProvider) getClient() OpenaiClient {
 			}
 
 			newClient := NewOpenaiClient(provider.params.BaseURL, apiKey, options...)
+			if !newClient.BaseURL.Valid() {
+				if envBaseURL := os.Getenv("OPENAI_BASE_URL"); envBaseURL != "" {
+					newClient.BaseURL = param.NewOpt(envBaseURL)
+				}
+			}
 			if provider.params.WebsocketBaseURL.Valid() {
 				newClient.WebsocketBaseURL = provider.params.WebsocketBaseURL
 			} else if envWSBaseURL := os.Getenv("OPENAI_WEBSOCKET_BASE_URL"); envWSBaseURL != "" {
 				newClient.WebsocketBaseURL = param.NewOpt(envWSBaseURL)
+			}
+			defaultHeaders := make(map[string]string)
+			if provider.params.Organization.Valid() {
+				defaultHeaders["OpenAI-Organization"] = provider.params.Organization.Value
+			} else if envOrgID := os.Getenv("OPENAI_ORG_ID"); envOrgID != "" {
+				defaultHeaders["OpenAI-Organization"] = envOrgID
+			}
+			if provider.params.Project.Valid() {
+				defaultHeaders["OpenAI-Project"] = provider.params.Project.Value
+			} else if envProjectID := os.Getenv("OPENAI_PROJECT_ID"); envProjectID != "" {
+				defaultHeaders["OpenAI-Project"] = envProjectID
+			}
+			if len(defaultHeaders) > 0 {
+				newClient.DefaultHeaders = defaultHeaders
 			}
 			provider.client = &newClient
 		}

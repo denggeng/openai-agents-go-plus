@@ -16,6 +16,7 @@ package agents
 
 import (
 	"slices"
+	"time"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -27,6 +28,9 @@ type OpenaiClient struct {
 	BaseURL          param.Opt[string]
 	WebsocketBaseURL param.Opt[string]
 	APIKey           param.Opt[string]
+	DefaultHeaders   map[string]string
+	DefaultQuery     map[string]string
+	RequestTimeout   time.Duration
 }
 
 func NewOpenaiClient(baseURL, apiKey param.Opt[string], opts ...option.RequestOption) OpenaiClient {
@@ -37,8 +41,10 @@ func NewOpenaiClient(baseURL, apiKey param.Opt[string], opts ...option.RequestOp
 		opts = append(slices.Clone(opts), option.WithAPIKey(apiKey.Value))
 	}
 	return OpenaiClient{
-		Client:  openai.NewClient(opts...),
-		BaseURL: baseURL,
-		APIKey:  apiKey,
+		Client:         openai.NewClient(opts...),
+		BaseURL:        baseURL,
+		APIKey:         apiKey,
+		DefaultHeaders: nil,
+		DefaultQuery:   nil,
 	}
 }

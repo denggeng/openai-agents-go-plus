@@ -10,17 +10,14 @@ Compared against `.upstream/openai-agents-python` HEAD `e00f377a` (`0.11.1`). Fo
 - Function-tool timeout semantics are aligned. `agents/tool_function_invoke.go`, `agents/run_impl.go`, and `agents/realtime/session.go` now enforce `timeout_seconds`, `timeout_behavior`, and `timeout_error_function`, including timeout-as-result vs raise-exception behavior in runner and realtime flows.
 - MCP display metadata fallback/persistence is aligned. Local MCP tools now carry title/description fallback through `agents/mcp_util.go` and `agents/run_impl.go`, hosted MCP calls recover display metadata from prior `mcp_list_tools` history, and RunState now round-trips `ToolCallItem` titles/descriptions.
 - Trace reattach semantics are aligned. `agents/trace_resume.go` now reattaches only when trace id, workflow name, group id, metadata, and tracing API key/hash all match the effective resumed settings; disabled runs no longer reattach, reattached traces preserve the live tracing key/hash, and the started-trace cache is now bounded like upstream Python.
+- Responses websocket transport is aligned. `agents/models_openai_responses_ws.go` now uses a real websocket transport with persistent connection reuse, request serialization, explicit websocket base URL support, typed event parsing, request timeout handling, terminal-response consumption for `GetResponse()`, and provider/session lifecycle cleanup, matching current Python `models/openai_responses.py` behavior for the supported Go surface.
 
 ## P0 gaps
-- Responses websocket transport is scaffolded but still non-functional in Go.
-  - `agents/responses_websocket_session.go` and `agents/models_openai_provider.go` can construct websocket-backed sessions/models.
-  - But `agents/models_openai_responses_ws.go` returns explicit `not implemented` errors from both `GetResponse()` and `StreamResponse()`.
-  - Python `src/agents/models/openai_responses.py` implements persistent websocket connections, request/connect/send/recv timeouts, streamed event parsing, connection reuse, and `get_response()` by consuming streamed terminal events.
-  - Impact: `UseResponsesWebsocket` and `NewResponsesWebSocketSession()` are effectively unusable in Go.
+- none
 
 ## P1 gaps
 - none
 
 ## Suggested implementation order
-1. Replace the websocket stubs in `agents/models_openai_responses_ws.go` with a real transport; then harden `ResponsesWebSocketSession` around the live provider/model lifecycle.
-2. After websocket parity lands, rerun a full Python-vs-Go audit before merge.
+1. Rerun a full Python-vs-Go audit before merge/release to confirm no new upstream drift.
+2. If the audit stays clean, this branch is ready to merge.
