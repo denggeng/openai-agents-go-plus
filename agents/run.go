@@ -2212,7 +2212,7 @@ func (r Runner) startStreaming(
 		if err != nil {
 			return err
 		}
-		markTraceIDStarted(trace.TraceID(), currentTracingAPIKeyHash())
+		markTraceIDStarted(trace.TraceID())
 	}
 
 	conversationID, resolvedPreviousResponseID, autoPrevious := resolveConversationSettings(runConfig, resumeState)

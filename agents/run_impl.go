@@ -2218,7 +2218,7 @@ func ManageTraceCtx(
 	}
 
 	return tracing.RunTrace(ctx, params, func(ctx context.Context, trace tracing.Trace) error {
-		markTraceIDStarted(trace.TraceID(), currentTracingAPIKeyHash())
+		markTraceIDStarted(trace.TraceID())
 		return fn(ctx)
 	})
 }
