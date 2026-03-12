@@ -15,18 +15,24 @@
 package agents
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 	"github.com/denggeng/openai-agents-go-plus/tracing"
@@ -38,14 +44,18 @@ import (
 
 const (
 	defaultOpenAIResponsesWebsocketBaseURL = "https://api.openai.com/v1"
-	websocketNoTimeout                     = time.Duration(-1)
 )
 
+type responsesWebsocketTimeout struct {
+	Duration time.Duration
+	Set      bool
+}
+
 type responsesWebsocketRequestTimeouts struct {
-	Lock    time.Duration
-	Connect time.Duration
-	Send    time.Duration
-	Recv    time.Duration
+	Lock    responsesWebsocketTimeout
+	Connect responsesWebsocketTimeout
+	Send    responsesWebsocketTimeout
+	Recv    responsesWebsocketTimeout
 }
 
 // ResponsesWebSocketError surfaces `error` / `response.error` websocket frames.
@@ -236,23 +246,54 @@ func (m *OpenAIResponsesWSModel) executeRequest(
 		return nil, err
 	}
 
-	conn, err := m.ensureConnection(ctx, wsURL, headers, timeouts.Connect)
+	conn, reused, err := m.ensureConnection(ctx, wsURL, headers, timeouts.Connect)
 	if err != nil {
 		return nil, err
 	}
 
 	requestDone := make(chan struct{})
-	go func(requestConn *websocket.Conn) {
-		select {
-		case <-ctx.Done():
-			m.dropSpecificConnection(requestConn)
-		case <-requestDone:
-		}
-	}(conn)
+	watchConnection := func(requestConn *websocket.Conn) {
+		go func() {
+			select {
+			case <-ctx.Done():
+				m.dropSpecificConnection(requestConn)
+			case <-requestDone:
+			}
+		}()
+	}
+	watchConnection(conn)
 	defer close(requestDone)
 
-	if err := m.writeFrame(ctx, conn, requestFrame, timeouts.Send); err != nil {
-		m.dropSpecificConnection(conn)
+	sendRequestFrame := func(requestConn *websocket.Conn, reusedConnection bool) (*websocket.Conn, error) {
+		writeErr := m.writeFrame(ctx, requestConn, requestFrame, timeouts.Send)
+		if writeErr == nil {
+			return requestConn, nil
+		}
+		m.dropSpecificConnection(requestConn)
+		if reusedConnection && shouldRetryResponsesWebsocketPreSend(writeErr) && ctx.Err() == nil {
+			retryConn, _, retryOpenErr := m.ensureConnection(ctx, wsURL, headers, timeouts.Connect)
+			if retryOpenErr != nil {
+				return nil, retryOpenErr
+			}
+			watchConnection(retryConn)
+			if retryErr := m.writeFrame(ctx, retryConn, requestFrame, timeouts.Send); retryErr == nil {
+				return retryConn, nil
+			} else {
+				m.dropSpecificConnection(retryConn)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				return nil, retryErr
+			}
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, writeErr
+	}
+
+	conn, err = sendRequestFrame(conn, reused)
+	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
@@ -416,21 +457,26 @@ func (m *OpenAIResponsesWSModel) prepareWebsocketHeaders(extraHeaders map[string
 
 func (m *OpenAIResponsesWSModel) acquireRequestSlot(
 	ctx context.Context,
-	timeout time.Duration,
+	timeout responsesWebsocketTimeout,
 ) (func(), error) {
 	release := sync.OnceFunc(func() {
 		m.requestSlot <- struct{}{}
 	})
 
 	switch {
-	case timeout == websocketNoTimeout:
+	case !timeout.Set:
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-m.requestSlot:
 			return release, nil
 		}
-	case timeout == 0:
+	case timeout.Duration < 0:
+		return nil, fmt.Errorf(
+			"Responses websocket request lock wait timed out after %g seconds",
+			timeout.Duration.Seconds(),
+		)
+	case timeout.Duration == 0:
 		select {
 		case <-m.requestSlot:
 			return release, nil
@@ -438,7 +484,7 @@ func (m *OpenAIResponsesWSModel) acquireRequestSlot(
 			return nil, fmt.Errorf("Responses websocket request lock wait timed out after 0 seconds")
 		}
 	default:
-		timer := time.NewTimer(timeout)
+		timer := time.NewTimer(timeout.Duration)
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
@@ -448,7 +494,7 @@ func (m *OpenAIResponsesWSModel) acquireRequestSlot(
 		case <-timer.C:
 			return nil, fmt.Errorf(
 				"Responses websocket request lock wait timed out after %g seconds",
-				timeout.Seconds(),
+				timeout.Duration.Seconds(),
 			)
 		}
 	}
@@ -458,19 +504,21 @@ func (m *OpenAIResponsesWSModel) ensureConnection(
 	ctx context.Context,
 	wsURL string,
 	headers map[string]string,
-	timeout time.Duration,
-) (*websocket.Conn, error) {
+	timeout responsesWebsocketTimeout,
+) (*websocket.Conn, bool, error) {
 	identity := websocketConnectionIdentity(wsURL, headers)
 
 	m.connMu.Lock()
 	if m.closed.Load() {
 		m.connMu.Unlock()
-		return nil, UserErrorf("responses websocket model is closed")
+		return nil, false, UserErrorf("responses websocket model is closed")
 	}
 	if m.conn != nil && m.connIdentity == identity {
-		conn := m.conn
-		m.connMu.Unlock()
-		return conn, nil
+		if isReusableResponsesWebsocketConnection(m.conn) {
+			conn := m.conn
+			m.connMu.Unlock()
+			return conn, true, nil
+		}
 	}
 	oldConn := m.conn
 	m.conn = nil
@@ -483,25 +531,106 @@ func (m *OpenAIResponsesWSModel) ensureConnection(
 
 	conn, err := openResponsesWebsocketConnection(ctx, wsURL, headers, timeout)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	m.connMu.Lock()
 	defer m.connMu.Unlock()
 	if m.closed.Load() {
 		_ = conn.Close()
-		return nil, UserErrorf("responses websocket model is closed")
+		return nil, false, UserErrorf("responses websocket model is closed")
 	}
 	m.conn = conn
 	m.connIdentity = identity
-	return conn, nil
+	return conn, false, nil
+}
+
+func isReusableResponsesWebsocketConnection(conn *websocket.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	if responsesWebsocketBufferedReadBytes(conn) > 0 {
+		return false
+	}
+
+	rawConn := conn.UnderlyingConn()
+	if rawConn == nil {
+		return false
+	}
+	if err := rawConn.SetReadDeadline(time.Now()); err != nil {
+		return false
+	}
+	defer func() { _ = rawConn.SetReadDeadline(time.Time{}) }()
+
+	var probe [1]byte
+	n, err := rawConn.Read(probe[:])
+	if n > 0 {
+		return false
+	}
+	return isNetTimeout(err)
+}
+
+func responsesWebsocketBufferedReadBytes(conn *websocket.Conn) int {
+	if conn == nil {
+		return 0
+	}
+
+	connValue := reflect.ValueOf(conn)
+	if connValue.Kind() != reflect.Pointer || connValue.IsNil() {
+		return 0
+	}
+	connValue = connValue.Elem()
+
+	readerValue := connValue.FieldByName("br")
+	if !readerValue.IsValid() || readerValue.IsNil() {
+		return 0
+	}
+	if !readerValue.CanAddr() {
+		return 0
+	}
+
+	// gorilla/websocket does not expose buffered read state; inspect it to avoid
+	// reusing a socket that already has close-frame bytes waiting.
+	reader := *(**bufio.Reader)(unsafe.Pointer(readerValue.UnsafeAddr()))
+	if reader == nil {
+		return 0
+	}
+	return reader.Buffered()
+}
+
+func shouldRetryResponsesWebsocketPreSend(err error) bool {
+	if err == nil {
+		return false
+	}
+	if websocket.IsCloseError(
+		err,
+		websocket.CloseNormalClosure,
+		websocket.CloseGoingAway,
+		websocket.CloseAbnormalClosure,
+		websocket.CloseNoStatusReceived,
+	) {
+		return true
+	}
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, websocket.ErrCloseSent) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "unexpected eof") ||
+		strings.Contains(message, "use of closed network connection")
 }
 
 func (m *OpenAIResponsesWSModel) writeFrame(
 	ctx context.Context,
 	conn *websocket.Conn,
 	frame map[string]any,
-	timeout time.Duration,
+	timeout responsesWebsocketTimeout,
 ) error {
 	payload, err := json.Marshal(frame)
 	if err != nil {
@@ -518,8 +647,8 @@ func (m *OpenAIResponsesWSModel) writeFrame(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		if timeout != websocketNoTimeout && isNetTimeout(err) {
-			return fmt.Errorf("Responses websocket send timed out after %g seconds", timeout.Seconds())
+		if timeout.Set && isNetTimeout(err) {
+			return fmt.Errorf("Responses websocket send timed out after %g seconds", timeout.Duration.Seconds())
 		}
 		return err
 	}
@@ -529,7 +658,7 @@ func (m *OpenAIResponsesWSModel) writeFrame(
 func (m *OpenAIResponsesWSModel) readEvent(
 	ctx context.Context,
 	conn *websocket.Conn,
-	timeout time.Duration,
+	timeout responsesWebsocketTimeout,
 ) (responses.ResponseStreamEventUnion, map[string]any, error) {
 	if deadline, ok := websocketOperationDeadline(ctx, timeout); ok {
 		if err := conn.SetReadDeadline(deadline); err != nil {
@@ -543,10 +672,10 @@ func (m *OpenAIResponsesWSModel) readEvent(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return responses.ResponseStreamEventUnion{}, nil, ctxErr
 		}
-		if timeout != websocketNoTimeout && isNetTimeout(err) {
+		if timeout.Set && isNetTimeout(err) {
 			return responses.ResponseStreamEventUnion{}, nil, fmt.Errorf(
 				"Responses websocket receive timed out after %g seconds",
-				timeout.Seconds(),
+				timeout.Duration.Seconds(),
 			)
 		}
 		return responses.ResponseStreamEventUnion{}, nil, err
@@ -599,11 +728,11 @@ func openResponsesWebsocketConnection(
 	ctx context.Context,
 	wsURL string,
 	headers map[string]string,
-	timeout time.Duration,
+	timeout responsesWebsocketTimeout,
 ) (*websocket.Conn, error) {
 	dialer := websocket.Dialer{}
-	if timeout > 0 {
-		dialer.HandshakeTimeout = timeout
+	if timeout.Set && timeout.Duration > 0 {
+		dialer.HandshakeTimeout = timeout.Duration
 	}
 
 	header := http.Header{}
@@ -613,15 +742,15 @@ func openResponsesWebsocketConnection(
 
 	dialCtx := ctx
 	var cancel context.CancelFunc
-	if timeout >= 0 {
-		dialCtx, cancel = context.WithTimeout(ctx, timeout)
+	if timeout.Set {
+		dialCtx, cancel = context.WithTimeout(ctx, timeout.Duration)
 		defer cancel()
 	}
 
 	conn, _, err := dialer.DialContext(dialCtx, wsURL, header)
 	if err != nil {
-		if timeout != websocketNoTimeout && (errors.Is(err, context.DeadlineExceeded) || isNetTimeout(err)) {
-			return nil, fmt.Errorf("Responses websocket connect timed out after %g seconds", timeout.Seconds())
+		if timeout.Set && (errors.Is(err, context.DeadlineExceeded) || isNetTimeout(err)) {
+			return nil, fmt.Errorf("Responses websocket connect timed out after %g seconds", timeout.Duration.Seconds())
 		}
 		return nil, err
 	}
@@ -677,7 +806,7 @@ func websocketRequestTimeoutsFromModelSettings(
 	settings modelsettings.ModelSettings,
 	client OpenaiClient,
 ) responsesWebsocketRequestTimeouts {
-	timeout := websocketNoTimeout
+	timeout := responsesWebsocketTimeout{}
 	if settings.ExtraArgs != nil {
 		if value, ok := settings.ExtraArgs["timeout"]; ok {
 			if parsed, ok := parseResponsesWebsocketTimeout(value); ok {
@@ -685,8 +814,11 @@ func websocketRequestTimeoutsFromModelSettings(
 			}
 		}
 	}
-	if timeout == websocketNoTimeout && client.RequestTimeout > 0 {
-		timeout = client.RequestTimeout
+	if !timeout.Set && client.RequestTimeout > 0 {
+		timeout = responsesWebsocketTimeout{
+			Duration: client.RequestTimeout,
+			Set:      true,
+		}
 	}
 
 	return responsesWebsocketRequestTimeouts{
@@ -697,48 +829,42 @@ func websocketRequestTimeoutsFromModelSettings(
 	}
 }
 
-func parseResponsesWebsocketTimeout(value any) (time.Duration, bool) {
+func parseResponsesWebsocketTimeout(value any) (responsesWebsocketTimeout, bool) {
 	switch typed := value.(type) {
 	case time.Duration:
-		if typed < 0 {
-			return websocketNoTimeout, false
-		}
-		return typed, true
+		return responsesWebsocketTimeout{Duration: typed, Set: true}, true
 	case float32:
-		if typed < 0 {
-			return websocketNoTimeout, false
+		if math.IsNaN(float64(typed)) || math.IsInf(float64(typed), 0) {
+			return responsesWebsocketTimeout{}, false
 		}
-		return time.Duration(float64(typed) * float64(time.Second)), true
+		return responsesWebsocketTimeout{
+			Duration: time.Duration(float64(typed) * float64(time.Second)),
+			Set:      true,
+		}, true
 	case float64:
-		if typed < 0 {
-			return websocketNoTimeout, false
+		if math.IsNaN(typed) || math.IsInf(typed, 0) {
+			return responsesWebsocketTimeout{}, false
 		}
-		return time.Duration(typed * float64(time.Second)), true
+		return responsesWebsocketTimeout{
+			Duration: time.Duration(typed * float64(time.Second)),
+			Set:      true,
+		}, true
 	case int:
-		if typed < 0 {
-			return websocketNoTimeout, false
-		}
-		return time.Duration(typed) * time.Second, true
+		return responsesWebsocketTimeout{Duration: time.Duration(typed) * time.Second, Set: true}, true
 	case int32:
-		if typed < 0 {
-			return websocketNoTimeout, false
-		}
-		return time.Duration(typed) * time.Second, true
+		return responsesWebsocketTimeout{Duration: time.Duration(typed) * time.Second, Set: true}, true
 	case int64:
-		if typed < 0 {
-			return websocketNoTimeout, false
-		}
-		return time.Duration(typed) * time.Second, true
+		return responsesWebsocketTimeout{Duration: time.Duration(typed) * time.Second, Set: true}, true
 	}
-	return websocketNoTimeout, false
+	return responsesWebsocketTimeout{}, false
 }
 
-func websocketOperationDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) {
+func websocketOperationDeadline(ctx context.Context, timeout responsesWebsocketTimeout) (time.Time, bool) {
 	var deadline time.Time
 	hasDeadline := false
 
-	if timeout >= 0 {
-		deadline = time.Now().Add(timeout)
+	if timeout.Set {
+		deadline = time.Now().Add(timeout.Duration)
 		hasDeadline = true
 	}
 	if ctxDeadline, ok := ctx.Deadline(); ok {

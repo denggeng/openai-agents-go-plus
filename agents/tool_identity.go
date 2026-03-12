@@ -180,6 +180,9 @@ func validateFunctionToolLookupConfiguration(tools []Tool) error {
 		if err := validateFunctionToolNamespaceShape(functionTool.Name, functionTool.Namespace); err != nil {
 			return err
 		}
+		if err := validateFunctionToolTimeoutConfig(functionTool); err != nil {
+			return err
+		}
 		if isDeferredTopLevelFunctionTool(functionTool) {
 			deferredName := strings.TrimSpace(functionTool.Name)
 			if _, exists := deferredTopLevelOwners[deferredName]; exists {

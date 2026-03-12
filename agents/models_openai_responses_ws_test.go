@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -90,6 +91,66 @@ func TestOpenAIResponsesWSModelGetResponseReusesPersistentConnection(t *testing.
 	assert.Equal(t, true, frames[0]["stream"])
 	assert.Equal(t, "gpt-4.1", frames[0]["model"])
 	assert.Equal(t, "resp-1", frames[1]["previous_response_id"])
+}
+
+func TestOpenAIResponsesWSModelReconnectsAfterServerClose(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		connectCount int
+		firstClosed  = make(chan struct{})
+	)
+
+	server := newResponsesWSTestServer(t, func(conn *websocket.Conn, _ *http.Request) {
+		mu.Lock()
+		connectCount++
+		connectionNumber := connectCount
+		mu.Unlock()
+
+		var frame map[string]any
+		if err := conn.ReadJSON(&frame); err != nil {
+			return
+		}
+		if err := conn.WriteMessage(
+			websocket.TextMessage,
+			[]byte(wsCompletedFrame(fmt.Sprintf("resp-%d", connectionNumber), 1)),
+		); err != nil {
+			return
+		}
+		if connectionNumber != 1 {
+			return
+		}
+
+		if tcpConn, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+			_ = tcpConn.SetLinger(0)
+		}
+		_ = conn.Close()
+		close(firstClosed)
+	})
+
+	client := NewOpenaiClient(param.NewOpt(server.URL+"/v1"), param.NewOpt("test-key"))
+	model := NewOpenAIResponsesWSModel("gpt-4.1", client, "")
+
+	first, err := model.GetResponse(t.Context(), ModelResponseParams{
+		Input: InputString("hi"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "resp-1", first.ResponseID)
+
+	select {
+	case <-firstClosed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first websocket to close")
+	}
+
+	second, err := model.GetResponse(t.Context(), ModelResponseParams{
+		Input: InputString("next"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "resp-2", second.ResponseID)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 2, connectCount)
 }
 
 func TestOpenAIResponsesWSModelUsesExplicitWebsocketBaseURLAndHeaders(t *testing.T) {
@@ -243,6 +304,29 @@ func TestOpenAIResponsesWSModelReceiveTimeoutDropsConnection(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "receive timed out")
+}
+
+func TestOpenAIResponsesWSModelNegativeTimeoutTimesOutImmediately(t *testing.T) {
+	server := newResponsesWSTestServer(t, func(conn *websocket.Conn, _ *http.Request) {
+		var frame map[string]any
+		if err := conn.ReadJSON(&frame); err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(wsCompletedFrame("resp-negative", 1)))
+	})
+
+	client := NewOpenaiClient(param.NewOpt(server.URL+"/v1"), param.NewOpt("test-key"))
+	client.RequestTimeout = time.Second
+	model := NewOpenAIResponsesWSModel("gpt-4.1", client, "")
+
+	_, err := model.GetResponse(t.Context(), ModelResponseParams{
+		Input: InputString("hi"),
+		ModelSettings: modelsettings.ModelSettings{
+			ExtraArgs: map[string]any{"timeout": -1.0},
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out after -1 seconds")
 }
 
 func newResponsesWSTestServer(

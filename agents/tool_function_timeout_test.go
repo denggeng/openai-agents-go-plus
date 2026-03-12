@@ -3,6 +3,7 @@ package agents_test
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -94,4 +95,61 @@ func TestFunctionToolInvokeDoesNotRewriteToolRaisedTimeoutError(t *testing.T) {
 
 	_, err := tool.Invoke(t.Context(), "{}")
 	require.ErrorIs(t, err, internalErr)
+}
+
+func TestFunctionToolTimeoutRejectsInvalidConfig(t *testing.T) {
+	tests := []struct {
+		name            string
+		timeoutSeconds  *float64
+		timeoutBehavior agents.ToolTimeoutBehavior
+		wantMessage     string
+	}{
+		{
+			name:           "zero timeout",
+			timeoutSeconds: float64Ptr(0),
+			wantMessage:    "greater than 0",
+		},
+		{
+			name:           "negative timeout",
+			timeoutSeconds: float64Ptr(-1),
+			wantMessage:    "greater than 0",
+		},
+		{
+			name:           "nan timeout",
+			timeoutSeconds: float64Ptr(math.NaN()),
+			wantMessage:    "finite number",
+		},
+		{
+			name:           "inf timeout",
+			timeoutSeconds: float64Ptr(math.Inf(1)),
+			wantMessage:    "finite number",
+		},
+		{
+			name:            "unsupported behavior",
+			timeoutBehavior: agents.ToolTimeoutBehavior("unsupported"),
+			wantMessage:     "must be one of",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			tool := agents.FunctionTool{
+				Name:             "bad_tool",
+				Description:      "bad",
+				ParamsJSONSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+				OnInvokeTool: func(context.Context, string) (any, error) {
+					called = true
+					return "ok", nil
+				},
+				TimeoutSeconds:  tt.timeoutSeconds,
+				TimeoutBehavior: tt.timeoutBehavior,
+			}
+
+			_, err := tool.Invoke(t.Context(), "{}")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantMessage)
+			assert.False(t, called)
+		})
+	}
 }

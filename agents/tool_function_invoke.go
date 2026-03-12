@@ -17,6 +17,7 @@ package agents
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 )
 
@@ -27,6 +28,9 @@ type functionToolInvokeResult struct {
 
 // Invoke executes the function tool handler and enforces timeout semantics when configured.
 func (t FunctionTool) Invoke(ctx context.Context, arguments string) (any, error) {
+	if err := validateFunctionToolTimeoutConfig(t); err != nil {
+		return nil, err
+	}
 	if t.OnInvokeTool == nil {
 		return nil, UserErrorf("function tool %q has no OnInvokeTool handler", t.Name)
 	}
@@ -73,5 +77,26 @@ func (t FunctionTool) Invoke(ctx context.Context, arguments string) (any, error)
 			return DefaultToolTimeoutErrorMessage(t.Name, timeoutSeconds), nil
 		}
 		return (*t.TimeoutErrorFunction)(ctx, timeoutErr)
+	}
+}
+
+func validateFunctionToolTimeoutConfig(tool FunctionTool) error {
+	if tool.TimeoutSeconds != nil {
+		timeoutSeconds := *tool.TimeoutSeconds
+		switch {
+		case math.IsNaN(timeoutSeconds) || math.IsInf(timeoutSeconds, 0):
+			return UserErrorf("FunctionTool timeout_seconds must be a finite number.")
+		case timeoutSeconds <= 0:
+			return UserErrorf("FunctionTool timeout_seconds must be greater than 0.")
+		}
+	}
+
+	switch normalizeToolTimeoutBehavior(tool.TimeoutBehavior) {
+	case ToolTimeoutBehaviorErrorAsResult, ToolTimeoutBehaviorRaiseException:
+		return nil
+	default:
+		return UserErrorf(
+			"FunctionTool timeout_behavior must be one of: 'error_as_result', 'raise_exception'.",
+		)
 	}
 }
