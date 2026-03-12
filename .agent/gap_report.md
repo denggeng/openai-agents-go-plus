@@ -5,6 +5,9 @@ Method:
 - manually reviewed low-confidence filename mismatches instead of relying on name matching alone
 - treated Python-only ergonomics/integration tests separately from actionable Go parity gaps
 
+Audit refresh:
+- 2026-03-12: re-ran the Python-vs-Go parity audit after the MultiProvider prefix-mode port; `go test ./...` passed and no new P0/P1 runtime gaps were found against upstream `v0.11.1`
+
 ## Aligned
 - HTTP Responses request/stream behavior is mostly aligned for non-websocket transport. Go now captures `request_id` in `agents/models_openai_responses.go`, persists `ModelResponse.RequestID` in `agents/items.go`, and finalizes streamed runs on `response.completed`, `response.failed`, and `response.incomplete` in `agents/run.go`, matching current Python `models/openai_responses.py` / `run.py`.
 - Tracing export sanitation is aligned. `tracing/processors.go` now sanitizes JSON-incompatible payloads and truncates oversized `span_data.input` / `span_data.output` before OpenAI trace ingest, matching Python `tracing/processors.py`.
