@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -166,6 +167,115 @@ func TestMultipleToolCalls(t *testing.T) {
 	assertItemIsFunctionToolCallOutput(t, items[4], agent, "456", "")
 
 	assert.IsType(t, NextStepRunAgain{}, result.NextStep)
+}
+
+func TestFunctionToolTimeoutReturnsErrorAsResult(t *testing.T) {
+	timeout := 0.01
+	slowTool := FunctionTool{
+		Name:             "slow_tool",
+		Description:      "slow",
+		ParamsJSONSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		OnInvokeTool: func(context.Context, string) (any, error) {
+			time.Sleep(200 * time.Millisecond)
+			return "slow", nil
+		},
+		TimeoutSeconds: &timeout,
+	}
+
+	agent := &Agent{
+		Name:  "test",
+		Tools: []Tool{slowTool},
+	}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			getFunctionToolCall("slow_tool", `{}`, ""),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+	result := getExecuteResult(t, getExecuteResultParams{
+		agent:    agent,
+		response: response,
+	})
+
+	items := result.GeneratedItems()
+	require.Len(t, items, 2)
+	toolCallItem, ok := items[0].(ToolCallItem)
+	require.True(t, ok)
+	assert.Equal(t, agent, toolCallItem.Agent)
+	assert.Equal(t, "slow_tool", toolCallItem.RawItem.(ResponseFunctionToolCall).Name)
+	assert.Equal(t, "slow", toolCallItem.Description)
+	outputItem, ok := items[1].(ToolCallOutputItem)
+	require.True(t, ok)
+	assert.Contains(t, outputItem.Output.(string), "timed out")
+	assert.IsType(t, NextStepRunAgain{}, result.NextStep)
+}
+
+func TestMultipleToolCallsStillRaiseToolTimeoutError(t *testing.T) {
+	timeout := 0.01
+	var noFailureHandler ToolErrorFunction
+	okTool := FunctionTool{
+		Name:             "ok_tool",
+		Description:      "ok",
+		ParamsJSONSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		OnInvokeTool: func(context.Context, string) (any, error) {
+			return "ok", nil
+		},
+		FailureErrorFunction: &noFailureHandler,
+	}
+	slowTool := FunctionTool{
+		Name:             "slow_tool",
+		Description:      "slow",
+		ParamsJSONSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		OnInvokeTool: func(context.Context, string) (any, error) {
+			time.Sleep(200 * time.Millisecond)
+			return "slow", nil
+		},
+		TimeoutSeconds:       &timeout,
+		TimeoutBehavior:      ToolTimeoutBehaviorRaiseException,
+		FailureErrorFunction: &noFailureHandler,
+	}
+
+	agent := &Agent{
+		Name:  "test",
+		Tools: []Tool{okTool, slowTool},
+	}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			getFunctionToolCall("ok_tool", `{}`, "1"),
+			getFunctionToolCall("slow_tool", `{}`, "2"),
+		},
+		Usage:      usage.NewUsage(),
+		ResponseID: "",
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+
+	_, err = RunImpl().ExecuteToolsAndSideEffects(
+		t.Context(),
+		agent,
+		InputString("hello"),
+		nil,
+		response,
+		*processed,
+		agent.OutputType,
+		NoOpRunHooks{},
+		RunConfig{},
+		nil,
+	)
+	require.Error(t, err)
+	var timeoutErr ToolTimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.Equal(t, "slow_tool", timeoutErr.ToolName)
 }
 
 func TestMultipleToolCallsWithToolContext(t *testing.T) {

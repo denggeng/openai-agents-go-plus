@@ -25,7 +25,7 @@ import (
 )
 
 func TestRunStateAcceptsSupportedSchemaVersions(t *testing.T) {
-	for _, version := range []string{"1.0", "1.1", "1.2", "1.3", "1.4"} {
+	for _, version := range []string{"1.0", "1.1", "1.2", "1.3", "1.4", "1.5"} {
 		t.Run(version, func(t *testing.T) {
 			_, err := agents.RunStateFromJSONString(
 				fmt.Sprintf(`{"$schemaVersion":"%s","current_turn":1,"max_turns":1}`, version),

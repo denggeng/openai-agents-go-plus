@@ -16,6 +16,7 @@ package agents_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"github.com/denggeng/openai-agents-go-plus/agents"
 	"github.com/denggeng/openai-agents-go-plus/computer"
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
@@ -68,7 +70,12 @@ func TestConvertToolChoiceStandardValues(t *testing.T) {
 		},
 		{
 			modelsettings.ToolChoiceString("computer_use_preview"),
-			R{OfHostedTool: &responses.ToolChoiceTypesParam{Type: responses.ToolChoiceTypesTypeComputerUsePreview}},
+			R{
+				OfFunctionTool: &responses.ToolChoiceFunctionParam{
+					Name: "computer_use_preview",
+					Type: constant.ValueOf[constant.Function](),
+				},
+			},
 		},
 		{
 			modelsettings.ToolChoiceString("image_generation"),
@@ -260,6 +267,57 @@ func TestConvertToolsBasicTypesAndIncludes(t *testing.T) {
 	})
 }
 
+func TestConvertToolsGroupsNamespacedFunctionTools(t *testing.T) {
+	crmTools, err := agents.ToolNamespace(
+		"crm",
+		"CRM tools",
+		testFunctionTool("lookup_account", "Lookup account"),
+		testFunctionTool("update_account", "Update account"),
+	)
+	require.NoError(t, err)
+
+	converted, err := agents.ResponsesConverter().ConvertTools(
+		t.Context(),
+		[]agents.Tool{crmTools[0], crmTools[1], testFunctionTool("bare_tool", "Bare tool")},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Empty(t, converted.Includes)
+
+	raw, err := json.Marshal(converted.Tools)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[
+		{
+			"type": "namespace",
+			"name": "crm",
+			"description": "CRM tools",
+			"tools": [
+				{
+					"type": "function",
+					"name": "lookup_account",
+					"description": "Lookup account",
+					"parameters": {"type":"object","properties":{}},
+					"strict": true
+				},
+				{
+					"type": "function",
+					"name": "update_account",
+					"description": "Update account",
+					"parameters": {"type":"object","properties":{}},
+					"strict": true
+				}
+			]
+		},
+		{
+			"type": "function",
+			"name": "bare_tool",
+			"description": "Bare tool",
+			"parameters": {"type":"object","properties":{}},
+			"strict": true
+		}
+	]`, string(raw))
+}
+
 func TestConvertToolsIncludesHandoffs(t *testing.T) {
 	//  When handoff objects are included, `ConvertTools` should append their
 	//  tool param items after tools and include appropriate descriptions.
@@ -293,4 +351,336 @@ func TestConvertToolsIncludesHandoffs(t *testing.T) {
 		},
 		Includes: nil,
 	}, converted)
+}
+
+func TestConvertToolChoiceComputerVariantsFollowEffectiveModel(t *testing.T) {
+	compTool := agents.ComputerTool{Computer: DummyComputer{}}
+
+	testCases := []struct {
+		name       string
+		toolChoice modelsettings.ToolChoice
+		tools      []agents.Tool
+		model      openai.ChatModel
+		wantJSON   string
+	}{
+		{
+			name:       "ga model uses ga selector for computer",
+			toolChoice: modelsettings.ToolChoiceString("computer"),
+			tools:      []agents.Tool{compTool},
+			model:      "gpt-5.4",
+			wantJSON:   `{"type":"computer"}`,
+		},
+		{
+			name:       "ga model uses ga selector for preview alias",
+			toolChoice: modelsettings.ToolChoiceString("computer_use_preview"),
+			tools:      []agents.Tool{compTool},
+			model:      "gpt-5.4",
+			wantJSON:   `{"type":"computer"}`,
+		},
+		{
+			name:       "preview model keeps preview selector",
+			toolChoice: modelsettings.ToolChoiceString("computer"),
+			tools:      []agents.Tool{compTool},
+			model:      "computer-use-preview",
+			wantJSON:   `{"type":"computer_use_preview"}`,
+		},
+		{
+			name:       "prompt managed explicit ga alias uses ga selector",
+			toolChoice: modelsettings.ToolChoiceString("computer_use"),
+			tools:      []agents.Tool{compTool},
+			model:      "",
+			wantJSON:   `{"type":"computer"}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := agents.ResponsesConverter().ConvertToolChoiceForRequest(
+				tc.toolChoice,
+				tc.tools,
+				nil,
+				tc.model,
+			)
+			require.NoError(t, err)
+			assertToolChoiceJSONEq(t, tc.wantJSON, got)
+		})
+	}
+}
+
+func TestConvertToolChoiceAllowsFunctionNamedBuiltinAliases(t *testing.T) {
+	toolCases := []struct {
+		name       string
+		toolChoice modelsettings.ToolChoice
+		tool       agents.FunctionTool
+		wantJSON   string
+	}{
+		{
+			name:       "computer",
+			toolChoice: modelsettings.ToolChoiceString("computer"),
+			tool:       testFunctionTool("computer", "Computer alias"),
+			wantJSON:   `{"type":"function","name":"computer"}`,
+		},
+		{
+			name:       "computer_use",
+			toolChoice: modelsettings.ToolChoiceString("computer_use"),
+			tool:       testFunctionTool("computer_use", "Computer use alias"),
+			wantJSON:   `{"type":"function","name":"computer_use"}`,
+		},
+		{
+			name:       "tool_search",
+			toolChoice: modelsettings.ToolChoiceString("tool_search"),
+			tool:       testFunctionTool("tool_search", "Tool search alias"),
+			wantJSON:   `{"type":"function","name":"tool_search"}`,
+		},
+	}
+
+	for _, tc := range toolCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := agents.ResponsesConverter().ConvertToolChoiceForRequest(
+				tc.toolChoice,
+				[]agents.Tool{tc.tool},
+				nil,
+				"",
+			)
+			require.NoError(t, err)
+			assertToolChoiceJSONEq(t, tc.wantJSON, got)
+		})
+	}
+}
+
+func TestConvertToolChoiceValidatesToolSearchAndNamespaceRules(t *testing.T) {
+	deferredTool := testFunctionTool("lookup_weather", "Deferred weather")
+	deferredTool.DeferLoading = true
+
+	t.Run("hosted tool search choice is rejected", func(t *testing.T) {
+		_, err := agents.ResponsesConverter().ConvertToolChoiceForRequest(
+			modelsettings.ToolChoiceString("tool_search"),
+			[]agents.Tool{deferredTool, agents.ToolSearchTool{}},
+			nil,
+			"",
+		)
+		require.ErrorContains(t, err, "ToolSearchTool()")
+	})
+
+	t.Run("tool_search without matching local or hosted definition is rejected", func(t *testing.T) {
+		namespacedTools, err := agents.ToolNamespace(
+			"crm",
+			"CRM tools",
+			testFunctionTool("lookup_weather", "Lookup weather"),
+		)
+		require.NoError(t, err)
+
+		_, err = agents.ResponsesConverter().ConvertToolChoiceForRequest(
+			modelsettings.ToolChoiceString("tool_search"),
+			[]agents.Tool{namespacedTools[0]},
+			nil,
+			"",
+		)
+		require.ErrorContains(t, err, "requires ToolSearchTool() or a real top-level function tool named `tool_search`")
+	})
+
+	t.Run("required rejects deferred tools without tool search", func(t *testing.T) {
+		_, err := agents.ResponsesConverter().ConvertToolChoiceForRequest(
+			modelsettings.ToolChoiceRequired,
+			[]agents.Tool{deferredTool},
+			nil,
+			"",
+		)
+		require.ErrorContains(t, err, "ToolSearchTool()")
+	})
+
+	t.Run("required allows deferred tools with tool search", func(t *testing.T) {
+		got, err := agents.ResponsesConverter().ConvertToolChoiceForRequest(
+			modelsettings.ToolChoiceRequired,
+			[]agents.Tool{deferredTool, agents.ToolSearchTool{}},
+			nil,
+			"",
+		)
+		require.NoError(t, err)
+		assertToolChoiceJSONEq(t, `"required"`, got)
+	})
+
+	t.Run("qualified namespaced function is allowed", func(t *testing.T) {
+		namespacedTools, err := agents.ToolNamespace(
+			"crm",
+			"CRM tools",
+			testFunctionTool("lookup_account", "Lookup account"),
+		)
+		require.NoError(t, err)
+
+		got, err := agents.ResponsesConverter().ConvertToolChoiceForRequest(
+			modelsettings.ToolChoiceString("crm.lookup_account"),
+			[]agents.Tool{namespacedTools[0]},
+			nil,
+			"",
+		)
+		require.NoError(t, err)
+		assertToolChoiceJSONEq(t, `{"type":"function","name":"crm.lookup_account"}`, got)
+
+		_, err = agents.ResponsesConverter().ConvertToolChoiceForRequest(
+			modelsettings.ToolChoiceString("lookup_account"),
+			[]agents.Tool{namespacedTools[0]},
+			nil,
+			"",
+		)
+		require.ErrorContains(t, err, "tool_namespace()")
+
+		_, err = agents.ResponsesConverter().ConvertToolChoiceForRequest(
+			modelsettings.ToolChoiceString("crm"),
+			[]agents.Tool{namespacedTools[0]},
+			nil,
+			"",
+		)
+		require.ErrorContains(t, err, "tool_namespace()")
+	})
+
+	t.Run("deferred only top level function name is rejected", func(t *testing.T) {
+		_, err := agents.ResponsesConverter().ConvertToolChoiceForRequest(
+			modelsettings.ToolChoiceString("lookup_weather"),
+			[]agents.Tool{deferredTool},
+			nil,
+			"",
+		)
+		require.ErrorContains(t, err, "deferred-loading function tools")
+	})
+}
+
+func TestConvertToolsSupportsToolSearchNamespacesAndDeferredSurfaces(t *testing.T) {
+	eagerTool := testFunctionTool("get_customer_profile", "Get customer profile")
+	deferredTool := testFunctionTool("list_open_orders", "List open orders")
+	deferredTool.DeferLoading = true
+
+	namespacedTools, err := agents.ToolNamespace(
+		"crm",
+		"CRM tools for customer lookups.",
+		eagerTool,
+		deferredTool,
+	)
+	require.NoError(t, err)
+
+	converted, err := agents.ResponsesConverter().ConvertTools(
+		t.Context(),
+		[]agents.Tool{namespacedTools[0], namespacedTools[1], agents.ToolSearchTool{}},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Empty(t, converted.Includes)
+
+	assertConvertedToolsJSONEq(t, `[
+		{
+			"type": "namespace",
+			"name": "crm",
+			"description": "CRM tools for customer lookups.",
+			"tools": [
+				{
+					"type": "function",
+					"name": "get_customer_profile",
+					"description": "Get customer profile",
+					"parameters": {"type":"object","properties":{}},
+					"strict": true
+				},
+				{
+					"type": "function",
+					"name": "list_open_orders",
+					"description": "List open orders",
+					"parameters": {"type":"object","properties":{}},
+					"strict": true,
+					"defer_loading": true
+				}
+			]
+		},
+		{"type": "tool_search"}
+	]`, converted)
+}
+
+func TestConvertToolsValidatesToolSearchAndDeferredHostedMCP(t *testing.T) {
+	deferredTool := testFunctionTool("get_weather", "Get weather")
+	deferredTool.DeferLoading = true
+
+	t.Run("deferred top level function requires tool search", func(t *testing.T) {
+		_, err := agents.ResponsesConverter().ConvertTools(
+			t.Context(),
+			[]agents.Tool{deferredTool},
+			nil,
+		)
+		require.ErrorContains(t, err, "ToolSearchTool()")
+	})
+
+	t.Run("tool search without a searchable surface is rejected", func(t *testing.T) {
+		_, err := agents.ResponsesConverter().ConvertTools(
+			t.Context(),
+			[]agents.Tool{testFunctionTool("get_weather", "Get weather"), agents.ToolSearchTool{}},
+			nil,
+		)
+		require.ErrorContains(t, err, "requires at least one searchable Responses surface")
+	})
+
+	t.Run("deferred hosted mcp is serialized with defer_loading", func(t *testing.T) {
+		hostedMCP := agents.HostedMCPTool{
+			ToolConfig: responses.ToolMcpParam{
+				ServerLabel: "crm_server",
+				ServerURL:   param.NewOpt("https://example.com/mcp"),
+				Type:        constant.ValueOf[constant.Mcp](),
+			},
+			DeferLoading: true,
+		}
+
+		converted, err := agents.ResponsesConverter().ConvertTools(
+			t.Context(),
+			[]agents.Tool{
+				hostedMCP,
+				agents.ToolSearchTool{
+					Description: "Search deferred tools on the server.",
+					Execution:   agents.ToolSearchExecutionServer,
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"query": map[string]any{"type": "string"},
+						},
+						"required": []string{"query"},
+					},
+				},
+			},
+			nil,
+		)
+		require.NoError(t, err)
+
+		assertConvertedToolsJSONEq(t, `[
+			{
+				"type": "mcp",
+				"server_label": "crm_server",
+				"server_url": "https://example.com/mcp",
+				"defer_loading": true
+			},
+			{
+				"type": "tool_search",
+				"description": "Search deferred tools on the server.",
+				"execution": "server",
+				"parameters": {
+					"type": "object",
+					"properties": {"query": {"type": "string"}},
+					"required": ["query"]
+				}
+			}
+		]`, converted)
+	})
+}
+
+func assertToolChoiceJSONEq(
+	t *testing.T,
+	want string,
+	got responses.ResponseNewParamsToolChoiceUnion,
+) {
+	t.Helper()
+	raw, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.JSONEq(t, want, string(raw))
+}
+
+func assertConvertedToolsJSONEq(t *testing.T, want string, got *agents.ConvertedTools) {
+	t.Helper()
+	require.NotNil(t, got)
+	raw, err := json.Marshal(got.Tools)
+	require.NoError(t, err)
+	assert.JSONEq(t, want, string(raw))
 }

@@ -16,6 +16,7 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -244,6 +245,56 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 		require.True(t, params.TopLogprobs.Valid())
 		assert.Equal(t, int64(2), params.TopLogprobs.Value)
 		assert.Contains(t, params.Include, responses.ResponseIncludableMessageOutputTextLogprobs)
+	})
+
+	t.Run("ga model uses ga computer payload and selector", func(t *testing.T) {
+		m := NewOpenAIResponsesModel("gpt-5.4", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))
+		params, _, err := m.prepareRequest(
+			t.Context(),
+			param.Opt[string]{},
+			InputString("input"),
+			modelsettings.ModelSettings{
+				ToolChoice: modelsettings.ToolChoiceString("computer_use_preview"),
+			},
+			[]Tool{ComputerTool{Computer: DummyComputer{}}},
+			nil,
+			nil,
+			"",
+			"",
+			false,
+			responses.ResponsePromptParam{},
+		)
+		require.NoError(t, err)
+
+		toolsJSON, err := json.Marshal(params.Tools)
+		require.NoError(t, err)
+		assert.JSONEq(t, `[{"type":"computer"}]`, string(toolsJSON))
+
+		toolChoiceJSON, err := json.Marshal(params.ToolChoice)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"type":"computer"}`, string(toolChoiceJSON))
+	})
+
+	t.Run("prompt managed tool search allows opaque surface", func(t *testing.T) {
+		m := NewOpenAIResponsesModel("model-name", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))
+		params, _, err := m.prepareRequest(
+			t.Context(),
+			param.Opt[string]{},
+			InputString("input"),
+			modelsettings.ModelSettings{},
+			[]Tool{ToolSearchTool{}},
+			nil,
+			nil,
+			"",
+			"",
+			false,
+			responses.ResponsePromptParam{ID: "prompt_123"},
+		)
+		require.NoError(t, err)
+
+		toolsJSON, err := json.Marshal(params.Tools)
+		require.NoError(t, err)
+		assert.JSONEq(t, `[{"type":"tool_search"}]`, string(toolsJSON))
 	})
 }
 

@@ -1233,7 +1233,7 @@ func (r Runner) resolveApplyPatchInterruptionsOnResume(
 	}
 
 	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
-	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
+	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs, resumeState.GeneratedItems)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1304,7 +1304,7 @@ func (r Runner) resolveFunctionToolInterruptionsOnResume(
 	}
 
 	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
-	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
+	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs, resumeState.GeneratedItems)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -1390,7 +1390,7 @@ func (r Runner) resolveShellInterruptionsOnResume(
 	}
 
 	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
-	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
+	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs, resumeState.GeneratedItems)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1485,7 +1485,7 @@ func (r Runner) resolveComputerActionsOnResume(
 	}
 
 	lastResponse := resumeState.ModelResponses[len(resumeState.ModelResponses)-1]
-	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs)
+	processed, err := RunImpl().ProcessModelResponse(ctx, agent, allTools, lastResponse, handoffs, resumeState.GeneratedItems)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2212,7 +2212,7 @@ func (r Runner) startStreaming(
 		if err != nil {
 			return err
 		}
-		markTraceIDStarted(trace.TraceID(), currentTracingAPIKeyHash())
+		markTraceIDStarted(trace.TraceID())
 	}
 
 	conversationID, resolvedPreviousResponseID, autoPrevious := resolveConversationSettings(runConfig, resumeState)
@@ -3226,6 +3226,7 @@ func (Runner) getSingleStepResultFromResponse(
 		allTools,
 		newResponse,
 		handoffs,
+		preStepItems,
 	)
 	if err != nil {
 		return nil, err

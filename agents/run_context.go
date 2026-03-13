@@ -19,6 +19,7 @@ import (
 	"reflect"
 
 	"github.com/denggeng/openai-agents-go-plus/usage"
+	"github.com/openai/openai-go/v3/responses"
 )
 
 type toolApprovalRecord struct {
@@ -83,6 +84,19 @@ func (c *RunContextWrapper[T]) getOrCreateApprovalRecord(toolName string) *toolA
 	return record
 }
 
+func (c *RunContextWrapper[T]) approvalStatusForKeys(keys []string, callID string) (bool, bool) {
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		approved, known := c.IsToolApproved(key, callID)
+		if known {
+			return approved, true
+		}
+	}
+	return false, false
+}
+
 // IsToolApproved returns (approved, known).
 // If known is false, there is no explicit decision for this tool+call_id yet.
 func (c *RunContextWrapper[T]) IsToolApproved(toolName, callID string) (bool, bool) {
@@ -112,24 +126,29 @@ func (c *RunContextWrapper[T]) applyApprovalDecision(
 	always bool,
 	approve bool,
 ) {
-	toolName := resolveApprovalToolName(approvalItem)
-	callID := resolveApprovalCallID(approvalItem)
-	record := c.getOrCreateApprovalRecord(toolName)
-
-	if always || callID == "" {
-		record.ApprovedAll = approve
-		record.RejectedAll = !approve
-		clear(record.ApprovedCallIDs)
-		clear(record.RejectedCallIDs)
-		return
+	toolKeys := approvalRecordKeysFromItem(approvalItem)
+	if len(toolKeys) == 0 {
+		toolKeys = []string{resolveApprovalToolName(approvalItem)}
 	}
+	callID := resolveApprovalCallID(approvalItem)
+	for _, toolKey := range toolKeys {
+		record := c.getOrCreateApprovalRecord(toolKey)
 
-	if approve {
-		delete(record.RejectedCallIDs, callID)
-		record.ApprovedCallIDs[callID] = struct{}{}
-	} else {
-		delete(record.ApprovedCallIDs, callID)
-		record.RejectedCallIDs[callID] = struct{}{}
+		if always || callID == "" {
+			record.ApprovedAll = approve
+			record.RejectedAll = !approve
+			clear(record.ApprovedCallIDs)
+			clear(record.RejectedCallIDs)
+			continue
+		}
+
+		if approve {
+			delete(record.RejectedCallIDs, callID)
+			record.ApprovedCallIDs[callID] = struct{}{}
+		} else {
+			delete(record.ApprovedCallIDs, callID)
+			record.RejectedCallIDs[callID] = struct{}{}
+		}
 	}
 }
 
@@ -151,12 +170,39 @@ func (c *RunContextWrapper[T]) GetApprovalStatus(
 	callID string,
 	existingPending *ToolApprovalItem,
 ) (bool, bool) {
-	approved, known := c.IsToolApproved(toolName, callID)
-	if known || existingPending == nil {
+	keys := approvalLookupKeys(toolName, existingPending)
+	if len(keys) == 0 && toolName != "" {
+		keys = []string{toolName}
+	}
+	approved, known := c.approvalStatusForKeys(keys, callID)
+	if known || existingPending == nil || callID == "" || !isMCPApprovalItem(*existingPending) {
 		return approved, known
 	}
-	approved, known = c.IsToolApproved(resolveApprovalToolName(*existingPending), callID)
-	if known || callID == "" || !isMCPApprovalItem(*existingPending) {
+	for _, record := range c.approvals {
+		if record == nil {
+			continue
+		}
+		if _, ok := record.ApprovedCallIDs[callID]; ok {
+			return true, true
+		}
+		if _, ok := record.RejectedCallIDs[callID]; ok {
+			return false, true
+		}
+	}
+	return approved, known
+}
+
+func (c *RunContextWrapper[T]) getApprovalStatusForLookupKey(
+	lookupKey FunctionToolLookupKey,
+	callID string,
+	existingPending *ToolApprovalItem,
+) (bool, bool) {
+	keys := []string{lookupKey.ApprovalKey()}
+	if lookupKey.IsZero() {
+		keys = approvalLookupKeys("", existingPending)
+	}
+	approved, known := c.approvalStatusForKeys(keys, callID)
+	if known || existingPending == nil || callID == "" || !isMCPApprovalItem(*existingPending) {
 		return approved, known
 	}
 	for _, record := range c.approvals {
@@ -313,6 +359,48 @@ func resolveApprovalCallID(item ToolApprovalItem) string {
 		return v
 	}
 	return ""
+}
+
+func approvalLookupKeys(toolName string, existingPending *ToolApprovalItem) []string {
+	if existingPending != nil {
+		keys := approvalRecordKeysFromItem(*existingPending)
+		if len(keys) > 0 {
+			return keys
+		}
+	}
+	if toolName != "" {
+		return []string{toolName}
+	}
+	return nil
+}
+
+func approvalRecordKeysFromItem(item ToolApprovalItem) []string {
+	if isFunctionToolCallRawItem(item.RawItem) {
+		toolName := resolveApprovalToolName(item)
+		namespace := functionToolCallNamespace(item.RawItem)
+		if lookupKey, ok := getFunctionToolLookupKey(toolName, namespace); ok {
+			return []string{lookupKey.ApprovalKey()}
+		}
+	}
+	toolName := resolveApprovalToolName(item)
+	if toolName == "" {
+		return nil
+	}
+	return []string{toolName}
+}
+
+func isFunctionToolCallRawItem(raw any) bool {
+	switch raw.(type) {
+	case ResponseFunctionToolCall, *ResponseFunctionToolCall, responses.ResponseFunctionToolCall, *responses.ResponseFunctionToolCall:
+		return true
+	}
+	if rawType, ok := stringFromMap(raw, "type"); ok && rawType == "function_call" {
+		return true
+	}
+	if rawType, ok := stringFromField(raw, "Type"); ok && rawType == "function_call" {
+		return true
+	}
+	return rawJSONObjectFieldString(raw, "type") == "function_call"
 }
 
 func providerDataApprovalID(rawItem any) (string, bool) {

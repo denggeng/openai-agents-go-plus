@@ -33,6 +33,18 @@ type FunctionTool struct {
 	// A description of the tool, as shown to the LLM.
 	Description string
 
+	// Optional display title for MCP-derived function tools and persisted tool-call metadata.
+	Title string
+
+	// Optional namespace metadata for OpenAI Responses tool-search surfaces.
+	// Namespaced tools are serialized under a `type:"namespace"` wrapper and
+	// dispatched using a namespace-qualified lookup key.
+	Namespace string
+
+	// Shared namespace description used when this tool is grouped under a
+	// namespace wrapper on the OpenAI Responses API.
+	NamespaceDescription string
+
 	// The JSON schema for the tool's parameters.
 	ParamsJSONSchema map[string]any
 
@@ -46,6 +58,19 @@ type FunctionTool struct {
 	// In case of errors, you can either return an error (which will cause the run to fail) or
 	// return a string error message (which will be sent back to the LLM).
 	OnInvokeTool func(ctx context.Context, arguments string) (any, error)
+
+	// Whether this function tool should be hidden until Responses tool-search loads it.
+	// This feature is only supported on OpenAI Responses models.
+	DeferLoading bool
+
+	// Optional timeout in seconds for the function-tool handler.
+	TimeoutSeconds *float64
+
+	// Timeout handling behavior. The zero value behaves like `error_as_result`.
+	TimeoutBehavior ToolTimeoutBehavior
+
+	// Optional formatter for timeout results when TimeoutBehavior is `error_as_result`.
+	TimeoutErrorFunction *ToolErrorFunction
 
 	// Optional error handling function. When the tool invocation returns an error,
 	// this function is called with the original error and its return value is sent
@@ -85,6 +110,12 @@ type FunctionTool struct {
 
 func (t FunctionTool) ToolName() string {
 	return t.Name
+}
+
+// QualifiedName returns the namespace-qualified display name for the tool when
+// a namespace is configured.
+func (t FunctionTool) QualifiedName() string {
+	return toolTraceName(t.Name, t.Namespace)
 }
 
 func (t FunctionTool) isTool() {}

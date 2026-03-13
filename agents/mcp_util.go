@@ -256,7 +256,8 @@ func (u mcpUtil) toFunctionToolWithOptions(
 
 	functionTool := FunctionTool{
 		Name:             tool.Name,
-		Description:      tool.Description,
+		Description:      resolveMCPToolDescriptionForModel(tool),
+		Title:            resolveMCPToolTitle(tool),
 		ParamsJSONSchema: schema,
 		OnInvokeTool:     invokeFunc,
 		StrictJSONSchema: param.NewOpt(isStrict),

@@ -15,6 +15,7 @@
 package agents_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/denggeng/openai-agents-go-plus/agents"
@@ -89,6 +90,29 @@ func TestToolContextConstructorAcceptsAgentKeyword(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, agent, toolCtx.Agent)
+}
+
+func TestToolContextWithToolCallInfersNamespaceFromRawJSON(t *testing.T) {
+	raw := []byte(`{
+		"type":"function_call",
+		"name":"lookup_account",
+		"call_id":"call-2",
+		"arguments":"{}",
+		"namespace":"billing"
+	}`)
+	var toolCall responses.ResponseFunctionToolCall
+	require.NoError(t, json.Unmarshal(raw, &toolCall))
+
+	toolCtx, err := agents.NewToolContext(
+		map[string]any{},
+		"lookup_account",
+		"call-2",
+		"{}",
+		agents.ToolContextWithToolCall[map[string]any](&toolCall),
+	)
+	require.NoError(t, err)
+	require.Equal(t, "billing", toolCtx.ToolNamespace)
+	require.Equal(t, "billing.lookup_account", toolCtx.QualifiedToolName)
 }
 
 func TestToolContextFromToolContextInheritsAgent(t *testing.T) {

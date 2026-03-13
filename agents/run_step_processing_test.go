@@ -21,11 +21,33 @@ import (
 
 	"github.com/denggeng/openai-agents-go-plus/computer"
 	"github.com/denggeng/openai-agents-go-plus/usage"
+	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared/constant"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type processModelResponseMCPServer struct{}
+
+func (processModelResponseMCPServer) Connect(context.Context) error { return nil }
+func (processModelResponseMCPServer) Cleanup(context.Context) error { return nil }
+func (processModelResponseMCPServer) Name() string                  { return "test_mcp_server" }
+func (processModelResponseMCPServer) UseStructuredContent() bool    { return false }
+func (processModelResponseMCPServer) ListTools(context.Context, *Agent) ([]*mcp.Tool, error) {
+	return nil, nil
+}
+func (processModelResponseMCPServer) CallTool(context.Context, string, map[string]any, map[string]any) (*mcp.CallToolResult, error) {
+	return &mcp.CallToolResult{}, nil
+}
+func (processModelResponseMCPServer) ListPrompts(context.Context) (*mcp.ListPromptsResult, error) {
+	return &mcp.ListPromptsResult{}, nil
+}
+func (processModelResponseMCPServer) GetPrompt(context.Context, string, map[string]string) (*mcp.GetPromptResult, error) {
+	return &mcp.GetPromptResult{}, nil
+}
 
 func TestEmptyResponse(t *testing.T) {
 	agent := &Agent{Name: "test"}
@@ -381,6 +403,108 @@ func TestFunctionWebSearchToolCallParsedCorrectly(t *testing.T) {
 
 	assert.Empty(t, result.Functions)
 	assert.Empty(t, result.Handoffs)
+}
+
+func TestProcessModelResponseSetsTitleForLocalMCPFunctionTool(t *testing.T) {
+	agent := &Agent{Name: "local-mcp"}
+	mcpTool := &mcp.Tool{
+		Name:        "search_docs",
+		InputSchema: &jsonschema.Schema{Type: "object"},
+		Title:       "Search Docs",
+	}
+	functionTool, err := MCPUtil().ToFunctionTool(
+		mcpTool,
+		processModelResponseMCPServer{},
+		false,
+	)
+	require.NoError(t, err)
+
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			outputItemFromMap(t, map[string]any{
+				"type":      "function_call",
+				"name":      "search_docs",
+				"call_id":   "call_search_docs",
+				"status":    "completed",
+				"arguments": `{}`,
+			}),
+		},
+		Usage: usage.NewUsage(),
+	}
+
+	result, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		[]Tool{functionTool},
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, result.NewItems, 1)
+
+	item, ok := result.NewItems[0].(ToolCallItem)
+	require.True(t, ok)
+	assert.Equal(t, "Search Docs", item.Description)
+	assert.Equal(t, "Search Docs", item.Title)
+}
+
+func TestProcessModelResponseUsesMCPListToolsMetadataForHostedMCPCalls(t *testing.T) {
+	agent := &Agent{Name: "hosted-mcp"}
+	hostedTool := HostedMCPTool{
+		ToolConfig: responses.ToolMcpParam{
+			ServerLabel: "docs_server",
+			ServerURL:   param.NewOpt("https://example.com/mcp"),
+			Type:        constant.ValueOf[constant.Mcp](),
+		},
+	}
+
+	var listTools responses.ResponseOutputItemMcpListTools
+	rawListTools, err := json.Marshal(map[string]any{
+		"id":           "mcp_list_tools_1",
+		"server_label": "docs_server",
+		"type":         "mcp_list_tools",
+		"tools": []map[string]any{{
+			"name":        "search_docs",
+			"description": "Search the docs.",
+			"title":       "Search Docs",
+			"annotations": map[string]any{"title": "Search Docs"},
+			"input_schema": map[string]any{
+				"type": "object",
+			},
+		}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(rawListTools, &listTools))
+
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			outputItemFromMap(t, map[string]any{
+				"id":           "mcp_call_1",
+				"arguments":    `{}`,
+				"name":         "search_docs",
+				"server_label": "docs_server",
+				"type":         "mcp_call",
+				"status":       "completed",
+			}),
+		},
+		Usage: usage.NewUsage(),
+	}
+
+	result, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		[]Tool{hostedTool},
+		response,
+		nil,
+		[]RunItem{MCPListToolsItem{Agent: agent, RawItem: listTools, Type: "mcp_list_tools_item"}},
+	)
+	require.NoError(t, err)
+	require.Len(t, result.NewItems, 1)
+
+	item, ok := result.NewItems[0].(ToolCallItem)
+	require.True(t, ok)
+	assert.Equal(t, "Search the docs.", item.Description)
+	assert.Equal(t, "Search Docs", item.Title)
 }
 
 func TestReasoningItemParsedCorrectly(t *testing.T) {
@@ -956,6 +1080,93 @@ func TestProcessModelResponseHandlesCompactionItem(t *testing.T) {
 	assert.Equal(t, "enc", rawPayload["encrypted_content"])
 	_, hasCreatedBy := rawPayload["created_by"]
 	assert.False(t, hasCreatedBy)
+}
+
+func TestProcessModelResponseClassifiesToolSearchItems(t *testing.T) {
+	agent := &Agent{Name: "tool-search-agent"}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustOutputItem(t, map[string]any{
+				"id":        "tsc_123",
+				"type":      "tool_search_call",
+				"arguments": map[string]any{"paths": []string{"crm"}, "query": "profile"},
+				"execution": "server",
+				"status":    "completed",
+			}),
+			mustOutputItem(t, map[string]any{
+				"id":         "tso_123",
+				"type":       "tool_search_output",
+				"execution":  "server",
+				"status":     "completed",
+				"created_by": "server",
+				"tools": []map[string]any{
+					{
+						"type":        "function",
+						"name":        "get_customer_profile",
+						"description": "Fetch a CRM customer profile.",
+						"parameters": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"customer_id": map[string]any{"type": "string"},
+							},
+							"required": []string{"customer_id"},
+						},
+						"defer_loading": true,
+					},
+				},
+			}),
+		},
+		Usage: usage.NewUsage(),
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	processed, err := RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, processed.NewItems, 2)
+
+	_, ok := processed.NewItems[0].(ToolSearchCallItem)
+	require.True(t, ok)
+	outputItem, ok := processed.NewItems[1].(ToolSearchOutputItem)
+	require.True(t, ok)
+	assert.Equal(t, []string{"tool_search", "tool_search"}, processed.ToolsUsed)
+
+	inputRaw, err := json.Marshal(outputItem.ToInputItem())
+	require.NoError(t, err)
+	assert.NotContains(t, string(inputRaw), `"created_by"`)
+}
+
+func TestProcessModelResponseRejectsClientExecutedToolSearchCall(t *testing.T) {
+	agent := &Agent{Name: "tool-search-agent"}
+	response := ModelResponse{
+		Output: []TResponseOutputItem{
+			mustOutputItem(t, map[string]any{
+				"id":        "tsc_client",
+				"type":      "tool_search_call",
+				"arguments": map[string]any{"query": "profile"},
+				"execution": "client",
+				"status":    "completed",
+			}),
+		},
+		Usage: usage.NewUsage(),
+	}
+
+	allTools, err := agent.GetAllTools(t.Context())
+	require.NoError(t, err)
+	_, err = RunImpl().ProcessModelResponse(
+		t.Context(),
+		agent,
+		allTools,
+		response,
+		nil,
+	)
+	require.ErrorContains(t, err, "Client-executed tool_search calls are not supported")
 }
 
 type noopApplyPatchEditor struct{}

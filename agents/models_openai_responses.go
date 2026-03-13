@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 	"github.com/denggeng/openai-agents-go-plus/tracing"
@@ -236,8 +237,25 @@ func (m OpenAIResponsesModel) prepareRequest(
 		}
 	}
 
-	toolChoice := ResponsesConverter().ConvertToolChoice(modelSettings.ToolChoice)
-	convertedTools, err := ResponsesConverter().ConvertTools(ctx, tools, handoffs)
+	toolChoice, err := ResponsesConverter().ConvertToolChoiceForRequest(
+		modelSettings.ToolChoice,
+		tools,
+		handoffs,
+		m.Model,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	convertedTools, err := ResponsesConverter().convertTools(
+		ctx,
+		tools,
+		handoffs,
+		responsesConvertToolsOptions{
+			allowOpaqueToolSearchSurface: !reflect.ValueOf(prompt).IsZero(),
+			model:                        m.Model,
+			toolChoice:                   modelSettings.ToolChoice,
+		},
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -404,27 +422,70 @@ type ConvertedTools struct {
 	Includes []responses.ResponseIncludable
 }
 
+type responsesConvertToolsOptions struct {
+	allowOpaqueToolSearchSurface bool
+	model                        openai.ChatModel
+	toolChoice                   modelsettings.ToolChoice
+}
+
 type responsesConverter struct{}
 
 func ResponsesConverter() responsesConverter { return responsesConverter{} }
 
 func (responsesConverter) ConvertToolChoice(toolChoice modelsettings.ToolChoice) responses.ResponseNewParamsToolChoiceUnion {
+	out, _ := responsesConverter{}.convertToolChoice(toolChoice, nil, nil, "")
+	return out
+}
+
+func (responsesConverter) ConvertToolChoiceForRequest(
+	toolChoice modelsettings.ToolChoice,
+	tools []Tool,
+	handoffs []Handoff,
+	model openai.ChatModel,
+) (responses.ResponseNewParamsToolChoiceUnion, error) {
+	return responsesConverter{}.convertToolChoice(toolChoice, tools, handoffs, model)
+}
+
+func (responsesConverter) convertToolChoice(
+	toolChoice modelsettings.ToolChoice,
+	tools []Tool,
+	handoffs []Handoff,
+	model openai.ChatModel,
+) (responses.ResponseNewParamsToolChoiceUnion, error) {
 	switch toolChoice := toolChoice.(type) {
 	case nil:
-		return responses.ResponseNewParamsToolChoiceUnion{}
+		return responses.ResponseNewParamsToolChoiceUnion{}, nil
 	case modelsettings.ToolChoiceString:
+		if err := validateResponsesNamedToolChoice(toolChoice.String(), tools, handoffs); err != nil {
+			return responses.ResponseNewParamsToolChoiceUnion{}, err
+		}
 		switch toolChoice {
 		case "none", "auto", "required":
+			if toolChoice == modelsettings.ToolChoiceRequired {
+				if err := validateResponsesRequiredToolChoice(tools); err != nil {
+					return responses.ResponseNewParamsToolChoiceUnion{}, err
+				}
+			}
 			return responses.ResponseNewParamsToolChoiceUnion{
 				OfToolChoiceMode: param.NewOpt(responses.ToolChoiceOptions(toolChoice)),
-			}
+			}, nil
 		case "file_search", "web_search_preview", "web_search_preview_2025_03_11",
-			"computer_use_preview", "image_generation", "code_interpreter":
+			"image_generation", "code_interpreter":
 			return responses.ResponseNewParamsToolChoiceUnion{
 				OfHostedTool: &responses.ToolChoiceTypesParam{
 					Type: responses.ToolChoiceTypesType(toolChoice),
 				},
+			}, nil
+		case "computer", "computer_use", "computer_use_preview":
+			if hasComputerTool(tools) {
+				return convertBuiltinComputerToolChoice(model, toolChoice), nil
 			}
+			return responses.ResponseNewParamsToolChoiceUnion{
+				OfFunctionTool: &responses.ToolChoiceFunctionParam{
+					Name: toolChoice.String(),
+					Type: constant.ValueOf[constant.Function](),
+				},
+			}, nil
 		case "mcp":
 			// Note that this is still here for backwards compatibility,
 			// but migrating to ToolChoiceMCP is recommended.
@@ -432,14 +493,14 @@ func (responsesConverter) ConvertToolChoice(toolChoice modelsettings.ToolChoice)
 				OfMcpTool: &responses.ToolChoiceMcpParam{
 					Type: constant.ValueOf[constant.Mcp](),
 				},
-			}
+			}, nil
 		default:
 			return responses.ResponseNewParamsToolChoiceUnion{
 				OfFunctionTool: &responses.ToolChoiceFunctionParam{
 					Name: toolChoice.String(),
 					Type: constant.ValueOf[constant.Function](),
 				},
-			}
+			}, nil
 		}
 	case modelsettings.ToolChoiceMCP:
 		return responses.ResponseNewParamsToolChoiceUnion{
@@ -448,7 +509,7 @@ func (responsesConverter) ConvertToolChoice(toolChoice modelsettings.ToolChoice)
 				Name:        param.NewOpt(toolChoice.Name),
 				Type:        constant.ValueOf[constant.Mcp](),
 			},
-		}
+		}, nil
 	default:
 		// This would be an unrecoverable implementation bug, so a panic is appropriate.
 		panic(fmt.Errorf("unexpected ToolChoice type %T", toolChoice))
@@ -478,8 +539,21 @@ func (responsesConverter) GetResponseFormat(
 }
 
 func (conv responsesConverter) ConvertTools(ctx context.Context, ts []Tool, handoffs []Handoff) (*ConvertedTools, error) {
+	return conv.convertTools(ctx, ts, handoffs, responsesConvertToolsOptions{})
+}
+
+func (conv responsesConverter) convertTools(
+	ctx context.Context,
+	ts []Tool,
+	handoffs []Handoff,
+	opts responsesConvertToolsOptions,
+) (*ConvertedTools, error) {
 	var convertedTools []responses.ToolUnionParam
 	var includes []responses.ResponseIncludable
+
+	if err := validateResponsesToolSearchConfiguration(ts, opts.allowOpaqueToolSearchSurface); err != nil {
+		return nil, err
+	}
 
 	var computerTools []ComputerTool
 	for _, tool := range ts {
@@ -495,9 +569,40 @@ func (conv responsesConverter) ConvertTools(ctx context.Context, ts []Tool, hand
 	if len(computerTools) > 1 {
 		return nil, UserErrorf("you can only provide one computer tool, got %d", len(computerTools))
 	}
+	usePreviewComputerTool := shouldUsePreviewComputerTool(opts.model, opts.toolChoice)
+
+	namespaceIndexByName := make(map[string]int)
+	namespaceToolsByName := make(map[string][]map[string]any)
+	namespaceDescriptions := make(map[string]string)
 
 	for _, tool := range ts {
-		convertedTool, include, err := conv.convertTool(ctx, tool)
+		functionTool, ok := asFunctionTool(tool)
+		if ok && functionTool.Namespace != "" {
+			if _, exists := namespaceIndexByName[functionTool.Namespace]; exists {
+				expectedDescription := namespaceDescriptions[functionTool.Namespace]
+				if expectedDescription != functionTool.NamespaceDescription {
+					return nil, UserErrorf(
+						"all tools in namespace %q must share the same description",
+						functionTool.Namespace,
+					)
+				}
+				namespaceToolsByName[functionTool.Namespace] = append(
+					namespaceToolsByName[functionTool.Namespace],
+					functionToolResponsesPayload(functionTool, true),
+				)
+				continue
+			}
+
+			namespaceIndexByName[functionTool.Namespace] = len(convertedTools)
+			namespaceDescriptions[functionTool.Namespace] = functionTool.NamespaceDescription
+			namespaceToolsByName[functionTool.Namespace] = []map[string]any{
+				functionToolResponsesPayload(functionTool, true),
+			}
+			convertedTools = append(convertedTools, responses.ToolUnionParam{})
+			continue
+		}
+
+		convertedTool, include, err := conv.convertTool(ctx, tool, usePreviewComputerTool)
 		if err != nil {
 			return nil, err
 		}
@@ -505,6 +610,18 @@ func (conv responsesConverter) ConvertTools(ctx context.Context, ts []Tool, hand
 		if include != nil {
 			includes = append(includes, *include)
 		}
+	}
+
+	for namespaceName, index := range namespaceIndexByName {
+		namespaceTool, err := responsesNamespaceToolParam(
+			namespaceName,
+			namespaceDescriptions[namespaceName],
+			namespaceToolsByName[namespaceName],
+		)
+		if err != nil {
+			return nil, err
+		}
+		convertedTools[index] = namespaceTool
 	}
 
 	for _, handoff := range handoffs {
@@ -521,6 +638,7 @@ func (conv responsesConverter) ConvertTools(ctx context.Context, ts []Tool, hand
 func (conv responsesConverter) convertTool(
 	ctx context.Context,
 	tool Tool,
+	usePreviewComputerTool bool,
 ) (*responses.ToolUnionParam, *responses.ResponseIncludable, error) {
 	var convertedTool *responses.ToolUnionParam
 	var includes *responses.ResponseIncludable
@@ -536,7 +654,19 @@ func (conv responsesConverter) convertTool(
 				Type:        constant.ValueOf[constant.Function](),
 			},
 		}
+		if t.DeferLoading {
+			raw, err := rawToolUnionParam(functionToolResponsesPayload(t, true))
+			if err != nil {
+				return nil, nil, err
+			}
+			convertedTool = &raw
+		}
 		includes = nil
+	case *FunctionTool:
+		if t == nil {
+			return nil, nil, NewUserError("function tool is nil")
+		}
+		return conv.convertTool(ctx, *t, usePreviewComputerTool)
 	case WebSearchTool:
 		convertedTool = &responses.ToolUnionParam{
 			OfWebSearch: &responses.WebSearchToolParam{
@@ -577,23 +707,43 @@ func (conv responsesConverter) convertTool(
 			return nil, nil, err
 		}
 
-		convertedTool = &responses.ToolUnionParam{
-			OfComputerUsePreview: &responses.ComputerToolParam{
-				DisplayHeight: dimensions.Height,
-				DisplayWidth:  dimensions.Width,
-				Environment:   responses.ComputerToolEnvironment(environment),
-				Type:          constant.ValueOf[constant.ComputerUsePreview](),
-			},
+		if usePreviewComputerTool {
+			convertedTool = &responses.ToolUnionParam{
+				OfComputerUsePreview: &responses.ComputerToolParam{
+					DisplayHeight: dimensions.Height,
+					DisplayWidth:  dimensions.Width,
+					Environment:   responses.ComputerToolEnvironment(environment),
+					Type:          constant.ValueOf[constant.ComputerUsePreview](),
+				},
+			}
+		} else {
+			raw, err := rawToolUnionParam(map[string]any{"type": "computer"})
+			if err != nil {
+				return nil, nil, err
+			}
+			convertedTool = &raw
 		}
 		includes = nil
 	case *ComputerTool:
 		if t == nil {
 			return nil, nil, NewUserError("computer tool is nil")
 		}
-		return conv.convertTool(ctx, *t)
+		return conv.convertTool(ctx, *t, usePreviewComputerTool)
 	case HostedMCPTool:
-		convertedTool = &responses.ToolUnionParam{
-			OfMcp: &t.ToolConfig,
+		if t.DeferLoading || hostedMCPToolConfigDeferLoading(t.ToolConfig) {
+			payload, err := hostedMCPToolPayload(t)
+			if err != nil {
+				return nil, nil, err
+			}
+			raw, err := rawToolUnionParam(payload)
+			if err != nil {
+				return nil, nil, err
+			}
+			convertedTool = &raw
+		} else {
+			convertedTool = &responses.ToolUnionParam{
+				OfMcp: &t.ToolConfig,
+			}
 		}
 		includes = nil
 	case ImageGenerationTool:
@@ -640,6 +790,28 @@ func (conv responsesConverter) convertTool(
 			},
 		}
 		includes = nil
+	case ToolSearchTool:
+		payload := map[string]any{"type": "tool_search"}
+		if strings.TrimSpace(t.Description) != "" {
+			payload["description"] = t.Description
+		}
+		if t.Execution != "" {
+			payload["execution"] = string(t.Execution)
+		}
+		if t.Parameters != nil {
+			payload["parameters"] = normalizeJSONValue(t.Parameters)
+		}
+		raw, err := rawToolUnionParam(payload)
+		if err != nil {
+			return nil, nil, err
+		}
+		convertedTool = &raw
+		includes = nil
+	case *ToolSearchTool:
+		if t == nil {
+			return nil, nil, NewUserError("tool search tool is nil")
+		}
+		return conv.convertTool(ctx, *t, usePreviewComputerTool)
 	default:
 		return nil, nil, UserErrorf("Unknown tool type: %T", tool)
 	}
@@ -657,4 +829,201 @@ func (responsesConverter) convertHandoffTool(handoff Handoff) responses.ToolUnio
 			Type:        constant.ValueOf[constant.Function](),
 		},
 	}
+}
+
+func responsesNamespaceToolParam(
+	name string,
+	description string,
+	tools []map[string]any,
+) (responses.ToolUnionParam, error) {
+	payload := map[string]any{
+		"type":        "namespace",
+		"name":        name,
+		"description": description,
+		"tools":       tools,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return responses.ToolUnionParam{}, fmt.Errorf("marshal namespace tool payload: %w", err)
+	}
+	return param.Override[responses.ToolUnionParam](json.RawMessage(data)), nil
+}
+
+func functionToolResponsesPayload(tool FunctionTool, includeDeferLoading bool) map[string]any {
+	payload := map[string]any{
+		"type":        "function",
+		"name":        tool.Name,
+		"description": tool.Description,
+		"parameters":  materializeJSONMap(tool.ParamsJSONSchema),
+		"strict":      tool.StrictJSONSchema.Or(true),
+	}
+	if includeDeferLoading && tool.DeferLoading {
+		payload["defer_loading"] = true
+	}
+	return payload
+}
+
+func rawToolUnionParam(payload map[string]any) (responses.ToolUnionParam, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return responses.ToolUnionParam{}, err
+	}
+	return param.Override[responses.ToolUnionParam](json.RawMessage(data)), nil
+}
+
+func hostedMCPToolPayload(tool HostedMCPTool) (map[string]any, error) {
+	data, err := json.Marshal(tool.ToolConfig)
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, err
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if payload["type"] == nil {
+		payload["type"] = "mcp"
+	}
+	if tool.DeferLoading {
+		payload["defer_loading"] = true
+	}
+	return payload, nil
+}
+
+func hasComputerTool(tools []Tool) bool {
+	for _, tool := range tools {
+		switch typed := tool.(type) {
+		case ComputerTool:
+			return true
+		case *ComputerTool:
+			if typed != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isPreviewComputerModel(model openai.ChatModel) bool {
+	return strings.HasPrefix(string(model), "computer-use-preview")
+}
+
+func shouldUsePreviewComputerTool(
+	model openai.ChatModel,
+	toolChoice modelsettings.ToolChoice,
+) bool {
+	if isPreviewComputerModel(model) {
+		return true
+	}
+	if model != "" {
+		return false
+	}
+	choiceString, ok := toolChoice.(modelsettings.ToolChoiceString)
+	if ok && (choiceString == "computer" || choiceString == "computer_use") {
+		return false
+	}
+	return true
+}
+
+func convertBuiltinComputerToolChoice(
+	model openai.ChatModel,
+	toolChoice modelsettings.ToolChoiceString,
+) responses.ResponseNewParamsToolChoiceUnion {
+	if isPreviewComputerModel(model) || shouldUsePreviewComputerTool(model, toolChoice) {
+		return responses.ResponseNewParamsToolChoiceUnion{
+			OfHostedTool: &responses.ToolChoiceTypesParam{
+				Type: responses.ToolChoiceTypesTypeComputerUsePreview,
+			},
+		}
+	}
+	raw := json.RawMessage(`{"type":"computer"}`)
+	return param.Override[responses.ResponseNewParamsToolChoiceUnion](raw)
+}
+
+func validateResponsesRequiredToolChoice(tools []Tool) error {
+	if len(tools) == 0 {
+		return nil
+	}
+	for _, tool := range tools {
+		switch tool.(type) {
+		case ToolSearchTool, *ToolSearchTool:
+			return nil
+		}
+	}
+	if hasRequiredToolSearchSurface(tools) {
+		return NewUserError(
+			"tool_choice='required' is not currently supported when deferred-loading Responses tools are configured without ToolSearchTool() on the OpenAI Responses API. Add ToolSearchTool() or use `auto`.",
+		)
+	}
+	return nil
+}
+
+func validateResponsesNamedToolChoice(toolChoice string, tools []Tool, handoffs []Handoff) error {
+	if toolChoice == "" || len(tools) == 0 && len(handoffs) == 0 {
+		return nil
+	}
+
+	topLevelFunctionNames := make(map[string]struct{})
+	allLocalFunctionNames := make(map[string]struct{})
+	deferredOnlyFunctionNames := make(map[string]struct{})
+	namespacedFunctionNames := make(map[string]struct{})
+	namespaceNames := make(map[string]struct{})
+	hasHostedToolSearch := false
+
+	for _, handoff := range handoffs {
+		topLevelFunctionNames[handoff.ToolName] = struct{}{}
+		allLocalFunctionNames[handoff.ToolName] = struct{}{}
+	}
+
+	for _, tool := range tools {
+		switch tool.(type) {
+		case ToolSearchTool, *ToolSearchTool:
+			hasHostedToolSearch = true
+		}
+		functionTool, ok := asFunctionTool(tool)
+		if !ok {
+			continue
+		}
+		allLocalFunctionNames[functionTool.Name] = struct{}{}
+		if strings.TrimSpace(functionTool.Namespace) == "" {
+			if functionTool.DeferLoading {
+				deferredOnlyFunctionNames[functionTool.Name] = struct{}{}
+			} else {
+				topLevelFunctionNames[functionTool.Name] = struct{}{}
+			}
+			continue
+		}
+		namespacedFunctionNames[functionTool.Name] = struct{}{}
+		namespaceNames[functionTool.Namespace] = struct{}{}
+	}
+
+	_, isRealTopLevelFunction := topLevelFunctionNames[toolChoice]
+	_, isLocalFunction := allLocalFunctionNames[toolChoice]
+	_, isNamespacedFunction := namespacedFunctionNames[toolChoice]
+	_, isNamespaceName := namespaceNames[toolChoice]
+	_, isDeferredOnlyFunction := deferredOnlyFunctionNames[toolChoice]
+
+	if toolChoice == "tool_search" && hasHostedToolSearch && !isLocalFunction {
+		return NewUserError(
+			"tool_choice='tool_search' is not supported for ToolSearchTool() on the OpenAI Responses API. Use `auto` or `required`, or target a real top-level function tool named `tool_search`.",
+		)
+	}
+	if toolChoice == "tool_search" && !hasHostedToolSearch && !isLocalFunction {
+		return NewUserError(
+			"tool_choice='tool_search' requires ToolSearchTool() or a real top-level function tool named `tool_search` on the OpenAI Responses API.",
+		)
+	}
+	if (isNamespacedFunction && !isRealTopLevelFunction) || (isNamespaceName && !isRealTopLevelFunction) {
+		return NewUserError(
+			"Named tool_choice must target a callable tool, not a namespace wrapper or bare inner name from tool_namespace(), on the OpenAI Responses API. Use `auto`, `required`, `none`, or target a top-level or qualified namespaced function tool.",
+		)
+	}
+	if isDeferredOnlyFunction && !isRealTopLevelFunction {
+		return NewUserError(
+			"Named tool_choice is not currently supported for deferred-loading function tools on the OpenAI Responses API. Use `auto`, `required`, `none`, or load the tool via ToolSearchTool() first.",
+		)
+	}
+	return nil
 }

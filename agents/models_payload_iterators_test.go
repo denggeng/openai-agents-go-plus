@@ -74,7 +74,7 @@ func TestResponsesToolSchemaMaterializesIterables(t *testing.T) {
 		ParamsJSONSchema: schema,
 	}
 
-	converted, _, err := responsesConverter{}.convertTool(context.Background(), tool)
+	converted, _, err := responsesConverter{}.convertTool(context.Background(), tool, true)
 	require.NoError(t, err)
 	require.NotNil(t, converted)
 	require.NotNil(t, converted.OfFunction)

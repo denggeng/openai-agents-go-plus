@@ -83,6 +83,19 @@ func TestMessageToOutputItemsWithRefusal(t *testing.T) {
 	}, items)
 }
 
+func TestToolToOpenaiRejectsNamespacedFunctionTool(t *testing.T) {
+	namespacedTools, err := agents.ToolNamespace(
+		"crm",
+		"CRM tools",
+		testFunctionTool("lookup_account", "Lookup account"),
+	)
+	require.NoError(t, err)
+
+	_, err = agents.ChatCmplConverter().ToolToOpenai(namespacedTools[0])
+	require.ErrorContains(t, err, "only supported with OpenAI Responses models")
+	require.ErrorContains(t, err, "crm.lookup_account")
+}
+
 func TestMessageToOutputItemsWithToolCall(t *testing.T) {
 	// If the ChatCompletionMessage contains one or more tool calls, they should
 	// be reflected as separate `ResponseFunctionToolCall` items appended after

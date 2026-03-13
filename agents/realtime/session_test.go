@@ -1154,6 +1154,51 @@ func TestRealtimeSessionFunctionCallUnknownToolEmitsError(t *testing.T) {
 	assert.Empty(t, model.sentEvents)
 }
 
+func TestRealtimeSessionFunctionToolTimeoutReturnsResultMessage(t *testing.T) {
+	model := &mockRealtimeModel{}
+	timeout := 0.01
+	tool := agents.FunctionTool{
+		Name:             "slow_tool",
+		Description:      "slow",
+		ParamsJSONSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+		OnInvokeTool: func(context.Context, string) (any, error) {
+			time.Sleep(200 * time.Millisecond)
+			return "done", nil
+		},
+		TimeoutSeconds: &timeout,
+	}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent", Tools: []agents.Tool{tool}},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{"async_tool_calls": false},
+	)
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelToolCallEvent{
+		Name:      "slow_tool",
+		CallID:    "call_timeout",
+		Arguments: `{}`,
+	}))
+
+	_, ok := (<-session.Events()).(RealtimeRawModelEvent)
+	require.True(t, ok)
+	_, ok = (<-session.Events()).(RealtimeToolStartEvent)
+	require.True(t, ok)
+	toolEnd, ok := (<-session.Events()).(RealtimeToolEndEvent)
+	require.True(t, ok)
+	output, ok := toolEnd.Output.(string)
+	require.True(t, ok)
+	assert.Contains(t, output, "timed out")
+
+	require.Len(t, model.sentEvents, 1)
+	outputEvent, ok := model.sentEvents[0].(RealtimeModelSendToolOutput)
+	require.True(t, ok)
+	assert.Equal(t, "call_timeout", outputEvent.ToolCall.CallID)
+	assert.Contains(t, outputEvent.Output, "timed out")
+	assert.True(t, outputEvent.StartResponse)
+}
+
 func TestRealtimeSessionFunctionCallToolPanicEmitsError(t *testing.T) {
 	model := &mockRealtimeModel{}
 	tool := agents.FunctionTool{

@@ -137,6 +137,50 @@ func UserErrorf(format string, a ...any) UserError {
 	return UserError{AgentsError: AgentsErrorf(format, a...)}
 }
 
+type ToolTimeoutBehavior string
+
+const (
+	ToolTimeoutBehaviorErrorAsResult  ToolTimeoutBehavior = "error_as_result"
+	ToolTimeoutBehaviorRaiseException ToolTimeoutBehavior = "raise_exception"
+)
+
+func normalizeToolTimeoutBehavior(value ToolTimeoutBehavior) ToolTimeoutBehavior {
+	if value == "" {
+		return ToolTimeoutBehaviorErrorAsResult
+	}
+	return value
+}
+
+func DefaultToolTimeoutErrorMessage(toolName string, timeoutSeconds float64) string {
+	return fmt.Sprintf("Tool '%s' timed out after %g seconds.", toolName, timeoutSeconds)
+}
+
+// ToolTimeoutError is returned when a function tool exceeds its configured timeout.
+type ToolTimeoutError struct {
+	*AgentsError
+	ToolName       string
+	TimeoutSeconds float64
+}
+
+func (err ToolTimeoutError) Error() string {
+	if err.AgentsError == nil {
+		return "ToolTimeoutError"
+	}
+	return err.AgentsError.Error()
+}
+
+func (err ToolTimeoutError) Unwrap() error {
+	return err.AgentsError
+}
+
+func NewToolTimeoutError(toolName string, timeoutSeconds float64) ToolTimeoutError {
+	return ToolTimeoutError{
+		AgentsError:    NewAgentsError(DefaultToolTimeoutErrorMessage(toolName, timeoutSeconds)),
+		ToolName:       toolName,
+		TimeoutSeconds: timeoutSeconds,
+	}
+}
+
 // InputGuardrailTripwireTriggeredError is returned when an input guardrail tripwire is triggered.
 type InputGuardrailTripwireTriggeredError struct {
 	*AgentsError

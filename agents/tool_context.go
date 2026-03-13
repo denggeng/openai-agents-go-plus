@@ -28,6 +28,12 @@ type ToolContextData struct {
 	// The name of the tool being invoked.
 	ToolName string
 
+	// Optional namespace of the tool being invoked.
+	ToolNamespace string
+
+	// Display-friendly qualified tool name.
+	QualifiedToolName string
+
 	// The ID of the tool call.
 	ToolCallID string
 
@@ -42,10 +48,13 @@ func ContextWithToolData(
 	toolCallID string,
 	toolCall responses.ResponseFunctionToolCall,
 ) context.Context {
+	toolNamespace := functionToolCallNamespace(toolCall)
 	return context.WithValue(ctx, toolContextDataKey{}, &ToolContextData{
-		ToolName:      toolCall.Name,
-		ToolCallID:    toolCallID,
-		ToolArguments: toolCall.Arguments,
+		ToolName:          toolCall.Name,
+		ToolNamespace:     toolNamespace,
+		QualifiedToolName: toolTraceName(toolCall.Name, toolNamespace),
+		ToolCallID:        toolCallID,
+		ToolArguments:     toolCall.Arguments,
 	})
 }
 
@@ -64,9 +73,11 @@ var (
 type ToolContext[T any] struct {
 	*RunContextWrapper[T]
 
-	ToolName      string
-	ToolCallID    string
-	ToolArguments string
+	ToolName          string
+	ToolNamespace     string
+	QualifiedToolName string
+	ToolCallID        string
+	ToolArguments     string
 
 	ToolCall  *responses.ResponseFunctionToolCall
 	Agent     *Agent
@@ -79,6 +90,11 @@ type ToolContextOption[T any] func(*ToolContext[T])
 func ToolContextWithToolCall[T any](call *responses.ResponseFunctionToolCall) ToolContextOption[T] {
 	return func(tc *ToolContext[T]) {
 		tc.ToolCall = call
+		if call == nil {
+			return
+		}
+		tc.ToolNamespace = functionToolCallNamespace(call)
+		tc.QualifiedToolName = toolTraceName(tc.ToolName, tc.ToolNamespace)
 	}
 }
 
@@ -161,6 +177,8 @@ func ToolContextFromAgentContext[T any](
 		return nil, err
 	}
 	toolContext.ToolCall = toolCall
+	toolContext.ToolNamespace = functionToolCallNamespace(toolCall)
+	toolContext.QualifiedToolName = toolTraceName(toolName, toolContext.ToolNamespace)
 	toolContext.Agent = toolAgent
 	toolContext.RunConfig = toolRunConfig
 	return toolContext, nil
@@ -184,6 +202,7 @@ func newToolContextFromWrapper[T any](
 	return &ToolContext[T]{
 		RunContextWrapper: wrapper,
 		ToolName:          toolName,
+		QualifiedToolName: toolTraceName(toolName, ""),
 		ToolCallID:        toolCallID,
 		ToolArguments:     toolArguments,
 	}, nil
