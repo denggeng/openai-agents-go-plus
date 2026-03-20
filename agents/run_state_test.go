@@ -251,7 +251,7 @@ func TestRunStateRoundTripToolApprovals(t *testing.T) {
 	assert.Equal(t, "Denied by reviewer", message)
 }
 
-func TestRunStateContextOverrideKeepsSerializedRejectionMessages(t *testing.T) {
+func TestRunStateContextOverrideKeepsSerializedUsageAndRejectionMessages(t *testing.T) {
 	approvalItem := agents.ToolApprovalItem{
 		ToolName: "tool_2",
 		RawItem:  map[string]any{"call_id": "call-2"},
@@ -259,12 +259,13 @@ func TestRunStateContextOverrideKeepsSerializedRejectionMessages(t *testing.T) {
 
 	runContext := agents.NewRunContextWrapper[any](map[string]any{"source": "saved"})
 	runContext.RejectTool(approvalItem, true, "Denied by reviewer")
+	runContext.Usage.Requests = 7
 
 	state := agents.RunState{
 		SchemaVersion: agents.CurrentRunStateSchemaVersion,
 		Context: &agents.RunStateContextState{
 			Context: map[string]any{"source": "saved"},
-			Usage:   usage.NewUsage(),
+			Usage:   &usage.Usage{Requests: 7},
 		},
 	}
 	state.SetToolApprovalsFromContext(runContext)
@@ -275,6 +276,7 @@ func TestRunStateContextOverrideKeepsSerializedRejectionMessages(t *testing.T) {
 
 	override := agents.NewRunContextWrapper[any](map[string]any{"source": "override"})
 	override.RejectTool(approvalItem, true, "override denial")
+	override.Usage.Requests = 99
 
 	decoded, err := agents.RunStateFromJSONWithOptions(encoded, agents.RunStateDeserializeOptions{
 		ContextOverride: override,
@@ -282,6 +284,7 @@ func TestRunStateContextOverrideKeepsSerializedRejectionMessages(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, decoded.Context)
 	assert.Equal(t, map[string]any{"source": "override"}, decoded.Context.Context)
+	assert.Equal(t, uint64(7), decoded.Context.Usage.Requests)
 
 	restoredContext := agents.NewRunContextWrapper[any](nil)
 	decoded.ApplyToolApprovalsToContext(restoredContext)

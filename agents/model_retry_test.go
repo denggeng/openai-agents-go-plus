@@ -174,6 +174,45 @@ func TestGetResponseWithRetryDisablesWebsocketPreEventRetriesWhenRunnerManaged(t
 	assert.Equal(t, []bool{true, true}, flags)
 }
 
+func TestGetResponseWithRetryHonorsExplicitNoneRetryAfterOverride(t *testing.T) {
+	calls := 0
+	_, err := getResponseWithRetry(
+		t.Context(),
+		func(context.Context) (*ModelResponse, error) {
+			calls++
+			return nil, openAIStatusError(t, 429, "rate_limit", http.Header{
+				"Retry-After-Ms": []string{"1250"},
+			})
+		},
+		func() error {
+			t.Fatalf("explicit retry_after=nil override should suppress retries")
+			return nil
+		},
+		&retry.ModelRetrySettings{
+			MaxRetries: retry.Int(1),
+			Backoff: &retry.ModelRetryBackoffSettings{
+				Jitter: retry.Bool(false),
+			},
+			Policy: retry.RetryPolicies.RetryAfter(),
+		},
+		func(retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice {
+			return &retry.ModelRetryAdvice{
+				Normalized: &retry.ModelRetryNormalizedError{
+					RetryAfterSet: true,
+				},
+			}
+		},
+		"",
+		"",
+	)
+	require.Error(t, err)
+
+	var statusErr *openai.Error
+	require.ErrorAs(t, err, &statusErr)
+	assert.Equal(t, 429, statusErr.StatusCode)
+	assert.Equal(t, 1, calls)
+}
+
 func TestStreamResponseWithRetryPropagatesFailedAttemptCount(t *testing.T) {
 	originalSleep := sleepForModelRetry
 	defer func() { sleepForModelRetry = originalSleep }()
@@ -227,6 +266,57 @@ func TestStreamResponseWithRetryPropagatesFailedAttemptCount(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, []int{1}, failedAttemptCounts)
+}
+
+func TestStreamResponseWithRetryDoesNotLeakRetryDisableFlagsToConsumer(t *testing.T) {
+	originalSleep := sleepForModelRetry
+	defer func() { sleepForModelRetry = originalSleep }()
+	sleepForModelRetry = func(context.Context, time.Duration) error { return nil }
+
+	attempts := 0
+	var providerRetryFlags []bool
+	var consumerProviderRetryFlags []bool
+	var consumerWebsocketRetryFlags []bool
+	var consumerRequestIDs []string
+
+	err := streamResponseWithRetry(
+		t.Context(),
+		func(ctx context.Context, yield ModelStreamResponseCallback) error {
+			providerRetryFlags = append(providerRetryFlags, providerManagedRetriesDisabledFromContext(ctx))
+			attempts++
+			if attempts == 1 {
+				return transientNetworkError()
+			}
+
+			eventCtx := contextWithModelRequestID(ctx, "req-stream-123")
+			return yield(eventCtx, TResponseStreamEvent{Type: "response.created"})
+		},
+		func() error { return nil },
+		&retry.ModelRetrySettings{
+			MaxRetries: retry.Int(1),
+			Policy:     retry.RetryPolicies.NetworkError(),
+		},
+		nil,
+		"",
+		"",
+		func(ctx context.Context, _ TResponseStreamEvent) error {
+			consumerProviderRetryFlags = append(
+				consumerProviderRetryFlags,
+				providerManagedRetriesDisabledFromContext(ctx),
+			)
+			consumerWebsocketRetryFlags = append(
+				consumerWebsocketRetryFlags,
+				websocketPreEventRetriesDisabledFromContext(ctx),
+			)
+			consumerRequestIDs = append(consumerRequestIDs, modelRequestIDFromContext(ctx))
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []bool{false, true}, providerRetryFlags)
+	assert.Equal(t, []bool{false}, consumerProviderRetryFlags)
+	assert.Equal(t, []bool{false}, consumerWebsocketRetryFlags)
+	assert.Equal(t, []string{"req-stream-123"}, consumerRequestIDs)
 }
 
 func TestGetOpenAIRetryAdviceKeepsStatefulTransportFailuresAmbiguous(t *testing.T) {

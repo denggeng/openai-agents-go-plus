@@ -62,14 +62,17 @@ func (s *ModelRetryBackoffSettings) ResolveJitter() bool {
 }
 
 type ModelRetryNormalizedError struct {
-	StatusCode     *int     `json:"status_code,omitempty"`
-	ErrorCode      string   `json:"error_code,omitempty"`
-	Message        string   `json:"message,omitempty"`
-	RequestID      string   `json:"request_id,omitempty"`
-	RetryAfter     *float64 `json:"retry_after,omitempty"`
-	IsAbort        *bool    `json:"is_abort,omitempty"`
-	IsNetworkError *bool    `json:"is_network_error,omitempty"`
-	IsTimeout      *bool    `json:"is_timeout,omitempty"`
+	StatusCode *int     `json:"status_code,omitempty"`
+	ErrorCode  string   `json:"error_code,omitempty"`
+	Message    string   `json:"message,omitempty"`
+	RequestID  string   `json:"request_id,omitempty"`
+	RetryAfter *float64 `json:"retry_after,omitempty"`
+	// RetryAfterSet records whether RetryAfter was explicitly provided, including an
+	// intentional nil override that should suppress header-derived retry delays.
+	RetryAfterSet  bool  `json:"-"`
+	IsAbort        *bool `json:"is_abort,omitempty"`
+	IsNetworkError *bool `json:"is_network_error,omitempty"`
+	IsTimeout      *bool `json:"is_timeout,omitempty"`
 }
 
 func (e ModelRetryNormalizedError) Abort() bool {
@@ -85,10 +88,10 @@ func (e ModelRetryNormalizedError) Timeout() bool {
 }
 
 type ModelRetryAdvice struct {
-	Suggested    *bool                     `json:"suggested,omitempty"`
-	RetryAfter   *float64                  `json:"retry_after,omitempty"`
-	ReplaySafety string                    `json:"replay_safety,omitempty"`
-	Reason       string                    `json:"reason,omitempty"`
+	Suggested    *bool                      `json:"suggested,omitempty"`
+	RetryAfter   *float64                   `json:"retry_after,omitempty"`
+	ReplaySafety string                     `json:"replay_safety,omitempty"`
+	Reason       string                     `json:"reason,omitempty"`
 	Normalized   *ModelRetryNormalizedError `json:"normalized,omitempty"`
 }
 
@@ -105,7 +108,7 @@ type RetryDecision struct {
 	Delay  *float64
 	Reason string
 
-	hardVeto      bool
+	hardVeto       bool
 	approvesReplay bool
 }
 
@@ -152,7 +155,7 @@ type retryPolicyCapabilities interface {
 }
 
 type retryPolicySpec struct {
-	fn                         RetryPolicyFunc
+	fn                              RetryPolicyFunc
 	retriesSafeTransportErrorsValue bool
 	retriesAllTransientErrorsValue  bool
 }
@@ -340,9 +343,9 @@ func (p Policies) Any(policies ...RetryPolicy) RetryPolicy {
 }
 
 type ModelRetrySettings struct {
-	MaxRetries *int                  `json:"max_retries,omitempty"`
+	MaxRetries *int                       `json:"max_retries,omitempty"`
 	Backoff    *ModelRetryBackoffSettings `json:"backoff,omitempty"`
-	Policy     RetryPolicy           `json:"-"`
+	Policy     RetryPolicy                `json:"-"`
 }
 
 func (s *ModelRetrySettings) ResolvedMaxRetries() (int, bool) {

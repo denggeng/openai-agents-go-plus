@@ -164,6 +164,8 @@ func streamResponseWithRetry(
 	compatibilityRetriesTaken := 0
 	statefulRequest := isStatefulModelRequest(previousResponseID, conversationID)
 	disableWebsocketPreEventRetry := shouldDisableWebsocketPreEventRetry(retrySettings)
+	outerProviderRetriesDisabled := providerManagedRetriesDisabledFromContext(ctx)
+	outerWebsocketPreEventRetriesDisabled := websocketPreEventRetriesDisabledFromContext(ctx)
 
 	for {
 		emittedRetryUnsafeEvent := false
@@ -180,8 +182,16 @@ func streamResponseWithRetry(
 			if streamEventBlocksRetry(event) {
 				emittedRetryUnsafeEvent = true
 			}
-			eventCtx = withFailedModelRetryAttempts(eventCtx, failedAttemptsForDelivery)
-			if yieldErr := yield(eventCtx, event); yieldErr != nil {
+			consumerCtx := withProviderManagedRetriesDisabled(
+				eventCtx,
+				outerProviderRetriesDisabled,
+			)
+			consumerCtx = withWebsocketPreEventRetriesDisabled(
+				consumerCtx,
+				outerWebsocketPreEventRetriesDisabled,
+			)
+			consumerCtx = withFailedModelRetryAttempts(consumerCtx, failedAttemptsForDelivery)
+			if yieldErr := yield(consumerCtx, event); yieldErr != nil {
 				yieldReturnedError = true
 				return yieldErr
 			}
@@ -315,12 +325,14 @@ func evaluateModelRetry(
 }
 
 func normalizeRetryError(err error, providerAdvice *retry.ModelRetryAdvice) retry.ModelRetryNormalizedError {
+	retryAfter := parseRetryAfterFromHeaders(extractHeadersFromError(err))
 	normalized := retry.ModelRetryNormalizedError{
 		StatusCode:     intPointer(getStatusCodeFromError(err)),
 		ErrorCode:      getErrorCodeFromError(err),
 		Message:        errorMessage(err),
 		RequestID:      getRequestIDFromError(err),
-		RetryAfter:     parseRetryAfterFromHeaders(extractHeadersFromError(err)),
+		RetryAfter:     retryAfter,
+		RetryAfterSet:  retryAfter != nil,
 		IsAbort:        boolPointer(isAbortLikeError(err)),
 		IsNetworkError: boolPointer(isNetworkLikeError(err)),
 		IsTimeout:      boolPointer(isTimeoutLikeError(err)),
@@ -331,6 +343,7 @@ func normalizeRetryError(err error, providerAdvice *retry.ModelRetryAdvice) retr
 	}
 	if providerAdvice.RetryAfter != nil {
 		normalized.RetryAfter = cloneFloat64Pointer(providerAdvice.RetryAfter)
+		normalized.RetryAfterSet = true
 	}
 	if providerAdvice.Normalized == nil {
 		return normalized
@@ -349,8 +362,9 @@ func normalizeRetryError(err error, providerAdvice *retry.ModelRetryAdvice) retr
 	if override.RequestID != "" {
 		normalized.RequestID = override.RequestID
 	}
-	if override.RetryAfter != nil {
+	if override.RetryAfter != nil || override.RetryAfterSet {
 		normalized.RetryAfter = cloneFloat64Pointer(override.RetryAfter)
+		normalized.RetryAfterSet = true
 	}
 	if override.IsAbort != nil {
 		normalized.IsAbort = boolPointer(*override.IsAbort)
