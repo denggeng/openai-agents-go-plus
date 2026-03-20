@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/denggeng/openai-agents-go-plus/retry"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -43,25 +44,26 @@ func TestModelSettings_BasicSerialization(t *testing.T) {
 	require.NoError(t, err)
 
 	var want any = map[string]any{
-		"temperature":         json.Number("0.5"),
-		"top_p":               json.Number("0.9"),
-		"frequency_penalty":   nil,
-		"presence_penalty":    nil,
-		"tool_choice":         nil,
-		"parallel_tool_calls": nil,
-		"truncation":          nil,
-		"max_tokens":          json.Number("100"),
-		"reasoning":           map[string]any{},
-		"verbosity":           nil,
-		"metadata":            nil,
-		"store":               nil,
-		"include_usage":       nil,
-		"response_include":    nil,
-		"top_logprobs":        nil,
-		"extra_query":         nil,
-		"extra_headers":       nil,
-		"extra_body":          nil,
-		"extra_args":          nil,
+		"temperature":            json.Number("0.5"),
+		"top_p":                  json.Number("0.9"),
+		"frequency_penalty":      nil,
+		"presence_penalty":       nil,
+		"tool_choice":            nil,
+		"parallel_tool_calls":    nil,
+		"truncation":             nil,
+		"max_tokens":             json.Number("100"),
+		"reasoning":              map[string]any{},
+		"verbosity":              nil,
+		"metadata":               nil,
+		"store":                  nil,
+		"prompt_cache_retention": nil,
+		"include_usage":          nil,
+		"response_include":       nil,
+		"top_logprobs":           nil,
+		"extra_query":            nil,
+		"extra_headers":          nil,
+		"extra_body":             nil,
+		"extra_args":             nil,
 	}
 	assert.Equal(t, want, got)
 }
@@ -69,25 +71,26 @@ func TestModelSettings_BasicSerialization(t *testing.T) {
 // Tests whether ModelSettings can be serialized to a JSON string.
 func TestModelSettings_AllFieldsSerialization(t *testing.T) {
 	modelSettings := ModelSettings{
-		Temperature:       param.NewOpt(0.5),
-		TopP:              param.NewOpt(0.9),
-		FrequencyPenalty:  param.NewOpt(0.0),
-		PresencePenalty:   param.NewOpt(0.0),
-		ToolChoice:        ToolChoiceAuto,
-		ParallelToolCalls: param.NewOpt(true),
-		Truncation:        param.NewOpt(TruncationAuto),
-		MaxTokens:         param.NewOpt[int64](100),
-		Reasoning:         openai.ReasoningParam{},
-		Verbosity:         param.NewOpt(VerbosityMedium),
-		Metadata:          map[string]string{"foo": "bar"},
-		Store:             param.NewOpt(false),
-		IncludeUsage:      param.NewOpt(false),
-		ResponseInclude:   []responses.ResponseIncludable{responses.ResponseIncludableFileSearchCallResults},
-		TopLogprobs:       param.NewOpt(int64(1)),
-		ExtraQuery:        map[string]string{"foo": "bar"},
-		ExtraHeaders:      map[string]string{"foo": "bar"},
-		ExtraBody:         map[string]any{"body_key": "body_value"},
-		ExtraArgs:         map[string]any{"arg_key": "arg_value"},
+		Temperature:          param.NewOpt(0.5),
+		TopP:                 param.NewOpt(0.9),
+		FrequencyPenalty:     param.NewOpt(0.0),
+		PresencePenalty:      param.NewOpt(0.0),
+		ToolChoice:           ToolChoiceAuto,
+		ParallelToolCalls:    param.NewOpt(true),
+		Truncation:           param.NewOpt(TruncationAuto),
+		MaxTokens:            param.NewOpt[int64](100),
+		Reasoning:            openai.ReasoningParam{},
+		Verbosity:            param.NewOpt(VerbosityMedium),
+		Metadata:             map[string]string{"foo": "bar"},
+		Store:                param.NewOpt(false),
+		PromptCacheRetention: param.NewOpt(PromptCacheRetention24h),
+		IncludeUsage:         param.NewOpt(false),
+		ResponseInclude:      []responses.ResponseIncludable{responses.ResponseIncludableFileSearchCallResults},
+		TopLogprobs:          param.NewOpt(int64(1)),
+		ExtraQuery:           map[string]string{"foo": "bar"},
+		ExtraHeaders:         map[string]string{"foo": "bar"},
+		ExtraBody:            map[string]any{"body_key": "body_value"},
+		ExtraArgs:            map[string]any{"arg_key": "arg_value"},
 	}
 	res, err := json.Marshal(modelSettings)
 	require.NoError(t, err)
@@ -97,25 +100,26 @@ func TestModelSettings_AllFieldsSerialization(t *testing.T) {
 	require.NoError(t, err)
 
 	var want any = map[string]any{
-		"temperature":         json.Number("0.5"),
-		"top_p":               json.Number("0.9"),
-		"frequency_penalty":   json.Number("0"),
-		"presence_penalty":    json.Number("0"),
-		"tool_choice":         "auto",
-		"parallel_tool_calls": true,
-		"truncation":          "auto",
-		"max_tokens":          json.Number("100"),
-		"reasoning":           map[string]any{},
-		"verbosity":           "medium",
-		"metadata":            map[string]any{"foo": "bar"},
-		"store":               false,
-		"include_usage":       false,
-		"response_include":    []any{"file_search_call.results"},
-		"top_logprobs":        json.Number("1"),
-		"extra_query":         map[string]any{"foo": "bar"},
-		"extra_headers":       map[string]any{"foo": "bar"},
-		"extra_body":          map[string]any{"body_key": "body_value"},
-		"extra_args":          map[string]any{"arg_key": "arg_value"},
+		"temperature":            json.Number("0.5"),
+		"top_p":                  json.Number("0.9"),
+		"frequency_penalty":      json.Number("0"),
+		"presence_penalty":       json.Number("0"),
+		"tool_choice":            "auto",
+		"parallel_tool_calls":    true,
+		"truncation":             "auto",
+		"max_tokens":             json.Number("100"),
+		"reasoning":              map[string]any{},
+		"verbosity":              "medium",
+		"metadata":               map[string]any{"foo": "bar"},
+		"store":                  false,
+		"prompt_cache_retention": "24h",
+		"include_usage":          false,
+		"response_include":       []any{"file_search_call.results"},
+		"top_logprobs":           json.Number("1"),
+		"extra_query":            map[string]any{"foo": "bar"},
+		"extra_headers":          map[string]any{"foo": "bar"},
+		"extra_body":             map[string]any{"body_key": "body_value"},
+		"extra_args":             map[string]any{"arg_key": "arg_value"},
 	}
 	assert.Equal(t, want, got)
 }
@@ -144,20 +148,21 @@ func TestModelSettings_ToolChoiceMCPSerialization(t *testing.T) {
 			"server_label": "mcp",
 			"name":         "mcp_tool",
 		},
-		"parallel_tool_calls": nil,
-		"truncation":          nil,
-		"max_tokens":          nil,
-		"reasoning":           map[string]any{},
-		"verbosity":           nil,
-		"metadata":            nil,
-		"store":               nil,
-		"include_usage":       nil,
-		"response_include":    nil,
-		"top_logprobs":        nil,
-		"extra_query":         nil,
-		"extra_headers":       nil,
-		"extra_body":          nil,
-		"extra_args":          nil,
+		"parallel_tool_calls":    nil,
+		"truncation":             nil,
+		"max_tokens":             nil,
+		"reasoning":              map[string]any{},
+		"verbosity":              nil,
+		"metadata":               nil,
+		"store":                  nil,
+		"prompt_cache_retention": nil,
+		"include_usage":          nil,
+		"response_include":       nil,
+		"top_logprobs":           nil,
+		"extra_query":            nil,
+		"extra_headers":          nil,
+		"extra_body":             nil,
+		"extra_args":             nil,
 	}
 	assert.Equal(t, want, got)
 }
@@ -186,6 +191,7 @@ func TestModelSettings_Resolve(t *testing.T) {
 		Verbosity:                       param.NewOpt(VerbosityMedium),
 		Metadata:                        map[string]string{"foo": "bar"},
 		Store:                           param.NewOpt(false),
+		PromptCacheRetention:            param.NewOpt(PromptCacheRetentionInMemory),
 		IncludeUsage:                    param.NewOpt(false),
 		ResponseInclude:                 []responses.ResponseIncludable{responses.ResponseIncludableFileSearchCallResults},
 		TopLogprobs:                     param.NewOpt(int64(1)),
@@ -233,6 +239,7 @@ func TestModelSettings_Resolve(t *testing.T) {
 		assert.Equal(t, param.NewOpt(VerbosityHigh), resolved.Verbosity)
 		assert.Equal(t, map[string]string{"foo": "bar"}, resolved.Metadata)
 		assert.Equal(t, param.NewOpt(true), resolved.Store)
+		assert.Equal(t, param.NewOpt(PromptCacheRetentionInMemory), resolved.PromptCacheRetention)
 		assert.Equal(t, param.NewOpt(false), resolved.IncludeUsage)
 		assert.Equal(t, []responses.ResponseIncludable{responses.ResponseIncludableFileSearchCallResults}, resolved.ResponseInclude)
 		assert.Equal(t, param.NewOpt(int64(1)), resolved.TopLogprobs)
@@ -246,16 +253,17 @@ func TestModelSettings_Resolve(t *testing.T) {
 
 	t.Run("overriding second set of properties", func(t *testing.T) {
 		override := ModelSettings{
-			TopP:              param.NewOpt(0.8),
-			PresencePenalty:   param.NewOpt(0.2),
-			ParallelToolCalls: param.NewOpt(false),
-			MaxTokens:         param.NewOpt[int64](42),
-			Metadata:          map[string]string{"a": "b"},
-			IncludeUsage:      param.NewOpt(true),
-			ResponseInclude:   []responses.ResponseIncludable{responses.ResponseIncludableMessageInputImageImageURL},
-			TopLogprobs:       param.NewOpt(int64(2)),
-			ExtraHeaders:      map[string]string{"c": "d"},
-			ExtraArgs:         map[string]any{"arg": "override"},
+			TopP:                 param.NewOpt(0.8),
+			PresencePenalty:      param.NewOpt(0.2),
+			ParallelToolCalls:    param.NewOpt(false),
+			MaxTokens:            param.NewOpt[int64](42),
+			Metadata:             map[string]string{"a": "b"},
+			PromptCacheRetention: param.NewOpt(PromptCacheRetention24h),
+			IncludeUsage:         param.NewOpt(true),
+			ResponseInclude:      []responses.ResponseIncludable{responses.ResponseIncludableMessageInputImageImageURL},
+			TopLogprobs:          param.NewOpt(int64(2)),
+			ExtraHeaders:         map[string]string{"c": "d"},
+			ExtraArgs:            map[string]any{"arg": "override"},
 			CustomizeChatCompletionsRequest: func(context.Context, *openai.ChatCompletionNewParams, []option.RequestOption) (*openai.ChatCompletionNewParams, []option.RequestOption, error) {
 				return nil, nil, nil
 			},
@@ -278,6 +286,7 @@ func TestModelSettings_Resolve(t *testing.T) {
 		assert.Equal(t, param.NewOpt(VerbosityMedium), resolved.Verbosity)
 		assert.Equal(t, map[string]string{"a": "b"}, resolved.Metadata)
 		assert.Equal(t, param.NewOpt(false), resolved.Store)
+		assert.Equal(t, param.NewOpt(PromptCacheRetention24h), resolved.PromptCacheRetention)
 		assert.Equal(t, param.NewOpt(true), resolved.IncludeUsage)
 		assert.Equal(t, []responses.ResponseIncludable{responses.ResponseIncludableMessageInputImageImageURL}, resolved.ResponseInclude)
 		assert.Equal(t, param.NewOpt(int64(2)), resolved.TopLogprobs)
@@ -287,5 +296,133 @@ func TestModelSettings_Resolve(t *testing.T) {
 		assert.Equal(t, map[string]any{"arg": "override"}, resolved.ExtraArgs)
 		assert.Nil(t, resolved.CustomizeResponsesRequest)
 		assert.NotNil(t, resolved.CustomizeChatCompletionsRequest)
+	})
+
+	t.Run("merging extra args with override precedence", func(t *testing.T) {
+		base := ModelSettings{
+			Temperature: param.NewOpt(0.5),
+			ExtraArgs: map[string]any{
+				"param1": "base_value",
+				"param2": "base_only",
+			},
+		}
+		override := ModelSettings{
+			TopP: param.NewOpt(0.9),
+			ExtraArgs: map[string]any{
+				"param1": "override_value",
+				"param3": "override_only",
+			},
+		}
+
+		resolved := base.Resolve(override)
+
+		assert.Equal(t, param.NewOpt(0.5), resolved.Temperature)
+		assert.Equal(t, param.NewOpt(0.9), resolved.TopP)
+		assert.Equal(t, map[string]any{
+			"param1": "override_value",
+			"param2": "base_only",
+			"param3": "override_only",
+		}, resolved.ExtraArgs)
+	})
+
+	t.Run("preserving extra args when only one side provides them", func(t *testing.T) {
+		baseOnly := ModelSettings{
+			ExtraArgs: map[string]any{"param1": "value1"},
+		}
+		overrideWithoutArgs := ModelSettings{
+			Temperature: param.NewOpt(0.8),
+		}
+
+		resolved := baseOnly.Resolve(overrideWithoutArgs)
+		assert.Equal(t, map[string]any{"param1": "value1"}, resolved.ExtraArgs)
+		assert.Equal(t, param.NewOpt(0.8), resolved.Temperature)
+
+		overrideOnly := ModelSettings{
+			ExtraArgs: map[string]any{"param2": "value2"},
+		}
+
+		resolved = ModelSettings{Temperature: param.NewOpt(0.5)}.Resolve(overrideOnly)
+		assert.Equal(t, map[string]any{"param2": "value2"}, resolved.ExtraArgs)
+		assert.Equal(t, param.NewOpt(0.5), resolved.Temperature)
+	})
+
+	t.Run("keeping extra args nil when both sides omit them", func(t *testing.T) {
+		resolved := ModelSettings{
+			Temperature: param.NewOpt(0.5),
+		}.Resolve(ModelSettings{
+			TopP: param.NewOpt(0.9),
+		})
+
+		assert.Nil(t, resolved.ExtraArgs)
+		assert.Equal(t, param.NewOpt(0.5), resolved.Temperature)
+		assert.Equal(t, param.NewOpt(0.9), resolved.TopP)
+	})
+
+	t.Run("deep merging retry settings", func(t *testing.T) {
+		base := ModelSettings{
+			Retry: &retry.ModelRetrySettings{
+				MaxRetries: retry.Int(1),
+				Backoff: &retry.ModelRetryBackoffSettings{
+					InitialDelay: retry.Float64(0.1),
+					MaxDelay:     retry.Float64(1.0),
+				},
+				Policy: retry.RetryPolicies.NetworkError(),
+			},
+		}
+		override := ModelSettings{
+			Retry: &retry.ModelRetrySettings{
+				Backoff: &retry.ModelRetryBackoffSettings{
+					Multiplier: retry.Float64(3.0),
+					Jitter:     retry.Bool(false),
+				},
+				Policy: retry.RetryPolicies.Never(),
+			},
+		}
+
+		resolved := base.Resolve(override)
+		require.NotNil(t, resolved.Retry)
+		require.NotNil(t, resolved.Retry.MaxRetries)
+		assert.Equal(t, 1, *resolved.Retry.MaxRetries)
+		require.NotNil(t, resolved.Retry.Backoff)
+		assert.Equal(t, retry.Float64(0.1), resolved.Retry.Backoff.InitialDelay)
+		assert.Equal(t, retry.Float64(1.0), resolved.Retry.Backoff.MaxDelay)
+		assert.Equal(t, retry.Float64(3.0), resolved.Retry.Backoff.Multiplier)
+		assert.Equal(t, retry.Bool(false), resolved.Retry.Backoff.Jitter)
+		assert.False(t, retry.PolicyRetriesSafeTransportErrors(resolved.Retry.Policy))
+	})
+
+	t.Run("preserving inherited retry policy and falsey backoff overrides", func(t *testing.T) {
+		base := ModelSettings{
+			Retry: &retry.ModelRetrySettings{
+				MaxRetries: retry.Int(4),
+				Backoff: &retry.ModelRetryBackoffSettings{
+					InitialDelay: retry.Float64(0.5),
+					MaxDelay:     retry.Float64(2.0),
+					Multiplier:   retry.Float64(2.0),
+					Jitter:       retry.Bool(true),
+				},
+				Policy: retry.RetryPolicies.ProviderSuggested(),
+			},
+		}
+		override := ModelSettings{
+			Retry: &retry.ModelRetrySettings{
+				MaxRetries: retry.Int(0),
+				Backoff: &retry.ModelRetryBackoffSettings{
+					InitialDelay: retry.Float64(0),
+					Jitter:       retry.Bool(false),
+				},
+			},
+		}
+
+		resolved := base.Resolve(override)
+		require.NotNil(t, resolved.Retry)
+		require.NotNil(t, resolved.Retry.MaxRetries)
+		assert.Equal(t, 0, *resolved.Retry.MaxRetries)
+		require.NotNil(t, resolved.Retry.Backoff)
+		assert.Equal(t, retry.Float64(0), resolved.Retry.Backoff.InitialDelay)
+		assert.Equal(t, retry.Float64(2.0), resolved.Retry.Backoff.MaxDelay)
+		assert.Equal(t, retry.Float64(2.0), resolved.Retry.Backoff.Multiplier)
+		assert.Equal(t, retry.Bool(false), resolved.Retry.Backoff.Jitter)
+		assert.True(t, retry.PolicyRetriesSafeTransportErrors(resolved.Retry.Policy))
 	})
 }

@@ -1451,6 +1451,57 @@ func TestRealtimeSessionFunctionCallRequiresApprovalAndRejectUsesRunLevelFormatt
 	assert.Equal(t, "run-level secure_tool denied (approval_call_custom)", outputEvent.Output)
 }
 
+func TestRealtimeSessionFunctionCallRequiresApprovalAndRejectUsesExplicitMessage(t *testing.T) {
+	model := &mockRealtimeModel{}
+	tool := agents.FunctionTool{
+		Name:             "secure_tool",
+		Description:      "Tool that needs approval",
+		ParamsJSONSchema: map[string]any{"type": "object"},
+		NeedsApproval:    agents.FunctionToolNeedsApprovalEnabled(),
+		OnInvokeTool: func(_ context.Context, arguments string) (any, error) {
+			return "unexpected:" + arguments, nil
+		},
+	}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent", Tools: []agents.Tool{tool}},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{
+			"async_tool_calls": false,
+			"tool_error_formatter": RealtimeToolErrorFormatter(func(
+				args RealtimeToolErrorFormatterArgs,
+			) any {
+				return "run-level " + args.ToolName + " denied (" + args.CallID + ")"
+			}),
+		},
+	)
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelToolCallEvent{
+		Name:      "secure_tool",
+		CallID:    "approval_call_explicit",
+		Arguments: `{"value":"x"}`,
+	}))
+	<-session.Events() // raw
+	_, ok := (<-session.Events()).(RealtimeToolApprovalRequiredEvent)
+	require.True(t, ok)
+
+	require.NoError(t, session.RejectToolCall(
+		t.Context(),
+		"approval_call_explicit",
+		false,
+		"explicit rejection message",
+	))
+	toolEnd, ok := (<-session.Events()).(RealtimeToolEndEvent)
+	require.True(t, ok)
+	assert.Equal(t, "explicit rejection message", toolEnd.Output)
+
+	require.Len(t, model.sentEvents, 1)
+	outputEvent, ok := model.sentEvents[0].(RealtimeModelSendToolOutput)
+	require.True(t, ok)
+	assert.Equal(t, "explicit rejection message", outputEvent.Output)
+}
+
 func TestRealtimeSessionFunctionCallRequiresApprovalRejectFormatterFallbackToDefault(t *testing.T) {
 	model := &mockRealtimeModel{}
 	tool := agents.FunctionTool{
@@ -1573,6 +1624,45 @@ func TestRealtimeSessionFunctionCallUsesPreRejectedDecision(t *testing.T) {
 	toolEnd, ok := (<-session.Events()).(RealtimeToolEndEvent)
 	require.True(t, ok)
 	assert.Equal(t, defaultRealtimeApprovalRejectionMessage, toolEnd.Output)
+	assert.Len(t, model.sentEvents, 1)
+}
+
+func TestRealtimeSessionFunctionCallUsesStoredRejectedMessage(t *testing.T) {
+	model := &mockRealtimeModel{}
+	tool := agents.FunctionTool{
+		Name:             "secure_tool",
+		Description:      "Tool that needs approval",
+		ParamsJSONSchema: map[string]any{"type": "object"},
+		NeedsApproval:    agents.FunctionToolNeedsApprovalEnabled(),
+		OnInvokeTool: func(_ context.Context, arguments string) (any, error) {
+			return "approved:" + arguments, nil
+		},
+	}
+	session := NewRealtimeSession(
+		model,
+		&RealtimeAgent[any]{Name: "agent", Tools: []agents.Tool{tool}},
+		nil,
+		RealtimeModelConfig{},
+		RealtimeRunConfig{"async_tool_calls": false},
+	)
+
+	session.contextWrapper.RejectTool(agents.ToolApprovalItem{
+		ToolName: "secure_tool",
+		RawItem: map[string]any{
+			"call_id": "approval_call_5",
+		},
+	}, false, "stored rejection")
+
+	require.NoError(t, session.OnEvent(t.Context(), RealtimeModelToolCallEvent{
+		Name:      "secure_tool",
+		CallID:    "approval_call_5",
+		Arguments: `{"value":"z"}`,
+	}))
+
+	<-session.Events() // raw
+	toolEnd, ok := (<-session.Events()).(RealtimeToolEndEvent)
+	require.True(t, ok)
+	assert.Equal(t, "stored rejection", toolEnd.Output)
 	assert.Len(t, model.sentEvents, 1)
 }
 

@@ -79,6 +79,7 @@ func (applyPatchAction) Execute(
 				"apply_patch",
 				applyPatchTool.ToolName(),
 				callID,
+				approvalItem,
 			)
 			return buildApplyPatchRejectionItem(agent, callID, rejectionMessage), nil
 		}

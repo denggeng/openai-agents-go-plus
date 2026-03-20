@@ -25,7 +25,7 @@ import (
 )
 
 func TestRunStateAcceptsSupportedSchemaVersions(t *testing.T) {
-	for _, version := range []string{"1.0", "1.1", "1.2", "1.3", "1.4", "1.5"} {
+	for _, version := range []string{"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"} {
 		t.Run(version, func(t *testing.T) {
 			_, err := agents.RunStateFromJSONString(
 				fmt.Sprintf(`{"$schemaVersion":"%s","current_turn":1,"max_turns":1}`, version),
@@ -93,4 +93,38 @@ func TestRunStateModelResponseLegacyMalformedFieldReturnsError(t *testing.T) {
 	}`)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "legacy ModelResponse.ResponseID")
+}
+
+func TestRunStateLegacyApprovalSnapshotWithoutRejectionMessagesStillRestores(t *testing.T) {
+	decoded, err := agents.RunStateFromJSONString(`{
+		"$schemaVersion":"1.5",
+		"current_turn":1,
+		"max_turns":1,
+		"tool_approvals":{
+			"tool_2":{
+				"approved":[],
+				"rejected":["call-2"]
+			}
+		},
+		"context":{
+			"usage":{"requests":0},
+			"approvals":{
+				"tool_2":{
+					"approved":[],
+					"rejected":["call-2"]
+				}
+			}
+		}
+	}`)
+	require.NoError(t, err)
+
+	ctx := agents.NewRunContextWrapper[any](nil)
+	decoded.ApplyToolApprovalsToContext(ctx)
+
+	approved, known := ctx.IsToolApproved("tool_2", "call-2")
+	require.True(t, known)
+	assert.False(t, approved)
+
+	_, ok := ctx.GetRejectionMessage("tool_2", "call-2", nil)
+	assert.False(t, ok)
 }

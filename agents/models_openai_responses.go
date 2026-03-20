@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/retry"
 	"github.com/denggeng/openai-agents-go-plus/tracing"
 	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3"
@@ -46,6 +47,10 @@ func NewOpenAIResponsesModel(model openai.ChatModel, client OpenaiClient) OpenAI
 		Model:  model,
 		client: client,
 	}
+}
+
+func (m OpenAIResponsesModel) GetRetryAdvice(request retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice {
+	return getOpenAIRetryAdvice(request)
 }
 
 func (m OpenAIResponsesModel) GetResponse(
@@ -320,9 +325,12 @@ func (m OpenAIResponsesModel) prepareRequest(
 		ParallelToolCalls:  parallelToolCalls,
 		Text:               responseFormat,
 		Store:              modelSettings.Store,
-		Reasoning:          modelSettings.Reasoning,
-		TopLogprobs:        modelSettings.TopLogprobs,
-		Metadata:           modelSettings.Metadata,
+		PromptCacheRetention: responsesPromptCacheRetention(
+			modelSettings.PromptCacheRetention,
+		),
+		Reasoning:   modelSettings.Reasoning,
+		TopLogprobs: modelSettings.TopLogprobs,
+		Metadata:    modelSettings.Metadata,
 	}
 
 	headers := map[string]string{
@@ -347,6 +355,7 @@ func (m OpenAIResponsesModel) prepareRequest(
 	for k, v := range mergedModelExtraJSON(modelSettings) {
 		opts = append(opts, option.WithJSONSet(k, v))
 	}
+	opts = appendProviderRetryDisableOption(ctx, opts)
 
 	if modelSettings.CustomizeResponsesRequest != nil {
 		return modelSettings.CustomizeResponsesRequest(ctx, params, opts)

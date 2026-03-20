@@ -35,6 +35,7 @@ import (
 	"unsafe"
 
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/retry"
 	"github.com/denggeng/openai-agents-go-plus/tracing"
 	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/gorilla/websocket"
@@ -110,6 +111,10 @@ func NewOpenAIResponsesWSModel(
 		websocketBaseURL: websocketBaseURL,
 		requestSlot:      requestSlot,
 	}
+}
+
+func (m *OpenAIResponsesWSModel) GetRetryAdvice(request retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice {
+	return getOpenAIRetryAdvice(request)
 }
 
 func (m *OpenAIResponsesWSModel) GetResponse(
@@ -248,6 +253,13 @@ func (m *OpenAIResponsesWSModel) executeRequest(
 
 	conn, reused, err := m.ensureConnection(ctx, wsURL, headers, timeouts.Connect)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		var userErr UserError
+		if !errors.As(err, &userErr) {
+			err = wrapModelReplaySafety(err, "safe", false)
+		}
 		return nil, err
 	}
 
@@ -264,15 +276,25 @@ func (m *OpenAIResponsesWSModel) executeRequest(
 	watchConnection(conn)
 	defer close(requestDone)
 
+	retryPreEventDisconnect := !websocketPreEventRetriesDisabledFromContext(ctx)
 	sendRequestFrame := func(requestConn *websocket.Conn, reusedConnection bool) (*websocket.Conn, error) {
 		writeErr := m.writeFrame(ctx, requestConn, requestFrame, timeouts.Send)
 		if writeErr == nil {
 			return requestConn, nil
 		}
+		wrappedWriteErr := writeErr
+		if shouldRetryResponsesWebsocketPreSend(writeErr) {
+			wrappedWriteErr = wrapModelReplaySafety(writeErr, "safe", false)
+		}
 		m.dropSpecificConnection(requestConn)
-		if reusedConnection && shouldRetryResponsesWebsocketPreSend(writeErr) && ctx.Err() == nil {
+		if reusedConnection && retryPreEventDisconnect && shouldRetryResponsesWebsocketPreSend(writeErr) && ctx.Err() == nil {
+			retryPreEventDisconnect = false
 			retryConn, _, retryOpenErr := m.ensureConnection(ctx, wsURL, headers, timeouts.Connect)
 			if retryOpenErr != nil {
+				var userErr UserError
+				if !errors.As(retryOpenErr, &userErr) {
+					return nil, wrapModelReplaySafety(retryOpenErr, "safe", false)
+				}
 				return nil, retryOpenErr
 			}
 			watchConnection(retryConn)
@@ -283,13 +305,16 @@ func (m *OpenAIResponsesWSModel) executeRequest(
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return nil, ctxErr
 				}
+				if shouldRetryResponsesWebsocketPreSend(retryErr) {
+					return nil, wrapModelReplaySafety(retryErr, "safe", false)
+				}
 				return nil, retryErr
 			}
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, writeErr
+		return nil, wrappedWriteErr
 	}
 
 	conn, err = sendRequestFrame(conn, reused)
@@ -300,7 +325,10 @@ func (m *OpenAIResponsesWSModel) executeRequest(
 		return nil, err
 	}
 
-	var sawTerminal bool
+	var (
+		receivedAnyEvent bool
+		sawTerminal      bool
+	)
 	for {
 		event, payload, err := m.readEvent(ctx, conn, timeouts.Recv)
 		if err != nil {
@@ -308,8 +336,17 @@ func (m *OpenAIResponsesWSModel) executeRequest(
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
+			switch {
+			case receivedAnyEvent:
+				err = wrapModelReplaySafety(err, "unsafe", true)
+			case websocketTimeoutPhaseFromError(err) == "receive":
+				err = wrapModelReplaySafety(err, "unsafe", false)
+			case shouldRetryResponsesWebsocketPreSend(err):
+				err = wrapModelReplaySafety(err, "unsafe", false)
+			}
 			return nil, err
 		}
+		receivedAnyEvent = true
 
 		switch event.Type {
 		case "error", "response.error":

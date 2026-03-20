@@ -627,7 +627,7 @@ func TestNestedAgentToolResumesAfterRejection(t *testing.T) {
 	assert.Equal(t, innerTool.Name, second.Interruptions[0].ToolName)
 
 	state2 := stateFromResultWithApprovals(state, second, agents.DefaultMaxTurns)
-	require.NoError(t, state2.RejectTool(second.Interruptions[0], ""))
+	require.NoError(t, state2.RejectTool(second.Interruptions[0]))
 	third, err := agents.Runner{}.RunFromState(t.Context(), outerAgent, state2)
 	require.NoError(t, err)
 	require.NotEmpty(t, third.Interruptions)

@@ -216,7 +216,7 @@ func TestRunStateRoundTripToolApprovals(t *testing.T) {
 	runContext.RejectTool(agents.ToolApprovalItem{
 		ToolName: "tool_2",
 		RawItem:  map[string]any{"call_id": "call-2"},
-	}, true)
+	}, true, "Denied by reviewer")
 
 	state := agents.RunState{
 		SchemaVersion: agents.CurrentRunStateSchemaVersion,
@@ -241,6 +241,58 @@ func TestRunStateRoundTripToolApprovals(t *testing.T) {
 	approved, known = restoredContext.IsToolApproved("tool_2", "any")
 	require.True(t, known)
 	assert.False(t, approved)
+
+	message, ok := restoredContext.GetRejectionMessage("tool_2", "call-2", nil)
+	require.True(t, ok)
+	assert.Equal(t, "Denied by reviewer", message)
+
+	message, ok = restoredContext.GetRejectionMessage("tool_2", "call-3", nil)
+	require.True(t, ok)
+	assert.Equal(t, "Denied by reviewer", message)
+}
+
+func TestRunStateContextOverrideKeepsSerializedRejectionMessages(t *testing.T) {
+	approvalItem := agents.ToolApprovalItem{
+		ToolName: "tool_2",
+		RawItem:  map[string]any{"call_id": "call-2"},
+	}
+
+	runContext := agents.NewRunContextWrapper[any](map[string]any{"source": "saved"})
+	runContext.RejectTool(approvalItem, true, "Denied by reviewer")
+
+	state := agents.RunState{
+		SchemaVersion: agents.CurrentRunStateSchemaVersion,
+		Context: &agents.RunStateContextState{
+			Context: map[string]any{"source": "saved"},
+			Usage:   usage.NewUsage(),
+		},
+	}
+	state.SetToolApprovalsFromContext(runContext)
+	state.Context.Approvals = state.ToolApprovals
+
+	encoded, err := state.ToJSON()
+	require.NoError(t, err)
+
+	override := agents.NewRunContextWrapper[any](map[string]any{"source": "override"})
+	override.RejectTool(approvalItem, true, "override denial")
+
+	decoded, err := agents.RunStateFromJSONWithOptions(encoded, agents.RunStateDeserializeOptions{
+		ContextOverride: override,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, decoded.Context)
+	assert.Equal(t, map[string]any{"source": "override"}, decoded.Context.Context)
+
+	restoredContext := agents.NewRunContextWrapper[any](nil)
+	decoded.ApplyToolApprovalsToContext(restoredContext)
+
+	message, ok := restoredContext.GetRejectionMessage("tool_2", "call-2", nil)
+	require.True(t, ok)
+	assert.Equal(t, "Denied by reviewer", message)
+
+	message, ok = restoredContext.GetRejectionMessage("tool_2", "call-3", nil)
+	require.True(t, ok)
+	assert.Equal(t, "Denied by reviewer", message)
 }
 
 func TestRunStateApproveAndRejectTool(t *testing.T) {
@@ -278,6 +330,10 @@ func TestRunStateApproveAndRejectTool(t *testing.T) {
 	approved, known := restoredContext.IsToolApproved("add", "approval_1")
 	require.True(t, known)
 	assert.False(t, approved)
+
+	message, ok := restoredContext.GetRejectionMessage("add", "approval_1", nil)
+	require.True(t, ok)
+	assert.Equal(t, "denied", message)
 }
 
 func TestRunStateApproveToolUpdatesApprovalsForNonMCP(t *testing.T) {
@@ -324,6 +380,10 @@ func TestRunStateRejectToolUpdatesApprovalsForNonMCP(t *testing.T) {
 	approved, known := ctx.IsToolApproved("apply_patch", "call-apply-2")
 	require.True(t, known)
 	assert.False(t, approved)
+
+	message, ok := ctx.GetRejectionMessage("apply_patch", "call-apply-2", nil)
+	require.True(t, ok)
+	assert.Equal(t, "denied", message)
 }
 
 func TestRunStateApplyStoredToolApprovals(t *testing.T) {
@@ -363,6 +423,36 @@ func TestRunStateApplyStoredToolApprovals(t *testing.T) {
 	assert.Equal(t, "mcp_approval_response", *state.GeneratedItems[0].GetType())
 	assert.Equal(t, "approval_1", *state.GeneratedItems[0].GetApprovalRequestID())
 	assert.True(t, *state.GeneratedItems[0].GetApprove())
+}
+
+func TestRunStateApplyStoredToolApprovalsUsesStoredRejectionMessage(t *testing.T) {
+	state := agents.RunState{
+		SchemaVersion: agents.CurrentRunStateSchemaVersion,
+		Interruptions: []agents.ToolApprovalItem{
+			{
+				ToolName: "add",
+				RawItem: responses.ResponseOutputItemMcpApprovalRequest{
+					ID:          "approval_1",
+					Name:        "add",
+					ServerLabel: "mcp_server",
+					Type:        constant.ValueOf[constant.McpApprovalRequest](),
+				},
+			},
+		},
+	}
+
+	runContext := agents.NewRunContextWrapper[any](nil)
+	runContext.RejectTool(state.Interruptions[0], false, "")
+	state.SetToolApprovalsFromContext(runContext)
+
+	err := state.ApplyStoredToolApprovals()
+	require.NoError(t, err)
+	require.Len(t, state.GeneratedItems, 1)
+	assert.Equal(t, "mcp_approval_response", *state.GeneratedItems[0].GetType())
+	assert.Equal(t, "approval_1", *state.GeneratedItems[0].GetApprovalRequestID())
+	assert.False(t, *state.GeneratedItems[0].GetApprove())
+	require.NotNil(t, state.GeneratedItems[0].GetReason())
+	assert.Equal(t, "", *state.GeneratedItems[0].GetReason())
 }
 
 func TestRunStateApplyStoredToolApprovalsSkipsExistingResponses(t *testing.T) {

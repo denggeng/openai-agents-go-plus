@@ -101,3 +101,23 @@ func TestRunContextHonorsGlobalApprovalAndRejection(t *testing.T) {
 	require.True(t, known)
 	assert.False(t, approved)
 }
+
+func TestRunContextRebuildApprovalsRestoresStickyRejectionMessage(t *testing.T) {
+	wrapper := NewRunContextWrapper(map[string]any{})
+	emptyMessage := ""
+	wrapper.RebuildApprovals(map[string]ToolApprovalRecordState{
+		"tool_call": {
+			Rejected:               true,
+			RejectionMessages:      map[string]string{"call-1": emptyMessage},
+			StickyRejectionMessage: &emptyMessage,
+		},
+	})
+
+	message, ok := wrapper.GetRejectionMessage("tool_call", "call-1", nil)
+	require.True(t, ok)
+	assert.Equal(t, "", message)
+
+	message, ok = wrapper.GetRejectionMessage("tool_call", "call-2", nil)
+	require.True(t, ok)
+	assert.Equal(t, "", message)
+}

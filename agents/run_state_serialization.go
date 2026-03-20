@@ -1614,8 +1614,6 @@ func applyRunStateContextOverrides(state *RunState, opts RunStateDeserializeOpti
 	if opts.ContextOverride != nil {
 		if wrapper, ok := opts.ContextOverride.(*RunContextWrapper[any]); ok {
 			state.Context.Context = wrapper.Context
-			state.Context.Usage = cloneUsage(wrapper.Usage)
-			state.Context.Approvals = wrapper.SerializeApprovals()
 			state.Context.ToolInput = wrapper.ToolInput
 		} else {
 			state.Context.Context = opts.ContextOverride

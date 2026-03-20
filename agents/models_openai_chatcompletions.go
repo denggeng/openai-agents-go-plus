@@ -25,6 +25,7 @@ import (
 
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
 	"github.com/denggeng/openai-agents-go-plus/openaitypes"
+	"github.com/denggeng/openai-agents-go-plus/retry"
 	"github.com/denggeng/openai-agents-go-plus/tracing"
 	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/denggeng/openai-agents-go-plus/util"
@@ -55,6 +56,10 @@ func NewOpenAIChatCompletionsModelWithImpl(
 		client:    client,
 		modelImpl: strings.TrimSpace(modelImpl),
 	}
+}
+
+func (m OpenAIChatCompletionsModel) GetRetryAdvice(request retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice {
+	return getOpenAIRetryAdvice(request)
 }
 
 func (m OpenAIChatCompletionsModel) GetResponse(
@@ -384,10 +389,13 @@ func (m OpenAIChatCompletionsModel) prepareRequest(
 		ParallelToolCalls: parallelToolCalls,
 		StreamOptions:     streamOptions,
 		Store:             store,
-		ReasoningEffort:   reasoningEffort,
-		Verbosity:         openai.ChatCompletionNewParamsVerbosity(modelSettings.Verbosity.Or("")),
-		TopLogprobs:       modelSettings.TopLogprobs,
-		Metadata:          modelSettings.Metadata,
+		PromptCacheRetention: chatCompletionsPromptCacheRetention(
+			modelSettings.PromptCacheRetention,
+		),
+		ReasoningEffort: reasoningEffort,
+		Verbosity:       openai.ChatCompletionNewParamsVerbosity(modelSettings.Verbosity.Or("")),
+		TopLogprobs:     modelSettings.TopLogprobs,
+		Metadata:        modelSettings.Metadata,
 	}
 
 	var opts []option.RequestOption
@@ -411,6 +419,7 @@ func (m OpenAIChatCompletionsModel) prepareRequest(
 	for k, v := range extraJSON {
 		opts = append(opts, option.WithJSONSet(k, v))
 	}
+	opts = appendProviderRetryDisableOption(ctx, opts)
 
 	if modelSettings.CustomizeChatCompletionsRequest != nil {
 		return modelSettings.CustomizeChatCompletionsRequest(ctx, params, opts)

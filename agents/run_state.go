@@ -36,7 +36,7 @@ type toolApprovalStateRebuilder interface {
 
 const (
 	// CurrentRunStateSchemaVersion is the serialization schema version for RunState.
-	CurrentRunStateSchemaVersion = "1.5"
+	CurrentRunStateSchemaVersion = "1.6"
 )
 
 var supportedRunStateSchemaVersions = map[string]struct{}{
@@ -46,6 +46,7 @@ var supportedRunStateSchemaVersions = map[string]struct{}{
 	"1.3": {},
 	"1.4": {},
 	"1.5": {},
+	"1.6": {},
 }
 
 // GuardrailFunctionOutputState is a JSON-friendly representation of GuardrailFunctionOutput.
@@ -267,17 +268,18 @@ func (s *RunState) ApproveTool(approvalItem ToolApprovalItem) error {
 	}
 	if parentSig, ok := agentToolParentSignatureFromRaw(approvalItem.RawItem); ok {
 		if nestedState := peekAgentToolRunState(parentSig); nestedState != nil && nestedState != s {
-			return nestedState.applyToolDecision(approvalItem, true, "")
+			return nestedState.applyToolDecision(approvalItem, true, nil)
 		}
 	}
-	return s.applyToolDecision(approvalItem, true, "")
+	return s.applyToolDecision(approvalItem, true, nil)
 }
 
 // RejectTool appends a rejection response input item for the given interruption.
-func (s *RunState) RejectTool(approvalItem ToolApprovalItem, reason string) error {
+func (s *RunState) RejectTool(approvalItem ToolApprovalItem, rejectionMessage ...string) error {
 	if s == nil {
 		return nil
 	}
+	reason := optionalStringPointer(rejectionMessage...)
 	if parentSig, ok := agentToolParentSignatureFromRaw(approvalItem.RawItem); ok {
 		if nestedState := peekAgentToolRunState(parentSig); nestedState != nil && nestedState != s {
 			return nestedState.applyToolDecision(approvalItem, false, reason)
@@ -286,7 +288,11 @@ func (s *RunState) RejectTool(approvalItem ToolApprovalItem, reason string) erro
 	return s.applyToolDecision(approvalItem, false, reason)
 }
 
-func (s *RunState) applyToolDecision(approvalItem ToolApprovalItem, approve bool, reason string) error {
+func (s *RunState) applyToolDecision(
+	approvalItem ToolApprovalItem,
+	approve bool,
+	reason *string,
+) error {
 	if s == nil {
 		return nil
 	}
@@ -297,7 +303,7 @@ func (s *RunState) applyToolDecision(approvalItem ToolApprovalItem, approve bool
 		}
 		s.GeneratedItems = append(s.GeneratedItems, item)
 	}
-	s.applyDecisionToToolApprovals(approvalItem, approve)
+	s.applyDecisionToToolApprovals(approvalItem, approve, reason)
 	return nil
 }
 
@@ -401,7 +407,18 @@ func (s *RunState) ApplyStoredToolApprovals() error {
 			continue
 		}
 
-		item, err := buildMCPApprovalResponseInputItem(interruption, approved, "")
+		var reason *string
+		if !approved {
+			if message, ok := approvalContext.GetRejectionMessage(
+				resolveApprovalToolName(interruption),
+				approvalRequestID,
+				&interruption,
+			); ok {
+				reason = &message
+			}
+		}
+
+		item, err := buildMCPApprovalResponseInputItem(interruption, approved, reason)
 		if err != nil {
 			return err
 		}
@@ -581,8 +598,10 @@ func cloneToolApprovalStates(in map[string]ToolApprovalRecordState) map[string]T
 	out := make(map[string]ToolApprovalRecordState, len(in))
 	for toolName, state := range in {
 		out[toolName] = ToolApprovalRecordState{
-			Approved: cloneToolApprovalValue(state.Approved),
-			Rejected: cloneToolApprovalValue(state.Rejected),
+			Approved:               cloneToolApprovalValue(state.Approved),
+			Rejected:               cloneToolApprovalValue(state.Rejected),
+			RejectionMessages:      cloneStringMap(state.RejectionMessages),
+			StickyRejectionMessage: cloneStringPointer(state.StickyRejectionMessage),
 		}
 	}
 	return out
@@ -632,7 +651,11 @@ func isMCPApprovalItem(approvalItem ToolApprovalItem) bool {
 	return false
 }
 
-func (s *RunState) applyDecisionToToolApprovals(approvalItem ToolApprovalItem, approve bool) {
+func (s *RunState) applyDecisionToToolApprovals(
+	approvalItem ToolApprovalItem,
+	approve bool,
+	rejectionMessage *string,
+) {
 	if s == nil {
 		return
 	}
@@ -642,12 +665,20 @@ func (s *RunState) applyDecisionToToolApprovals(approvalItem ToolApprovalItem, a
 	if approve {
 		approvalContext.ApproveTool(approvalItem, false)
 	} else {
-		approvalContext.RejectTool(approvalItem, false)
+		if rejectionMessage != nil {
+			approvalContext.RejectTool(approvalItem, false, *rejectionMessage)
+		} else {
+			approvalContext.RejectTool(approvalItem, false)
+		}
 	}
 	s.SetToolApprovalsFromContext(approvalContext)
 }
 
-func buildMCPApprovalResponseInputItem(approvalItem ToolApprovalItem, approve bool, reason string) (TResponseInputItem, error) {
+func buildMCPApprovalResponseInputItem(
+	approvalItem ToolApprovalItem,
+	approve bool,
+	reason *string,
+) (TResponseInputItem, error) {
 	approvalRequestID := resolveApprovalCallID(approvalItem)
 	if approvalRequestID == "" {
 		return TResponseInputItem{}, UserErrorf("approval item has no approval request id")
@@ -660,8 +691,8 @@ func buildMCPApprovalResponseInputItem(approvalItem ToolApprovalItem, approve bo
 		Reason:            param.Opt[string]{},
 		Type:              constant.ValueOf[constant.McpApprovalResponse](),
 	}
-	if !approve && reason != "" {
-		rawItem.Reason = param.NewOpt(reason)
+	if !approve && reason != nil {
+		rawItem.Reason = param.NewOpt(*reason)
 	}
 
 	return responses.ResponseInputItemUnionParam{

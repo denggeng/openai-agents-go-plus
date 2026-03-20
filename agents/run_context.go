@@ -17,22 +17,27 @@ package agents
 import (
 	"fmt"
 	"reflect"
+	"sort"
 
 	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/responses"
 )
 
 type toolApprovalRecord struct {
-	ApprovedAll     bool
-	RejectedAll     bool
-	ApprovedCallIDs map[string]struct{}
-	RejectedCallIDs map[string]struct{}
+	ApprovedAll            bool
+	RejectedAll            bool
+	ApprovedCallIDs        map[string]struct{}
+	RejectedCallIDs        map[string]struct{}
+	RejectionMessages      map[string]string
+	StickyRejectionMessage *string
 }
 
 // ToolApprovalRecordState is a JSON-friendly approval state snapshot.
 type ToolApprovalRecordState struct {
-	Approved any `json:"approved"`
-	Rejected any `json:"rejected"`
+	Approved               any               `json:"approved"`
+	Rejected               any               `json:"rejected"`
+	RejectionMessages      map[string]string `json:"rejection_messages,omitempty"`
+	StickyRejectionMessage *string           `json:"sticky_rejection_message,omitempty"`
 }
 
 // ToolApprovalItem stores tool identity data used to approve or reject tool calls.
@@ -76,12 +81,29 @@ func (c *RunContextWrapper[T]) getOrCreateApprovalRecord(toolName string) *toolA
 	record, ok := c.approvals[toolName]
 	if !ok {
 		record = &toolApprovalRecord{
-			ApprovedCallIDs: make(map[string]struct{}),
-			RejectedCallIDs: make(map[string]struct{}),
+			ApprovedCallIDs:   make(map[string]struct{}),
+			RejectedCallIDs:   make(map[string]struct{}),
+			RejectionMessages: make(map[string]string),
 		}
 		c.approvals[toolName] = record
 	}
+	ensureToolApprovalRecordInitialized(record)
 	return record
+}
+
+func ensureToolApprovalRecordInitialized(record *toolApprovalRecord) {
+	if record == nil {
+		return
+	}
+	if record.ApprovedCallIDs == nil {
+		record.ApprovedCallIDs = make(map[string]struct{})
+	}
+	if record.RejectedCallIDs == nil {
+		record.RejectedCallIDs = make(map[string]struct{})
+	}
+	if record.RejectionMessages == nil {
+		record.RejectionMessages = make(map[string]string)
+	}
 }
 
 func (c *RunContextWrapper[T]) approvalStatusForKeys(keys []string, callID string) (bool, bool) {
@@ -125,6 +147,7 @@ func (c *RunContextWrapper[T]) applyApprovalDecision(
 	approvalItem ToolApprovalItem,
 	always bool,
 	approve bool,
+	rejectionMessage *string,
 ) {
 	toolKeys := approvalRecordKeysFromItem(approvalItem)
 	if len(toolKeys) == 0 {
@@ -139,27 +162,55 @@ func (c *RunContextWrapper[T]) applyApprovalDecision(
 			record.RejectedAll = !approve
 			clear(record.ApprovedCallIDs)
 			clear(record.RejectedCallIDs)
+			if approve {
+				clear(record.RejectionMessages)
+				record.StickyRejectionMessage = nil
+			} else {
+				if callID != "" {
+					if rejectionMessage != nil {
+						record.RejectionMessages[callID] = *rejectionMessage
+					} else {
+						delete(record.RejectionMessages, callID)
+					}
+				}
+				record.StickyRejectionMessage = cloneStringPointer(rejectionMessage)
+			}
 			continue
 		}
 
 		if approve {
 			delete(record.RejectedCallIDs, callID)
 			record.ApprovedCallIDs[callID] = struct{}{}
+			delete(record.RejectionMessages, callID)
 		} else {
 			delete(record.ApprovedCallIDs, callID)
 			record.RejectedCallIDs[callID] = struct{}{}
+			if rejectionMessage != nil {
+				record.RejectionMessages[callID] = *rejectionMessage
+			} else {
+				delete(record.RejectionMessages, callID)
+			}
 		}
 	}
 }
 
 // ApproveTool approves a tool call, optionally for all future calls of that tool.
 func (c *RunContextWrapper[T]) ApproveTool(approvalItem ToolApprovalItem, alwaysApprove bool) {
-	c.applyApprovalDecision(approvalItem, alwaysApprove, true)
+	c.applyApprovalDecision(approvalItem, alwaysApprove, true, nil)
 }
 
 // RejectTool rejects a tool call, optionally for all future calls of that tool.
-func (c *RunContextWrapper[T]) RejectTool(approvalItem ToolApprovalItem, alwaysReject bool) {
-	c.applyApprovalDecision(approvalItem, alwaysReject, false)
+func (c *RunContextWrapper[T]) RejectTool(
+	approvalItem ToolApprovalItem,
+	alwaysReject bool,
+	rejectionMessage ...string,
+) {
+	c.applyApprovalDecision(
+		approvalItem,
+		alwaysReject,
+		false,
+		optionalStringPointer(rejectionMessage...),
+	)
 }
 
 // GetApprovalStatus returns (approved, known).
@@ -219,6 +270,55 @@ func (c *RunContextWrapper[T]) getApprovalStatusForLookupKey(
 	return approved, known
 }
 
+func rejectionMessageForRecord(record *toolApprovalRecord, callID string) (string, bool) {
+	if record == nil {
+		return "", false
+	}
+	if record.RejectedAll {
+		if message, ok := record.RejectionMessages[callID]; ok {
+			return message, true
+		}
+		if record.StickyRejectionMessage != nil {
+			return *record.StickyRejectionMessage, true
+		}
+		return "", false
+	}
+	if _, ok := record.RejectedCallIDs[callID]; ok {
+		message, found := record.RejectionMessages[callID]
+		return message, found
+	}
+	return "", false
+}
+
+// GetRejectionMessage returns a stored rejection message for the given tool call.
+func (c *RunContextWrapper[T]) GetRejectionMessage(
+	toolName string,
+	callID string,
+	existingPending *ToolApprovalItem,
+) (string, bool) {
+	keys := approvalLookupKeys(toolName, existingPending)
+	if len(keys) == 0 && toolName != "" {
+		keys = []string{toolName}
+	}
+	for _, key := range keys {
+		if message, ok := rejectionMessageForRecord(c.approvals[key], callID); ok {
+			return message, true
+		}
+	}
+	if existingPending == nil || callID == "" || !isMCPApprovalItem(*existingPending) {
+		return "", false
+	}
+	for _, record := range c.approvals {
+		if record == nil {
+			continue
+		}
+		if message, ok := record.RejectionMessages[callID]; ok {
+			return message, true
+		}
+	}
+	return "", false
+}
+
 // SerializeApprovals exports approval state as JSON-friendly data.
 func (c *RunContextWrapper[T]) SerializeApprovals() map[string]ToolApprovalRecordState {
 	if len(c.approvals) == 0 {
@@ -247,9 +347,17 @@ func (c *RunContextWrapper[T]) SerializeApprovals() map[string]ToolApprovalRecor
 			}
 			rejected = rejectedIDs
 		}
+		if approvedIDs, ok := approved.([]string); ok {
+			sort.Strings(approvedIDs)
+		}
+		if rejectedIDs, ok := rejected.([]string); ok {
+			sort.Strings(rejectedIDs)
+		}
 		out[toolName] = ToolApprovalRecordState{
-			Approved: approved,
-			Rejected: rejected,
+			Approved:               approved,
+			Rejected:               rejected,
+			RejectionMessages:      cloneStringMap(record.RejectionMessages),
+			StickyRejectionMessage: cloneStringPointer(record.StickyRejectionMessage),
 		}
 	}
 	return out
@@ -260,8 +368,9 @@ func (c *RunContextWrapper[T]) RebuildApprovals(approvals map[string]ToolApprova
 	c.approvals = make(map[string]*toolApprovalRecord, len(approvals))
 	for toolName, state := range approvals {
 		record := &toolApprovalRecord{
-			ApprovedCallIDs: make(map[string]struct{}),
-			RejectedCallIDs: make(map[string]struct{}),
+			ApprovedCallIDs:   make(map[string]struct{}),
+			RejectedCallIDs:   make(map[string]struct{}),
+			RejectionMessages: make(map[string]string),
 		}
 
 		switch approved := state.Approved.(type) {
@@ -297,6 +406,10 @@ func (c *RunContextWrapper[T]) RebuildApprovals(approvals map[string]ToolApprova
 				}
 			}
 		}
+
+		record.RejectionMessages = cloneStringMap(state.RejectionMessages)
+		record.StickyRejectionMessage = cloneStringPointer(state.StickyRejectionMessage)
+		ensureToolApprovalRecordInitialized(record)
 
 		c.approvals[toolName] = record
 	}
@@ -417,6 +530,33 @@ func providerDataApprovalID(rawItem any) (string, bool) {
 	}
 	id, ok := stringFromMap(providerData, "id")
 	return id, ok
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func cloneStringPointer(in *string) *string {
+	if in == nil {
+		return nil
+	}
+	value := *in
+	return &value
+}
+
+func optionalStringPointer(values ...string) *string {
+	if len(values) == 0 {
+		return nil
+	}
+	value := values[0]
+	return &value
 }
 
 func stringFromMap(rawItem any, key string) (string, bool) {

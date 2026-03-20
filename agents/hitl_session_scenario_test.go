@@ -370,7 +370,7 @@ func runScenarioStep(
 	approval := first.Interruptions[0]
 	state := agents.NewRunStateFromResult(*first, 1, 10)
 	if step.approval == "reject" {
-		require.NoError(t, state.RejectTool(approval, ""))
+		require.NoError(t, state.RejectTool(approval))
 	} else {
 		require.NoError(t, state.ApproveTool(approval))
 	}

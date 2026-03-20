@@ -28,6 +28,7 @@ import (
 
 	"github.com/denggeng/openai-agents-go-plus/memory"
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/retry"
 	"github.com/denggeng/openai-agents-go-plus/tracing"
 	"github.com/denggeng/openai-agents-go-plus/usage"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -2875,10 +2876,6 @@ func (r Runner) runSingleTurnStreamed(
 	if err != nil {
 		return nil, err
 	}
-	if serverConversationTracker != nil {
-		serverConversationTracker.MarkInputAsSent(filtered.Input)
-	}
-
 	conversationID := runConfig.ConversationID
 	if serverConversationTracker != nil {
 		conversationID = serverConversationTracker.ConversationID
@@ -2909,8 +2906,34 @@ func (r Runner) runSingleTurnStreamed(
 		ConversationID:     conversationID,
 		Prompt:             promptConfig,
 	}
-	err = model.StreamResponse(
-		ctx, modelResponseParams,
+
+	var retryAdviceProvider func(retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice
+	if _, ok := model.(ModelRetryAdvisor); ok {
+		retryAdviceProvider = func(request retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice {
+			return getModelRetryAdvice(model, request)
+		}
+	}
+
+	rewindInput := func() error {
+		if serverConversationTracker != nil {
+			serverConversationTracker.RewindInput(filtered.Input)
+		}
+		return nil
+	}
+
+	err = streamResponseWithRetry(
+		ctx,
+		func(attemptCtx context.Context, yield ModelStreamResponseCallback) error {
+			if serverConversationTracker != nil {
+				serverConversationTracker.MarkInputAsSent(filtered.Input)
+			}
+			return model.StreamResponse(attemptCtx, modelResponseParams, yield)
+		},
+		rewindInput,
+		modelSettings.Retry,
+		retryAdviceProvider,
+		previousResponseID,
+		conversationID,
 		func(ctx context.Context, event TResponseStreamEvent) error {
 			if event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.incomplete" {
 				if reflect.ValueOf(event.Response).IsZero() {
@@ -2931,9 +2954,7 @@ func (r Runner) runSingleTurnStreamed(
 						TotalTokens:         uint64(event.Response.Usage.TotalTokens),
 					}
 				}
-				if u.Requests == 0 {
-					u.Requests = 1
-				}
+				u = applyRetryAttemptUsage(u, modelRetryAttemptsFromContext(ctx))
 				finalResponse = &ModelResponse{
 					Output:     event.Response.Output,
 					Usage:      u,
@@ -3401,10 +3422,6 @@ func (r Runner) getNewResponse(
 	if err != nil {
 		return nil, err
 	}
-	if serverConversationTracker != nil {
-		serverConversationTracker.MarkInputAsSent(filtered.Input)
-	}
-
 	conversationID := runConfig.ConversationID
 	if serverConversationTracker != nil {
 		conversationID = serverConversationTracker.ConversationID
@@ -3427,7 +3444,7 @@ func (r Runner) getNewResponse(
 		}
 	}
 
-	newResponse, err := model.GetResponse(ctx, ModelResponseParams{
+	modelResponseParams := ModelResponseParams{
 		SystemInstructions: filtered.Instructions,
 		Input:              InputItems(filtered.Input),
 		ModelSettings:      modelSettings,
@@ -3441,7 +3458,36 @@ func (r Runner) getNewResponse(
 		PreviousResponseID: previousResponseID,
 		ConversationID:     conversationID,
 		Prompt:             promptConfig,
-	})
+	}
+
+	var retryAdviceProvider func(retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice
+	if _, ok := model.(ModelRetryAdvisor); ok {
+		retryAdviceProvider = func(request retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice {
+			return getModelRetryAdvice(model, request)
+		}
+	}
+
+	rewindInput := func() error {
+		if serverConversationTracker != nil {
+			serverConversationTracker.RewindInput(filtered.Input)
+		}
+		return nil
+	}
+
+	newResponse, err := getResponseWithRetry(
+		ctx,
+		func(attemptCtx context.Context) (*ModelResponse, error) {
+			if serverConversationTracker != nil {
+				serverConversationTracker.MarkInputAsSent(filtered.Input)
+			}
+			return model.GetResponse(attemptCtx, modelResponseParams)
+		},
+		rewindInput,
+		modelSettings.Retry,
+		retryAdviceProvider,
+		previousResponseID,
+		conversationID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -3454,11 +3500,7 @@ func (r Runner) getNewResponse(
 		}
 	}
 
-	if newResponse.Usage == nil {
-		newResponse.Usage = &usage.Usage{Requests: 1}
-	} else {
-		newResponse.Usage.Requests++
-	}
+	newResponse.Usage = applyRetryAttemptUsage(newResponse.Usage, 0)
 
 	if contextUsage, _ := usage.FromContext(ctx); contextUsage != nil {
 		contextUsage.Add(newResponse.Usage)
