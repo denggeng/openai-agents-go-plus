@@ -201,6 +201,30 @@ func TestOpenAIResponsesModel_prepareRequest(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("forwards prompt cache retention", func(t *testing.T) {
+		m := NewOpenAIResponsesModel("model-name", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))
+		_, _, err := m.prepareRequest(
+			t.Context(),
+			param.Opt[string]{},
+			InputString("input"),
+			modelsettings.ModelSettings{
+				PromptCacheRetention: param.NewOpt(modelsettings.PromptCacheRetentionInMemory),
+				CustomizeResponsesRequest: func(ctx context.Context, params *responses.ResponseNewParams, opts []option.RequestOption) (*responses.ResponseNewParams, []option.RequestOption, error) {
+					assert.Equal(t, responses.ResponseNewParamsPromptCacheRetentionInMemory, params.PromptCacheRetention)
+					return params, opts, nil
+				},
+			},
+			nil,
+			nil,
+			nil,
+			"",
+			"",
+			false,
+			responses.ResponsePromptParam{},
+		)
+		require.NoError(t, err)
+	})
+
 	t.Run("with ModelSettings.CustomizeResponsesRequest returning error", func(t *testing.T) {
 		customError := errors.New("error")
 		m := NewOpenAIResponsesModel("model-name", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))

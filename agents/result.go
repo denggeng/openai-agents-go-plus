@@ -28,6 +28,13 @@ import (
 	"github.com/denggeng/openai-agents-go-plus/tracing"
 )
 
+type ToInputListMode string
+
+const (
+	ToInputListModePreserveAll ToInputListMode = "preserve_all"
+	ToInputListModeNormalized  ToInputListMode = "normalized"
+)
+
 type RunResult struct {
 	// The original input items i.e. the items before Run() was called. This may be a mutated
 	// version of the input, if there are handoff input filters that mutate the input.
@@ -85,8 +92,14 @@ func (r RunResult) String() string {
 }
 
 // ToInputList creates a new input list, merging the original input with all the new items generated.
-func (r RunResult) ToInputList() []TResponseInputItem {
-	return toInputListWithPolicy(r.Input, r.NewItems, r.reasoningItemIDPolicy)
+func (r RunResult) ToInputList(mode ...ToInputListMode) []TResponseInputItem {
+	return resultToInputList(
+		r.Input,
+		r.NewItems,
+		r.ModelInputItems,
+		r.reasoningItemIDPolicy,
+		resolveToInputListMode(mode),
+	)
 }
 
 // LastResponseID is a convenience method to get the response ID of the last model response.
@@ -397,13 +410,49 @@ func (r *RunResultStreaming) setWaitingOnEventQueue(v bool) {
 }
 
 // ToInputList creates a new input list, merging the original input with all the new items generated.
-func (r *RunResultStreaming) ToInputList() []TResponseInputItem {
-	return toInputListWithPolicy(r.Input(), r.NewItems(), r.reasoningItemIDPolicy)
+func (r *RunResultStreaming) ToInputList(mode ...ToInputListMode) []TResponseInputItem {
+	return resultToInputList(
+		r.Input(),
+		r.NewItems(),
+		r.ModelInputItems(),
+		r.reasoningItemIDPolicy,
+		resolveToInputListMode(mode),
+	)
 }
 
 // LastResponseID is a convenience method to get the response ID of the last model response.
 func (r *RunResultStreaming) LastResponseID() string {
 	return lastResponseID(r.RawResponses())
+}
+
+func resolveToInputListMode(mode []ToInputListMode) ToInputListMode {
+	if len(mode) == 0 {
+		return ToInputListModePreserveAll
+	}
+	switch mode[0] {
+	case ToInputListModePreserveAll, ToInputListModeNormalized:
+		return mode[0]
+	default:
+		panic(AgentsErrorf("Unsupported ToInputList mode: %s", mode[0]))
+	}
+}
+
+func resultToInputList(
+	input Input,
+	sessionItems []RunItem,
+	modelInputItems []RunItem,
+	reasoningItemIDPolicy ReasoningItemIDPolicy,
+	mode ToInputListMode,
+) []TResponseInputItem {
+	originalItems := ItemHelpers().InputToNewInputList(input)
+
+	replayItems := sessionItems
+	if mode == ToInputListModeNormalized && len(modelInputItems) > 0 {
+		replayItems = modelInputItems
+	}
+
+	replayInputItems := runItemsToInputItemsWithPolicy(replayItems, reasoningItemIDPolicy)
+	return append(originalItems, replayInputItems...)
 }
 
 // FinalOutputAs stores the streaming final output into target if the types are compatible.
