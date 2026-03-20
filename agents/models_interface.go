@@ -18,6 +18,7 @@ import (
 	"context"
 
 	"github.com/denggeng/openai-agents-go-plus/modelsettings"
+	"github.com/denggeng/openai-agents-go-plus/retry"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 )
@@ -43,6 +44,12 @@ type Model interface {
 
 	// StreamResponse streams a response from the model.
 	StreamResponse(context.Context, ModelResponseParams, ModelStreamResponseCallback) error
+}
+
+// ModelRetryAdvisor is an optional interface for models that can provide
+// provider-specific retry guidance for failed requests.
+type ModelRetryAdvisor interface {
+	GetRetryAdvice(retry.ModelRetryAdviceRequest) *retry.ModelRetryAdvice
 }
 
 type ModelStreamResponseCallback = func(context.Context, TResponseStreamEvent) error

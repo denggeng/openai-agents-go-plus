@@ -19,6 +19,7 @@ import (
 	"maps"
 	"reflect"
 
+	"github.com/denggeng/openai-agents-go-plus/retry"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -79,6 +80,11 @@ type ModelSettings struct {
 	// For Chat Completions API: disabled when not specified.
 	Store param.Opt[bool] `json:"store"`
 
+	// The retention policy for the prompt cache. Set to `24h` to enable extended
+	// prompt caching, which keeps cached prefixes active for longer, up to a maximum
+	// of 24 hours.
+	PromptCacheRetention param.Opt[PromptCacheRetention] `json:"prompt_cache_retention"`
+
 	// Whether to include usage chunk.
 	//Only available for Chat Completions API.
 	IncludeUsage param.Opt[bool] `json:"include_usage"`
@@ -106,6 +112,9 @@ type ModelSettings struct {
 	// These are merged with ExtraBody; for duplicate keys, ExtraArgs wins,
 	// except `reasoning_effort` where ExtraBody wins for compatibility.
 	ExtraArgs map[string]any `json:"extra_args"`
+
+	// Optional runner-managed retry settings for model calls.
+	Retry *retry.ModelRetrySettings `json:"retry,omitempty"`
 
 	// Optional function which allows you to fully customize parameters and options
 	// for a call to the responses API. Pre-built parameters and options are given.
@@ -159,6 +168,13 @@ const (
 	TruncationDisabled Truncation = "disabled"
 )
 
+type PromptCacheRetention string
+
+const (
+	PromptCacheRetentionInMemory PromptCacheRetention = "in_memory"
+	PromptCacheRetention24h      PromptCacheRetention = "24h"
+)
+
 // Resolve produces a new ModelSettings by overlaying any present values from
 // the override on top of this instance.
 func (ms ModelSettings) Resolve(override ModelSettings) ModelSettings {
@@ -175,13 +191,15 @@ func (ms ModelSettings) Resolve(override ModelSettings) ModelSettings {
 	resolveOpt(&newSettings.Verbosity, override.Verbosity)
 	resolveMap(&newSettings.Metadata, override.Metadata)
 	resolveOpt(&newSettings.Store, override.Store)
+	resolveOpt(&newSettings.PromptCacheRetention, override.PromptCacheRetention)
 	resolveOpt(&newSettings.IncludeUsage, override.IncludeUsage)
 	resolveAny(&newSettings.ResponseInclude, override.ResponseInclude)
 	resolveOpt(&newSettings.TopLogprobs, override.TopLogprobs)
 	resolveMap(&newSettings.ExtraQuery, override.ExtraQuery)
 	resolveMap(&newSettings.ExtraHeaders, override.ExtraHeaders)
 	resolveMap(&newSettings.ExtraBody, override.ExtraBody)
-	resolveMap(&newSettings.ExtraArgs, override.ExtraArgs)
+	newSettings.ExtraArgs = resolveMergedMap(ms.ExtraArgs, override.ExtraArgs)
+	newSettings.Retry = resolveRetrySettings(ms.Retry, override.Retry)
 	resolveAny(&newSettings.CustomizeResponsesRequest, override.CustomizeResponsesRequest)
 	resolveAny(&newSettings.CustomizeChatCompletionsRequest, override.CustomizeChatCompletionsRequest)
 	return newSettings
@@ -204,4 +222,106 @@ func resolveMap[M ~map[K]V, K comparable, V any](base *M, override M) {
 	if len(override) > 0 {
 		*base = maps.Clone(override)
 	}
+}
+
+func resolveMergedMap[M ~map[K]V, K comparable, V any](base M, override M) M {
+	switch {
+	case len(base) == 0 && len(override) == 0:
+		var zero M
+		return zero
+	case len(base) == 0:
+		return maps.Clone(override)
+	case len(override) == 0:
+		return maps.Clone(base)
+	}
+
+	merged := maps.Clone(base)
+	for key, value := range override {
+		merged[key] = value
+	}
+	return merged
+}
+
+func resolveRetrySettings(
+	base *retry.ModelRetrySettings,
+	override *retry.ModelRetrySettings,
+) *retry.ModelRetrySettings {
+	switch {
+	case base == nil && override == nil:
+		return nil
+	case base == nil:
+		return cloneRetrySettings(override)
+	case override == nil:
+		return cloneRetrySettings(base)
+	}
+
+	merged := cloneRetrySettings(base)
+	if override.MaxRetries != nil {
+		merged.MaxRetries = clonePointer(override.MaxRetries)
+	}
+	if override.Policy != nil {
+		merged.Policy = override.Policy
+	}
+	merged.Backoff = resolveRetryBackoffSettings(base.Backoff, override.Backoff)
+	return merged
+}
+
+func resolveRetryBackoffSettings(
+	base *retry.ModelRetryBackoffSettings,
+	override *retry.ModelRetryBackoffSettings,
+) *retry.ModelRetryBackoffSettings {
+	switch {
+	case base == nil && override == nil:
+		return nil
+	case base == nil:
+		return cloneRetryBackoffSettings(override)
+	case override == nil:
+		return cloneRetryBackoffSettings(base)
+	}
+
+	merged := cloneRetryBackoffSettings(base)
+	if override.InitialDelay != nil {
+		merged.InitialDelay = clonePointer(override.InitialDelay)
+	}
+	if override.MaxDelay != nil {
+		merged.MaxDelay = clonePointer(override.MaxDelay)
+	}
+	if override.Multiplier != nil {
+		merged.Multiplier = clonePointer(override.Multiplier)
+	}
+	if override.Jitter != nil {
+		merged.Jitter = clonePointer(override.Jitter)
+	}
+	return merged
+}
+
+func cloneRetrySettings(settings *retry.ModelRetrySettings) *retry.ModelRetrySettings {
+	if settings == nil {
+		return nil
+	}
+	return &retry.ModelRetrySettings{
+		MaxRetries: clonePointer(settings.MaxRetries),
+		Backoff:    cloneRetryBackoffSettings(settings.Backoff),
+		Policy:     settings.Policy,
+	}
+}
+
+func cloneRetryBackoffSettings(settings *retry.ModelRetryBackoffSettings) *retry.ModelRetryBackoffSettings {
+	if settings == nil {
+		return nil
+	}
+	return &retry.ModelRetryBackoffSettings{
+		InitialDelay: clonePointer(settings.InitialDelay),
+		MaxDelay:     clonePointer(settings.MaxDelay),
+		Multiplier:   clonePointer(settings.Multiplier),
+		Jitter:       clonePointer(settings.Jitter),
+	}
+}
+
+func clonePointer[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }

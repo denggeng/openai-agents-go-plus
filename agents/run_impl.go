@@ -1294,6 +1294,7 @@ func (ri runImpl) ExecuteFunctionToolCalls(
 								"function",
 								toolDisplayName,
 								toolCall.CallID,
+								pending,
 							)
 							AttachErrorToCurrentSpan(ctx, tracing.SpanError{
 								Message: rejectionMessage,

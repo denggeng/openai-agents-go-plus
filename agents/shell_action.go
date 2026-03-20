@@ -71,6 +71,7 @@ func (shellAction) Execute(
 				"shell",
 				shellTool.ToolName(),
 				shellCall.CallID,
+				approvalItem,
 			)
 			return buildShellRejectionItem(agent, shellCall.CallID, rejectionMessage), nil
 		}

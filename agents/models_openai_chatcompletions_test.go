@@ -206,6 +206,36 @@ func TestOpenAIChatCompletionsModel_prepareRequest(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("forwards prompt cache retention", func(t *testing.T) {
+		m := NewOpenAIChatCompletionsModel("model-name", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))
+
+		err := tracing.GenerationSpan(
+			t.Context(), tracing.GenerationSpanParams{Disabled: true},
+			func(ctx context.Context, span tracing.Span) error {
+				_, _, err := m.prepareRequest(
+					t.Context(),
+					param.Opt[string]{},
+					InputString("input"),
+					modelsettings.ModelSettings{
+						PromptCacheRetention: param.NewOpt(modelsettings.PromptCacheRetentionInMemory),
+						CustomizeChatCompletionsRequest: func(ctx context.Context, params *openai.ChatCompletionNewParams, opts []option.RequestOption) (*openai.ChatCompletionNewParams, []option.RequestOption, error) {
+							assert.Equal(t, openai.ChatCompletionNewParamsPromptCacheRetentionInMemory, params.PromptCacheRetention)
+							return params, opts, nil
+						},
+					},
+					nil,
+					nil,
+					nil,
+					span,
+					ModelTracingDisabled,
+					false,
+				)
+				return err
+			},
+		)
+		require.NoError(t, err)
+	})
+
 	t.Run("with ModelSettings.CustomizeChatCompletionsRequest returning error", func(t *testing.T) {
 		customError := errors.New("error")
 		m := NewOpenAIChatCompletionsModel("model-name", NewOpenaiClient(param.Opt[string]{}, param.Opt[string]{}))

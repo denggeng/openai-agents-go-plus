@@ -5,7 +5,7 @@
 - `agentstesting/` contains fake models and helpers used across tests.
 - `openaitypes/`, `modelsettings/`, `memory/`, `tracing/`, `usage/`, `util/` provide shared types and utilities.
 - `examples/` hosts runnable samples grouped by scenario (e.g., `examples/basic`, `examples/agent_patterns`).
-- `.upstaream/` tracks the upstream Python SDK snapshot and migration notes (see `gap_report_20260212.md`).
+- `.upstream/` tracks the upstream Python SDK snapshot and migration notes (see `gap_report_20260319.md`).
 
 ## Build, Test, and Development Commands
 Use standard Go tooling:
@@ -33,9 +33,9 @@ Formats Go sources. Keep files gofmt-clean.
 - When porting features from Python, copy/translate tests first, then implement Go code until tests pass.
 
 ## Porting Workflow (Python → Go)
-- Reference upstream sources under `.upstaream/openai-agents-python/`.
+- Reference upstream sources under `.upstream/openai-agents-python/`.
 - Start from the closest Python tests and mirror behavior.
-- Update `gap_report_20260212.md` if you close a migration gap.
+- Update `gap_report_20260319.md` if you close a migration gap.
 
 ## Commit & Pull Request Guidelines
 - Existing history mixes simple imperative messages (`Add ...`, `Fix ...`) and Conventional-style prefixes (`fix:`, `feat:`, `fix(memory):`).

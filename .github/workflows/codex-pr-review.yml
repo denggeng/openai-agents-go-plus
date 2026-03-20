@@ -1,0 +1,114 @@
+name: codex-pr-review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: codex-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Avoid fork PRs in this workflow because secrets are unavailable and token
+    # permissions are restricted on forked pull_request events.
+    if: github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout pull request code
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex@latest
+
+      - name: Run Codex review
+        id: codex_review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            cat > codex_review.md <<'EOF'
+          ## Codex Review Skipped
+
+          `OPENAI_API_KEY` is not configured. Add it to repository secrets, then re-run this workflow.
+          EOF
+            exit 0
+          fi
+
+          git fetch --no-tags origin "${BASE_REF}:${BASE_REF}" || git fetch --no-tags origin "${BASE_REF}"
+
+          set +e
+          codex review --base "${BASE_REF}" > codex_review.md 2>&1
+          review_exit_code=$?
+          set -e
+
+          if [ "${review_exit_code}" -ne 0 ]; then
+            {
+              echo "## Codex Review Execution Error"
+              echo
+              echo "codex exited with code ${review_exit_code}."
+              echo
+              echo "Raw output:"
+              echo
+              echo '```text'
+              cat codex_review.md
+              echo '```'
+            } > codex_review_error.md
+            mv codex_review_error.md codex_review.md
+          fi
+
+      - name: Trim review body for GitHub API limits
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("codex_review.md")
+          text = source.read_text(encoding="utf-8", errors="replace").strip()
+          if not text:
+              text = "Codex review returned empty output."
+
+          limit = 60000
+          if len(text) > limit:
+              text = text[:limit] + "\n\n...(truncated for GitHub size limit)"
+
+          Path("codex_review_published.md").write_text(text + "\n", encoding="utf-8")
+          PY
+
+      - name: Publish review to pull request
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('node:fs');
+            const body = fs.readFileSync('codex_review_published.md', 'utf8');
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              event: 'COMMENT',
+              body,
+            });

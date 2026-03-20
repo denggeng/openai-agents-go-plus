@@ -38,7 +38,8 @@ type RunStateSerializeOptions struct {
 
 // RunStateDeserializeOptions controls RunState deserialization behavior.
 type RunStateDeserializeOptions struct {
-	// ContextOverride replaces the serialized context value (mapping or custom type).
+	// ContextOverride replaces only the serialized context value (mapping or custom
+	// type). Serialized usage and approvals remain attached to the restored run state.
 	ContextOverride any
 	// ContextDeserializer rebuilds custom contexts from serialized mappings.
 	ContextDeserializer func(map[string]any) (any, error)
@@ -1614,8 +1615,6 @@ func applyRunStateContextOverrides(state *RunState, opts RunStateDeserializeOpti
 	if opts.ContextOverride != nil {
 		if wrapper, ok := opts.ContextOverride.(*RunContextWrapper[any]); ok {
 			state.Context.Context = wrapper.Context
-			state.Context.Usage = cloneUsage(wrapper.Usage)
-			state.Context.Approvals = wrapper.SerializeApprovals()
 			state.Context.ToolInput = wrapper.ToolInput
 		} else {
 			state.Context.Context = opts.ContextOverride

@@ -18,11 +18,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net/http"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -73,27 +75,37 @@ type mcpClientSession interface {
 
 var newMCPClient = mcp.NewClient
 
+// MCPRequestAuthenticator mutates an outgoing MCP HTTP request before it is sent.
+type MCPRequestAuthenticator func(*http.Request) error
+
+func newRequestSerializationSlot() chan struct{} {
+	slot := make(chan struct{}, 1)
+	slot <- struct{}{}
+	return slot
+}
+
 // MCPServerWithClientSession is a base type for MCP servers that uses an
 // mcp.ClientSession to communicate with the server.
 type MCPServerWithClientSession struct {
-	transport            mcp.Transport
-	session              mcpClientSession
-	cleanupMu            sync.Mutex
-	cacheToolsList       bool
-	cacheDirty           bool
-	toolsList            []*mcp.Tool
-	toolFilter           MCPToolFilter
-	name                 string
-	useStructuredContent bool
-	maxRetryAttempts     int
-	retryBackoffBase     time.Duration
-	clientOptions        *mcp.ClientOptions
-	clientSessionTimeout time.Duration
-	needsApprovalPolicy  mcpNeedsApprovalPolicy
-	failureErrorFunction *ToolErrorFunction
-	failureErrorSet      bool
-	toolMetaResolver     MCPToolMetaResolver
-	cleanupHook          func()
+	transport                mcp.Transport
+	session                  mcpClientSession
+	cleanupMu                sync.Mutex
+	cacheToolsList           bool
+	cacheDirty               bool
+	toolsList                []*mcp.Tool
+	toolFilter               MCPToolFilter
+	name                     string
+	useStructuredContent     bool
+	maxRetryAttempts         int
+	retryBackoffBase         time.Duration
+	clientOptions            *mcp.ClientOptions
+	clientSessionTimeout     time.Duration
+	needsApprovalPolicy      mcpNeedsApprovalPolicy
+	failureErrorFunction     *ToolErrorFunction
+	failureErrorSet          bool
+	toolMetaResolver         MCPToolMetaResolver
+	requestSerializationSlot chan struct{}
+	cleanupHook              func()
 }
 
 type MCPServerWithClientSessionParams struct {
@@ -230,9 +242,15 @@ func (s *MCPServerWithClientSession) ListTools(ctx context.Context, agent *Agent
 		var listToolsResults *mcp.ListToolsResult
 		err := s.runWithRetries(ctx, func() error {
 			var err error
-			attemptCtx, cancel := s.withSessionTimeout(ctx)
-			defer cancel()
-			listToolsResults, err = s.session.ListTools(attemptCtx, nil)
+			listToolsResults, err = withSerializedSessionRequest(
+				ctx,
+				s.requestSerializationSlot,
+				func() (*mcp.ListToolsResult, error) {
+					attemptCtx, cancel := s.withSessionTimeout(ctx)
+					defer cancel()
+					return s.session.ListTools(attemptCtx, nil)
+				},
+			)
 			return err
 		})
 		if err != nil {
@@ -271,17 +289,23 @@ func (s *MCPServerWithClientSession) CallTool(
 	var result *mcp.CallToolResult
 	err := s.runWithRetries(ctx, func() error {
 		var err error
-		attemptCtx, cancel := s.withSessionTimeout(ctx)
-		defer cancel()
+		result, err = withSerializedSessionRequest(
+			ctx,
+			s.requestSerializationSlot,
+			func() (*mcp.CallToolResult, error) {
+				attemptCtx, cancel := s.withSessionTimeout(ctx)
+				defer cancel()
 
-		params := &mcp.CallToolParams{
-			Name:      toolName,
-			Arguments: arguments,
-		}
-		if len(meta) > 0 {
-			params.Meta = mcp.Meta(meta)
-		}
-		result, err = s.session.CallTool(attemptCtx, params)
+				params := &mcp.CallToolParams{
+					Name:      toolName,
+					Arguments: arguments,
+				}
+				if len(meta) > 0 {
+					params.Meta = mcp.Meta(meta)
+				}
+				return s.session.CallTool(attemptCtx, params)
+			},
+		)
 		return err
 	})
 	if err != nil {
@@ -347,16 +371,8 @@ func (s *MCPServerWithClientSession) runWithRetries(
 		if s.maxRetryAttempts != -1 && attempts > s.maxRetryAttempts {
 			return err
 		}
-		if s.retryBackoffBase <= 0 {
-			continue
-		}
-		backoff := s.retryBackoffBase * time.Duration(1<<maxInt(attempts-1, 0))
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if err := s.sleepRetryBackoff(ctx, attempts-1); err != nil {
+			return err
 		}
 	}
 }
@@ -366,6 +382,43 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (s *MCPServerWithClientSession) sleepRetryBackoff(ctx context.Context, attemptIndex int) error {
+	if s.retryBackoffBase <= 0 {
+		return nil
+	}
+	backoff := s.retryBackoffBase * time.Duration(1<<maxInt(attemptIndex, 0))
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func withSerializedSessionRequest[T any](
+	ctx context.Context,
+	slot chan struct{},
+	fn func() (T, error),
+) (T, error) {
+	var zero T
+	if slot == nil {
+		return fn()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	select {
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	case <-slot:
+	}
+	defer func() { slot <- struct{}{} }()
+	return fn()
 }
 
 func (s *MCPServerWithClientSession) withSessionTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -427,21 +480,33 @@ func (s *MCPServerWithClientSession) ListPrompts(ctx context.Context) (*mcp.List
 	if s.session == nil {
 		return nil, NewUserError("server not initialized: make sure you call `Connect()` first")
 	}
-	attemptCtx, cancel := s.withSessionTimeout(ctx)
-	defer cancel()
-	return s.session.ListPrompts(attemptCtx, nil)
+	return withSerializedSessionRequest(
+		ctx,
+		s.requestSerializationSlot,
+		func() (*mcp.ListPromptsResult, error) {
+			attemptCtx, cancel := s.withSessionTimeout(ctx)
+			defer cancel()
+			return s.session.ListPrompts(attemptCtx, nil)
+		},
+	)
 }
 
 func (s *MCPServerWithClientSession) GetPrompt(ctx context.Context, name string, arguments map[string]string) (*mcp.GetPromptResult, error) {
 	if s.session == nil {
 		return nil, NewUserError("server not initialized: make sure you call `Connect()` first")
 	}
-	attemptCtx, cancel := s.withSessionTimeout(ctx)
-	defer cancel()
-	return s.session.GetPrompt(attemptCtx, &mcp.GetPromptParams{
-		Name:      name,
-		Arguments: arguments,
-	})
+	return withSerializedSessionRequest(
+		ctx,
+		s.requestSerializationSlot,
+		func() (*mcp.GetPromptResult, error) {
+			attemptCtx, cancel := s.withSessionTimeout(ctx)
+			defer cancel()
+			return s.session.GetPrompt(attemptCtx, &mcp.GetPromptParams{
+				Name:      name,
+				Arguments: arguments,
+			})
+		},
+	)
 }
 
 func (s *MCPServerWithClientSession) Run(ctx context.Context, fn func(context.Context, *MCPServerWithClientSession) error) (err error) {
@@ -547,6 +612,23 @@ type MCPServerSSEParams struct {
 	BaseURL       string
 	TransportOpts *mcp.SSEClientTransport
 
+	// Optional factory to build an HTTP client for SSE transport.
+	HTTPClientFactory func() *http.Client
+
+	// Optional static headers to attach to every SSE request.
+	Headers map[string]string
+
+	// Optional request authenticator applied before the request is sent.
+	Auth MCPRequestAuthenticator
+
+	// Optional request timeout for SSE transport.
+	// Defaults to 5 seconds.
+	Timeout time.Duration
+
+	// Optional SSE idle read timeout.
+	// Defaults to 5 minutes.
+	SSEReadTimeout time.Duration
+
 	// Optional client options, including MCP message handlers.
 	ClientOptions *mcp.ClientOptions
 
@@ -600,6 +682,9 @@ type MCPServerSSEParams struct {
 // See: https://modelcontextprotocol.io/docs/concepts/transports#server-sent-events-sse-deprecated
 type MCPServerSSE struct {
 	*MCPServerWithClientSession
+	headers        map[string]string
+	timeout        time.Duration
+	sseReadTimeout time.Duration
 }
 
 // NewMCPServerSSE creates a new MCP server based on the HTTP with SSE transport.
@@ -612,6 +697,14 @@ func NewMCPServerSSE(params MCPServerSSEParams) *MCPServerSSE {
 	if name == "" {
 		name = fmt.Sprintf("sse: %s", params.BaseURL)
 	}
+	timeout := params.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	sseReadTimeout := params.SSEReadTimeout
+	if sseReadTimeout <= 0 {
+		sseReadTimeout = 300 * time.Second
+	}
 
 	transport := &mcp.SSEClientTransport{
 		Endpoint: params.BaseURL,
@@ -622,6 +715,16 @@ func NewMCPServerSSE(params MCPServerSSEParams) *MCPServerSSE {
 			HTTPClient: params.TransportOpts.HTTPClient,
 		}
 	}
+	if transport.HTTPClient == nil && params.HTTPClientFactory != nil {
+		transport.HTTPClient = params.HTTPClientFactory()
+	}
+	transport.HTTPClient = decorateMCPHTTPClient(
+		transport.HTTPClient,
+		params.Headers,
+		params.Auth,
+		timeout,
+		sseReadTimeout,
+	)
 	return &MCPServerSSE{
 		MCPServerWithClientSession: NewMCPServerWithClientSession(MCPServerWithClientSessionParams{
 			Name:                    name,
@@ -638,6 +741,9 @@ func NewMCPServerSSE(params MCPServerSSEParams) *MCPServerSSE {
 			FailureErrorFunction:    params.FailureErrorFunction,
 			FailureErrorFunctionSet: params.FailureErrorFunctionSet,
 		}),
+		headers:        maps.Clone(params.Headers),
+		timeout:        timeout,
+		sseReadTimeout: sseReadTimeout,
 	}
 }
 
@@ -653,12 +759,15 @@ type MCPServerStreamableHTTPParams struct {
 	// Optional static headers to attach to every Streamable HTTP request.
 	Headers map[string]string
 
+	// Optional request authenticator applied before the request is sent.
+	Auth MCPRequestAuthenticator
+
 	// Optional request timeout for Streamable HTTP transport.
 	// Defaults to 5 seconds.
 	Timeout time.Duration
 
-	// Optional SSE read timeout setting for parity with Python configuration.
-	// Currently stored for observability; Go MCP transport does not expose a direct field.
+	// Optional SSE idle read timeout. Implemented at the HTTP response body layer
+	// because the Go MCP transport does not expose a direct field.
 	SSEReadTimeout time.Duration
 
 	// Optional terminate-on-close behavior for parity with Python configuration.
@@ -714,10 +823,12 @@ type MCPServerStreamableHTTPParams struct {
 // See: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http
 type MCPServerStreamableHTTP struct {
 	*MCPServerWithClientSession
-	headers          map[string]string
-	timeout          time.Duration
-	sseReadTimeout   time.Duration
-	terminateOnClose bool
+	headers                map[string]string
+	timeout                time.Duration
+	sseReadTimeout         time.Duration
+	terminateOnClose       bool
+	transportFactory       func() mcp.Transport
+	isolatedSessionFactory func(context.Context) (mcpClientSession, error)
 }
 
 func NewMCPServerStreamableHTTP(params MCPServerStreamableHTTPParams) *MCPServerStreamableHTTP {
@@ -739,36 +850,43 @@ func NewMCPServerStreamableHTTP(params MCPServerStreamableHTTPParams) *MCPServer
 		terminateOnClose = *params.TerminateOnClose
 	}
 
-	transport := &mcp.StreamableClientTransport{
-		Endpoint: params.URL,
-	}
-	if params.TransportOpts != nil {
-		transport = &mcp.StreamableClientTransport{
-			Endpoint:   params.URL,
-			HTTPClient: params.TransportOpts.HTTPClient,
-			MaxRetries: params.TransportOpts.MaxRetries,
+	buildTransport := func() mcp.Transport {
+		transport := &mcp.StreamableClientTransport{
+			Endpoint: params.URL,
 		}
-	}
+		if params.TransportOpts != nil {
+			transport = &mcp.StreamableClientTransport{
+				Endpoint:   params.URL,
+				HTTPClient: params.TransportOpts.HTTPClient,
+				MaxRetries: params.TransportOpts.MaxRetries,
+			}
+		}
 
-	if transport.HTTPClient == nil {
-		switch {
-		case params.HTTPClientFactoryWithConfig != nil:
-			transport.HTTPClient = params.HTTPClientFactoryWithConfig(maps.Clone(params.Headers), timeout)
-		case params.HTTPClientFactory != nil:
-			transport.HTTPClient = params.HTTPClientFactory()
-		default:
-			transport.HTTPClient = &http.Client{Timeout: timeout}
+		if transport.HTTPClient == nil {
+			switch {
+			case params.HTTPClientFactoryWithConfig != nil:
+				transport.HTTPClient = params.HTTPClientFactoryWithConfig(maps.Clone(params.Headers), timeout)
+			case params.HTTPClientFactory != nil:
+				transport.HTTPClient = params.HTTPClientFactory()
+			default:
+				transport.HTTPClient = &http.Client{}
+			}
 		}
-	} else if timeout > 0 && transport.HTTPClient.Timeout == 0 {
-		transport.HTTPClient.Timeout = timeout
-	}
 
-	if len(params.Headers) > 0 && params.HTTPClientFactoryWithConfig == nil {
-		transport.HTTPClient.Transport = &mcpHeaderTransport{
-			next:    transport.HTTPClient.Transport,
-			headers: maps.Clone(params.Headers),
+		headers := params.Headers
+		if params.HTTPClientFactoryWithConfig != nil {
+			headers = nil
 		}
+		transport.HTTPClient = decorateMCPHTTPClient(
+			transport.HTTPClient,
+			headers,
+			params.Auth,
+			timeout,
+			sseReadTimeout,
+		)
+		return transport
 	}
+	transport := buildTransport()
 
 	server := &MCPServerStreamableHTTP{
 		MCPServerWithClientSession: NewMCPServerWithClientSession(MCPServerWithClientSessionParams{
@@ -790,8 +908,284 @@ func NewMCPServerStreamableHTTP(params MCPServerStreamableHTTPParams) *MCPServer
 		timeout:          timeout,
 		sseReadTimeout:   sseReadTimeout,
 		terminateOnClose: terminateOnClose,
+		transportFactory: buildTransport,
 	}
+	server.requestSerializationSlot = newRequestSerializationSlot()
 	return server
+}
+
+type sharedSessionRequestNeedsIsolation struct {
+	err error
+}
+
+func (e *sharedSessionRequestNeedsIsolation) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *sharedSessionRequestNeedsIsolation) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+type isolatedSessionRetryFailed struct {
+	err error
+}
+
+func (e *isolatedSessionRetryFailed) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *isolatedSessionRetryFailed) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (s *MCPServerStreamableHTTP) newIsolatedClientSession(ctx context.Context) (mcpClientSession, error) {
+	if s.isolatedSessionFactory != nil {
+		return s.isolatedSessionFactory(ctx)
+	}
+	if s.transportFactory == nil {
+		return nil, NewUserError("streamable HTTP transport factory is not configured")
+	}
+	client := newMCPClient(&mcp.Implementation{Name: s.name}, s.clientOptions)
+	session, err := client.Connect(ctx, s.transportFactory(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("MCP client connection error: %w", err)
+	}
+	return session, nil
+}
+
+func (s *MCPServerStreamableHTTP) callToolWithSession(
+	ctx context.Context,
+	session mcpClientSession,
+	toolName string,
+	arguments map[string]any,
+	meta map[string]any,
+) (*mcp.CallToolResult, error) {
+	attemptCtx, cancel := s.withSessionTimeout(ctx)
+	defer cancel()
+
+	params := &mcp.CallToolParams{
+		Name:      toolName,
+		Arguments: arguments,
+	}
+	if len(meta) > 0 {
+		params.Meta = mcp.Meta(meta)
+	}
+	return session.CallTool(attemptCtx, params)
+}
+
+func (s *MCPServerStreamableHTTP) shouldRetryInIsolatedSession(err error) bool {
+	if err == nil {
+		return false
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		errs := multi.Unwrap()
+		return len(errs) > 0 && allErrors(errs, s.shouldRetryInIsolatedSession)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, mcp.ErrConnectionClosed) {
+		return true
+	}
+	statusCode := getStatusCodeFromError(err)
+	if statusCode == 0 {
+		statusCode = httpStatusCodeFromErrorMessage(err.Error())
+	}
+	if statusCode >= 500 || statusCode == http.StatusRequestTimeout {
+		return true
+	}
+	if mcpCode, ok := intFromField(err, "Code"); ok && mcpCode == http.StatusRequestTimeout {
+		return true
+	}
+
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(message, "timed out") ||
+		strings.Contains(message, "timeout") ||
+		strings.Contains(message, "deadline exceeded") ||
+		strings.Contains(message, "connection closed") ||
+		strings.Contains(message, "closed resource") {
+		return true
+	}
+	return false
+}
+
+func (s *MCPServerStreamableHTTP) callToolWithSharedSession(
+	ctx context.Context,
+	toolName string,
+	arguments map[string]any,
+	meta map[string]any,
+	allowIsolatedRetry bool,
+) (*mcp.CallToolResult, error) {
+	session := s.session
+	if session == nil {
+		return nil, NewUserError("server not initialized: make sure you call `Connect()` first")
+	}
+	result, err := withSerializedSessionRequest(
+		ctx,
+		s.requestSerializationSlot,
+		func() (*mcp.CallToolResult, error) {
+			return s.callToolWithSession(ctx, session, toolName, arguments, meta)
+		},
+	)
+	if err == nil {
+		return result, nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if allowIsolatedRetry && s.shouldRetryInIsolatedSession(err) {
+		return nil, &sharedSessionRequestNeedsIsolation{err: err}
+	}
+	return nil, err
+}
+
+func (s *MCPServerStreamableHTTP) callToolWithIsolatedRetry(
+	ctx context.Context,
+	toolName string,
+	arguments map[string]any,
+	meta map[string]any,
+	allowIsolatedRetry bool,
+) (*mcp.CallToolResult, bool, error) {
+	result, err := s.callToolWithSharedSession(ctx, toolName, arguments, meta, allowIsolatedRetry)
+	if err == nil {
+		return result, false, nil
+	}
+	var needsIsolation *sharedSessionRequestNeedsIsolation
+	if !errors.As(err, &needsIsolation) {
+		return nil, false, err
+	}
+
+	session, isolatedErr := s.newIsolatedClientSession(ctx)
+	if isolatedErr != nil {
+		return nil, false, &isolatedSessionRetryFailed{err: isolatedErr}
+	}
+	defer session.Close()
+
+	result, isolatedErr = s.callToolWithSession(ctx, session, toolName, arguments, meta)
+	if isolatedErr != nil {
+		return nil, false, &isolatedSessionRetryFailed{err: isolatedErr}
+	}
+	return result, true, nil
+}
+
+func (s *MCPServerStreamableHTTP) CallTool(
+	ctx context.Context,
+	toolName string,
+	arguments map[string]any,
+	meta map[string]any,
+) (*mcp.CallToolResult, error) {
+	if s.session == nil {
+		return nil, NewUserError("server not initialized: make sure you call `Connect()` first")
+	}
+	if err := s.validateCallToolArguments(toolName, arguments); err != nil {
+		return nil, err
+	}
+
+	retriesUsed := 0
+	firstAttempt := true
+	for {
+		if !firstAttempt && s.maxRetryAttempts != -1 {
+			retriesUsed++
+		}
+		allowIsolatedRetry := s.maxRetryAttempts == -1 || retriesUsed < s.maxRetryAttempts
+		result, usedIsolatedRetry, err := s.callToolWithIsolatedRetry(
+			ctx,
+			toolName,
+			arguments,
+			meta,
+			allowIsolatedRetry,
+		)
+		if err == nil {
+			if usedIsolatedRetry && s.maxRetryAttempts != -1 {
+				retriesUsed++
+			}
+			return result, nil
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		var isolatedErr *isolatedSessionRetryFailed
+		if errors.As(err, &isolatedErr) {
+			retriesUsed++
+			if s.maxRetryAttempts != -1 && retriesUsed >= s.maxRetryAttempts {
+				if isolatedErr.err != nil {
+					return nil, isolatedErr.err
+				}
+				return nil, err
+			}
+			if backoffErr := s.sleepRetryBackoff(ctx, retriesUsed-1); backoffErr != nil {
+				return nil, backoffErr
+			}
+			firstAttempt = false
+			continue
+		}
+
+		if s.maxRetryAttempts != -1 && retriesUsed >= s.maxRetryAttempts {
+			return nil, err
+		}
+		if backoffErr := s.sleepRetryBackoff(ctx, retriesUsed); backoffErr != nil {
+			return nil, backoffErr
+		}
+		firstAttempt = false
+	}
+}
+
+func allErrors(errs []error, pred func(error) bool) bool {
+	for _, err := range errs {
+		if err == nil || !pred(err) {
+			return false
+		}
+	}
+	return true
+}
+
+func httpStatusCodeFromErrorMessage(message string) int {
+	for _, field := range strings.Fields(message) {
+		if len(field) < 3 {
+			continue
+		}
+		start := 0
+		for start < len(field) && (field[start] < '0' || field[start] > '9') {
+			start++
+		}
+		end := start
+		for end < len(field) && field[end] >= '0' && field[end] <= '9' {
+			end++
+		}
+		if end-start != 3 {
+			continue
+		}
+		statusCode, err := strconv.Atoi(field[start:end])
+		if err == nil && statusCode >= 100 && statusCode <= 599 {
+			return statusCode
+		}
+	}
+	return 0
+}
+
+// Headers returns configured SSE headers.
+func (s *MCPServerSSE) Headers() map[string]string {
+	return maps.Clone(s.headers)
+}
+
+// Timeout returns configured SSE request timeout.
+func (s *MCPServerSSE) Timeout() time.Duration {
+	return s.timeout
+}
+
+// SSEReadTimeout returns configured SSE idle read timeout.
+func (s *MCPServerSSE) SSEReadTimeout() time.Duration {
+	return s.sseReadTimeout
 }
 
 // Headers returns configured Streamable HTTP headers.
@@ -815,8 +1209,38 @@ func (s *MCPServerStreamableHTTP) TerminateOnClose() bool {
 }
 
 type mcpHeaderTransport struct {
-	next    http.RoundTripper
-	headers map[string]string
+	next                 http.RoundTripper
+	headers              map[string]string
+	auth                 MCPRequestAuthenticator
+	requestTimeout       time.Duration
+	sseReadTimeout       time.Duration
+	timeoutNeedsFallback bool
+}
+
+func decorateMCPHTTPClient(
+	client *http.Client,
+	headers map[string]string,
+	auth MCPRequestAuthenticator,
+	requestTimeout time.Duration,
+	sseReadTimeout time.Duration,
+) *http.Client {
+	if len(headers) == 0 && auth == nil && requestTimeout <= 0 && sseReadTimeout <= 0 {
+		return client
+	}
+	if client == nil {
+		client = &http.Client{}
+	}
+	next, timeoutNeedsFallback := mcpTransportWithTimeout(client.Transport, requestTimeout)
+	decorated := *client
+	decorated.Transport = &mcpHeaderTransport{
+		next:                 next,
+		headers:              maps.Clone(headers),
+		auth:                 auth,
+		requestTimeout:       requestTimeout,
+		sseReadTimeout:       sseReadTimeout,
+		timeoutNeedsFallback: timeoutNeedsFallback,
+	}
+	return &decorated
 }
 
 func (t *mcpHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -826,11 +1250,171 @@ func (t *mcpHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	clone := req.Clone(req.Context())
 	clone.Header = req.Header.Clone()
+	if t.auth != nil {
+		if err := t.auth(clone); err != nil {
+			return nil, err
+		}
+	}
+	isSSERequest := isMCPEventStreamRequest(clone)
+	var cancel context.CancelFunc
+	if t.timeoutNeedsFallback && t.requestTimeout > 0 && !isSSERequest {
+		timeoutCtx, timeoutCancel := context.WithTimeout(clone.Context(), t.requestTimeout)
+		cancel = timeoutCancel
+		clone = clone.WithContext(timeoutCtx)
+		clone.Header = clone.Header.Clone()
+	}
 	for key, value := range t.headers {
 		if strings.TrimSpace(key) == "" {
 			continue
 		}
 		clone.Header.Set(key, value)
 	}
-	return transport.RoundTrip(clone)
+	resp, err := transport.RoundTrip(clone)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, err
+	}
+	if resp == nil || resp.Body == nil {
+		if cancel != nil {
+			cancel()
+		}
+		return resp, nil
+	}
+	if cancel != nil {
+		resp.Body = &mcpCancelOnCloseBody{
+			ReadCloser: resp.Body,
+			cancel:     cancel,
+		}
+	}
+	if t.sseReadTimeout > 0 && isSSERequest {
+		resp.Body = &mcpReadTimeoutBody{
+			body:    resp.Body,
+			timeout: t.sseReadTimeout,
+		}
+	}
+	return resp, nil
 }
+
+func mcpTransportWithTimeout(next http.RoundTripper, requestTimeout time.Duration) (http.RoundTripper, bool) {
+	if requestTimeout <= 0 {
+		return next, false
+	}
+	if next == nil {
+		if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+			clone := transport.Clone()
+			if clone.ResponseHeaderTimeout == 0 {
+				clone.ResponseHeaderTimeout = requestTimeout
+			}
+			return clone, false
+		}
+		return nil, true
+	}
+	transport, ok := next.(*http.Transport)
+	if !ok {
+		return next, true
+	}
+	clone := transport.Clone()
+	if clone.ResponseHeaderTimeout == 0 {
+		clone.ResponseHeaderTimeout = requestTimeout
+	}
+	return clone, false
+}
+
+func isMCPEventStreamRequest(req *http.Request) bool {
+	for _, accept := range req.Header.Values("Accept") {
+		for _, mediaType := range strings.Split(accept, ",") {
+			mediaType = strings.TrimSpace(mediaType)
+			if cut := strings.Index(mediaType, ";"); cut >= 0 {
+				mediaType = strings.TrimSpace(mediaType[:cut])
+			}
+			if strings.EqualFold(mediaType, "text/event-stream") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type mcpCancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (b *mcpCancelOnCloseBody) cancelOnce() {
+	if b == nil || b.cancel == nil {
+		return
+	}
+	b.once.Do(b.cancel)
+}
+
+func (b *mcpCancelOnCloseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.cancelOnce()
+	}
+	return n, err
+}
+
+func (b *mcpCancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancelOnce()
+	return err
+}
+
+type mcpReadTimeoutBody struct {
+	body    io.ReadCloser
+	timeout time.Duration
+}
+
+func (b *mcpReadTimeoutBody) Read(p []byte) (int, error) {
+	if b == nil || b.body == nil {
+		return 0, io.EOF
+	}
+	if b.timeout <= 0 {
+		return b.body.Read(p)
+	}
+
+	type result struct {
+		n   int
+		err error
+	}
+
+	resultCh := make(chan result, 1)
+	go func() {
+		n, err := b.body.Read(p)
+		resultCh <- result{n: n, err: err}
+	}()
+
+	timer := time.NewTimer(b.timeout)
+	defer timer.Stop()
+
+	select {
+	case outcome := <-resultCh:
+		return outcome.n, outcome.err
+	case <-timer.C:
+		_ = b.body.Close()
+		return 0, mcpReadTimeoutError{timeout: b.timeout}
+	}
+}
+
+func (b *mcpReadTimeoutBody) Close() error {
+	if b == nil || b.body == nil {
+		return nil
+	}
+	return b.body.Close()
+}
+
+type mcpReadTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e mcpReadTimeoutError) Error() string {
+	return fmt.Sprintf("MCP SSE read timed out after %s", e.timeout)
+}
+
+func (mcpReadTimeoutError) Timeout() bool { return true }
+
+func (mcpReadTimeoutError) Temporary() bool { return true }

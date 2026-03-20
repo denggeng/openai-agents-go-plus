@@ -42,7 +42,18 @@ func resolveApprovalRejectionMessage(
 	toolType string,
 	toolName string,
 	callID string,
+	approvalItem ...ToolApprovalItem,
 ) string {
+	var existingPending *ToolApprovalItem
+	if len(approvalItem) > 0 {
+		existingPending = &approvalItem[0]
+	}
+	if contextWrapper != nil {
+		if message, ok := contextWrapper.GetRejectionMessage(toolName, callID, existingPending); ok {
+			return message
+		}
+	}
+
 	formatter := runConfig.ToolErrorFormatter
 	if formatter == nil {
 		return DefaultApprovalRejectionMessage

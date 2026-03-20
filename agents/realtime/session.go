@@ -254,13 +254,18 @@ func (s *RealtimeSession) ApproveToolCall(ctx context.Context, callID string, al
 }
 
 // RejectToolCall rejects a pending tool call and notifies the model.
-func (s *RealtimeSession) RejectToolCall(ctx context.Context, callID string, always bool) error {
+func (s *RealtimeSession) RejectToolCall(
+	ctx context.Context,
+	callID string,
+	always bool,
+	rejectionMessage ...string,
+) error {
 	pending, ok := s.takePendingToolCall(callID)
 	if !ok {
 		return nil
 	}
 
-	s.contextWrapper.RejectTool(pending.approvalItem, always)
+	s.contextWrapper.RejectTool(pending.approvalItem, always, rejectionMessage...)
 	return s.sendToolRejection(ctx, pending.event, pending.agent, pending.functionTool)
 }
 
@@ -656,6 +661,10 @@ func (s *RealtimeSession) resolveApprovalRejectionMessage(
 	functionTool agents.FunctionTool,
 	callID string,
 ) string {
+	if message, ok := s.contextWrapper.GetRejectionMessage(functionTool.Name, callID, nil); ok {
+		return message
+	}
+
 	formatterValue := s.runConfig["tool_error_formatter"]
 	if formatterValue == nil {
 		return defaultRealtimeApprovalRejectionMessage

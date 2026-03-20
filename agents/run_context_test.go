@@ -107,6 +107,61 @@ func TestRunContextScopesRejectionsToCallIDs(t *testing.T) {
 	assert.False(t, approved)
 }
 
+func TestRunContextStoresPerCallRejectionMessages(t *testing.T) {
+	ctx := agents.NewRunContextWrapper[any](nil)
+	approvalItem := agents.ToolApprovalItem{
+		RawItem: map[string]any{
+			"type":    "tool_call",
+			"call_id": "call-1",
+		},
+	}
+
+	ctx.RejectTool(approvalItem, false, "Denied by policy")
+
+	message, ok := ctx.GetRejectionMessage("tool_call", "call-1", nil)
+	require.True(t, ok)
+	assert.Equal(t, "Denied by policy", message)
+
+	_, ok = ctx.GetRejectionMessage("tool_call", "call-2", nil)
+	assert.False(t, ok)
+}
+
+func TestRunContextStoresStickyRejectionMessagesForAlwaysReject(t *testing.T) {
+	ctx := agents.NewRunContextWrapper[any](nil)
+	approvalItem := agents.ToolApprovalItem{
+		RawItem: map[string]any{
+			"type":    "tool_call",
+			"call_id": "call-1",
+		},
+	}
+
+	ctx.RejectTool(approvalItem, true, "")
+
+	message, ok := ctx.GetRejectionMessage("tool_call", "call-1", nil)
+	require.True(t, ok)
+	assert.Equal(t, "", message)
+
+	message, ok = ctx.GetRejectionMessage("tool_call", "call-2", nil)
+	require.True(t, ok)
+	assert.Equal(t, "", message)
+}
+
+func TestRunContextClearsRejectionMessageAfterApproval(t *testing.T) {
+	ctx := agents.NewRunContextWrapper[any](nil)
+	approvalItem := agents.ToolApprovalItem{
+		RawItem: map[string]any{
+			"type":    "tool_call",
+			"call_id": "call-1",
+		},
+	}
+
+	ctx.RejectTool(approvalItem, false, "Denied by policy")
+	ctx.ApproveTool(approvalItem, false)
+
+	_, ok := ctx.GetRejectionMessage("tool_call", "call-1", nil)
+	assert.False(t, ok)
+}
+
 func TestRunContextResolveToolNameAndCallIDFromRawItem(t *testing.T) {
 	ctx := agents.NewRunContextWrapper[any](nil)
 
@@ -160,6 +215,27 @@ func TestRunContextNamespacedApprovalDoesNotFallbackToBareToolDecision(t *testin
 	assert.False(t, approved)
 }
 
+func TestRunContextNamespacedRejectionMessageDoesNotFallbackToBareToolDecision(t *testing.T) {
+	ctx := agents.NewRunContextWrapper[any](nil)
+	bareApproval := agents.ToolApprovalItem{
+		ToolName: "lookup_account",
+		RawItem:  namespacedApprovalRaw(t, "lookup_account", "call-bare", ""),
+	}
+	namespacedApproval := agents.ToolApprovalItem{
+		ToolName: "lookup_account",
+		RawItem:  namespacedApprovalRaw(t, "lookup_account", "call-billing", "billing"),
+	}
+
+	ctx.RejectTool(bareApproval, true, "bare denial")
+
+	_, ok := ctx.GetRejectionMessage("lookup_account", "call-billing-2", &namespacedApproval)
+	assert.False(t, ok)
+
+	message, ok := ctx.GetRejectionMessage("lookup_account", "call-bare-2", nil)
+	require.True(t, ok)
+	assert.Equal(t, "bare denial", message)
+}
+
 func TestRunContextSerializeAndRebuildApprovals(t *testing.T) {
 	ctx := agents.NewRunContextWrapper[any](nil)
 	ctx.ApproveTool(agents.ToolApprovalItem{
@@ -169,7 +245,7 @@ func TestRunContextSerializeAndRebuildApprovals(t *testing.T) {
 	ctx.RejectTool(agents.ToolApprovalItem{
 		ToolName: "tool_2",
 		RawItem:  map[string]any{"call_id": "call-2"},
-	}, true)
+	}, true, "denied")
 
 	serialized := ctx.SerializeApprovals()
 	require.NotEmpty(t, serialized)
@@ -184,6 +260,14 @@ func TestRunContextSerializeAndRebuildApprovals(t *testing.T) {
 	approved, known = restored.IsToolApproved("tool_2", "any")
 	require.True(t, known)
 	assert.False(t, approved)
+
+	message, ok := restored.GetRejectionMessage("tool_2", "call-2", nil)
+	require.True(t, ok)
+	assert.Equal(t, "denied", message)
+
+	message, ok = restored.GetRejectionMessage("tool_2", "other-call", nil)
+	require.True(t, ok)
+	assert.Equal(t, "denied", message)
 }
 
 func namespacedApprovalRaw(
